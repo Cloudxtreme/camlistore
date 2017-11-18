@@ -19,11 +19,14 @@ package camtypes
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"mime"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/magic"
 
 	"go4.org/types"
 )
@@ -115,24 +118,20 @@ type FileInfo struct {
 	WholeRef blob.Ref `json:"wholeRef,omitempty"`
 }
 
-func (fi *FileInfo) IsImage() bool {
-	return strings.HasPrefix(fi.MIMEType, "image/")
+func (fi *FileInfo) IsText() bool {
+	if strings.HasPrefix(fi.MIMEType, "text/") {
+		return true
+	}
+
+	return strings.HasPrefix(mime.TypeByExtension(filepath.Ext(fi.FileName)), "text/")
 }
 
-var videoExtensions = map[string]bool{
-	"3gp":  true,
-	"avi":  true,
-	"flv":  true,
-	"m1v":  true,
-	"m2v":  true,
-	"m4v":  true,
-	"mkv":  true,
-	"mov":  true,
-	"mp4":  true,
-	"mpeg": true,
-	"mpg":  true,
-	"ogv":  true,
-	"wmv":  true,
+func (fi *FileInfo) IsImage() bool {
+	if strings.HasPrefix(fi.MIMEType, "image/") {
+		return true
+	}
+
+	return strings.HasPrefix(mime.TypeByExtension(filepath.Ext(fi.FileName)), "image/")
 }
 
 func (fi *FileInfo) IsVideo() bool {
@@ -140,34 +139,11 @@ func (fi *FileInfo) IsVideo() bool {
 		return true
 	}
 
-	var ext string
-	if e := filepath.Ext(fi.FileName); strings.HasPrefix(e, ".") {
-		ext = e[1:]
-	} else {
-		return false
+	if magic.HasExtension(fi.FileName, magic.VideoExtensions) {
+		return true
 	}
 
-	// Case-insensitive lookup.
-	// Optimistically assume a short ASCII extension and be
-	// allocation-free in that case.
-	var buf [10]byte
-	lower := buf[:0]
-	const utf8RuneSelf = 0x80 // from utf8 package, but not importing it.
-	for i := 0; i < len(ext); i++ {
-		c := ext[i]
-		if c >= utf8RuneSelf {
-			// Slow path.
-			return videoExtensions[strings.ToLower(ext)]
-		}
-		if 'A' <= c && c <= 'Z' {
-			lower = append(lower, c+('a'-'A'))
-		} else {
-			lower = append(lower, c)
-		}
-	}
-	// The conversion from []byte to string doesn't allocate in
-	// a map lookup.
-	return videoExtensions[string(lower)]
+	return strings.HasPrefix(mime.TypeByExtension(filepath.Ext(fi.FileName)), "video/")
 }
 
 // ImageInfo describes an image file.
@@ -209,6 +185,10 @@ type PermanodeByAttrRequest struct {
 
 	FuzzyMatch bool // by default, an exact match is required
 	MaxResults int  // optional max results
+
+	// At, if non-zero, specifies that the attribute must have been set at
+	// the latest at At.
+	At time.Time
 }
 
 type EdgesToOpts struct {
@@ -252,4 +232,137 @@ type FileSearchResponse struct {
 	SearchErrorResponse
 
 	Files []blob.Ref `json:"files"` // Refs of the result files. Never nil.
+}
+
+// Location describes a file or permanode that has a location.
+type Location struct {
+	// Latitude and Longitude represent the point location of this blob,
+	// such as the place where a photo was taken.
+	//
+	// Negative values represent positions south of the equator or
+	// west of the prime meridian:
+	// Northern latitudes are positive, southern latitudes are negative.
+	// Eastern longitudes are positive, western longitudes are negative.
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+
+	// TODO(tajtiattila): decide how to represent blobs with
+	// no single point location such as a track file once we index them,
+	// perhaps with a N/S/E/W boundary. Note that a single point location
+	// is still useful for these, to represent the starting point of a
+	// track log or the main entrance of an area or building.
+}
+
+type Longitude float64
+
+// WrapTo180 returns l converted to the [-180,180] interval.
+func (l Longitude) WrapTo180() float64 {
+	lf := float64(l)
+	if lf >= -180 && lf <= 180 {
+		return lf
+	}
+	if lf == 0 {
+		return lf
+	}
+	if lf > 0 {
+		return math.Mod(lf+180, 360) - 180
+	}
+	return math.Mod(lf-180, 360) + 180
+}
+
+// LocationBounds is a location area delimited by its fields. See Location for
+// the fields meanings and values.
+type LocationBounds struct {
+	North float64 `json:"north"`
+	South float64 `json:"south"`
+	West  float64 `json:"west"`
+	East  float64 `json:"east"`
+}
+
+func (l LocationBounds) isEmpty() bool {
+	return l == (LocationBounds{}) ||
+		l.North == 0 &&
+			l.South == 0 &&
+			l.West == 0 &&
+			l.East == 0
+}
+
+func (l *LocationBounds) isWithinLongitude(loc Location) bool {
+	if l.East < l.West {
+		// l is spanning over antimeridian
+		return loc.Longitude >= l.West || loc.Longitude <= l.East
+	}
+	return loc.Longitude >= l.West && loc.Longitude <= l.East
+}
+
+// Expand returns a new LocationBounds nb. If either of loc coordinates is
+// outside of b, nb is the dimensions of b expanded as little as possible in
+// order to include loc. Otherwise, nb is just a copy of b.
+func (b LocationBounds) Expand(loc Location) LocationBounds {
+	if b.isEmpty() {
+		return LocationBounds{
+			North: loc.Latitude,
+			South: loc.Latitude,
+			West:  loc.Longitude,
+			East:  loc.Longitude,
+		}
+	}
+	nb := LocationBounds{
+		North: b.North,
+		South: b.South,
+		West:  b.West,
+		East:  b.East,
+	}
+	if loc.Latitude > nb.North {
+		nb.North = loc.Latitude
+	} else if loc.Latitude < nb.South {
+		nb.South = loc.Latitude
+	}
+	if nb.isWithinLongitude(loc) {
+		return nb
+	}
+	center := nb.center()
+	dToCenter := center.Longitude - loc.Longitude
+	if math.Abs(dToCenter) <= 180 {
+		if dToCenter > 0 {
+			// expand Westwards
+			nb.West = loc.Longitude
+		} else {
+			// expand Eastwards
+			nb.East = loc.Longitude
+		}
+		return nb
+	}
+	if dToCenter > 0 {
+		// expand Eastwards
+		nb.East = loc.Longitude
+	} else {
+		// expand Westwards
+		nb.West = loc.Longitude
+	}
+	return nb
+}
+
+func (b *LocationBounds) center() Location {
+	var lat, long float64
+	lat = b.South + (b.North-b.South)/2.
+	if b.West < b.East {
+		long = b.West + (b.East-b.West)/2.
+		return Location{
+			Latitude:  lat,
+			Longitude: long,
+		}
+	}
+	// b is spanning over antimeridian
+	awest := math.Abs(b.West)
+	aeast := math.Abs(b.East)
+	if awest > aeast {
+		long = b.East - (awest-aeast)/2.
+	} else {
+		long = b.West + (aeast-awest)/2.
+	}
+	return Location{
+		Latitude:  lat,
+		Longitude: long,
+	}
 }

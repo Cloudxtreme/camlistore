@@ -16,11 +16,22 @@ limitations under the License.
 
 package search
 
+import (
+	"time"
+
+	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/types/camtypes"
+
+	"golang.org/x/net/context"
+)
+
 func SetTestHookBug121(hook func()) {
 	testHookBug121 = hook
 }
 
 func ExportSetCandidateSourceHook(fn func(string)) { candSourceHook = fn }
+
+func ExportSetExpandLocationHook(val bool) { expandLocationHook = val }
 
 func ExportBufferedConst() int { return buffered }
 
@@ -29,3 +40,12 @@ func (s *SearchQuery) ExportPlannedQuery() *SearchQuery {
 }
 
 var SortName = sortName
+
+func (s *Handler) ExportGetPermanodeLocation(ctx context.Context, permaNode blob.Ref,
+	at time.Time) (camtypes.Location, error) {
+	return s.lh.PermanodeLocation(ctx, permaNode, at, s.owner)
+}
+
+func ExportBestByLocation(res *SearchResult, loc map[blob.Ref]camtypes.Location, limit int) {
+	bestByLocation(res, loc, limit)
+}

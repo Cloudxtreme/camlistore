@@ -17,7 +17,7 @@ limitations under the License.
 goog.provide('cam.PermanodeDetail');
 
 goog.require('goog.array');
-goog.require('goog.labs.Promise');
+goog.require('goog.Promise');
 goog.require('goog.object');
 
 goog.require('cam.ServerConnection');
@@ -36,11 +36,22 @@ cam.PermanodeDetail = React.createClass({
 	getInitialState: function() {
 		return {
 			newRow: {},
-			rows: this.getInitialRows_(),
+			rows: null,
 			sortBy: 'name',
 			sortAsc: true,
 			status: '',
 		};
+	},
+
+	componentWillReceiveProps: function(nextProps) {
+		// this.props == nextProps is for the very first load.
+		if (this.props == nextProps || this.props.meta.blobRef != nextProps.meta.blobRef) {
+			this.setState({rows: this.getInitialRows_(nextProps.meta)});
+		}
+	},
+
+	componentWillMount: function() {
+		this.componentWillReceiveProps(this.props, true);
 	},
 
 	render: function() {
@@ -62,10 +73,10 @@ cam.PermanodeDetail = React.createClass({
 		}
 	},
 
-	getInitialRows_: function() {
+	getInitialRows_: function(meta) {
 		var rows = [];
-		for (var name in this.props.meta.permanode.attr) {
-			var values = this.props.meta.permanode.attr[name];
+		for (var name in meta.permanode.attr) {
+			var values = meta.permanode.attr[name];
 			for (var i = 0; i < values.length; i++) {
 				rows.push({
 					'name': name,
@@ -83,7 +94,7 @@ cam.PermanodeDetail = React.createClass({
 				children.push(
 					React.DOM.i({
 						key: goog.string.subs('%s-sort-icon', name),
-						className: React.addons.classSet({
+						className: classNames({
 							'fa': true,
 							'fa-caret-up': this.state.sortAsc,
 							'fa-caret-down': !this.state.sortAsc,
@@ -112,7 +123,7 @@ cam.PermanodeDetail = React.createClass({
 					header(headerText('Value', 'value'), this.handleSort_.bind(null, 'value')),
 					header('')
 				),
-				cam.PermanodeDetail.AttributeRow({
+				React.createElement(cam.PermanodeDetail.AttributeRow, {
 					className: 'cam-permanode-detail-new-row',
 					key: 'new',
 					onBlur: this.handleBlur_,
@@ -120,7 +131,7 @@ cam.PermanodeDetail = React.createClass({
 					row: this.state.newRow,
 				}),
 				this.state.rows.map(function(r, i) {
-					return cam.PermanodeDetail.AttributeRow({
+					return React.createElement(cam.PermanodeDetail.AttributeRow, {
 						key: i,
 						onBlur: this.handleBlur_,
 						onChange: this.handleChange_,
@@ -199,7 +210,7 @@ cam.PermanodeDetail = React.createClass({
 		var key = function(r) {
 			return r.name + ':' + r.value;
 		};
-		var before = goog.array.toObject(this.getInitialRows_(), key);
+		var before = goog.array.toObject(this.getInitialRows_(this.props.meta), key);
 		var after = goog.array.toObject(this.state.rows, key);
 
 		var adds = goog.object.filter(after, function(v, k) { return !(k in before); });
@@ -220,11 +231,11 @@ cam.PermanodeDetail = React.createClass({
 			status: 'Saving...',
 		});
 		var promises = changes.adds.map(function(add) {
-			return new goog.labs.Promise(this.props.serverConnection.newAddAttributeClaim.bind(this.props.serverConnection, this.props.meta.blobRef, add.name, add.value));
+			return new goog.Promise(this.props.serverConnection.newAddAttributeClaim.bind(this.props.serverConnection, this.props.meta.blobRef, add.name, add.value));
 		}, this).concat(changes.deletes.map(function(del) {
-			return new goog.labs.Promise(this.props.serverConnection.newDelAttributeClaim.bind(this.props.serverConnection, this.props.meta.blobRef, del.name, del.value));
+			return new goog.Promise(this.props.serverConnection.newDelAttributeClaim.bind(this.props.serverConnection, this.props.meta.blobRef, del.name, del.value));
 		}, this));
-		goog.labs.Promise.all(promises).then(function() {
+		goog.Promise.all(promises).then(function() {
 			this.props.timer.setTimeout(function() {
 				this.setState({
 					status: '',
@@ -297,7 +308,7 @@ cam.PermanodeDetail.getAspect = function(serverConnection, timer, blobref, targe
 		fragment: 'permanode',
 		title: 'Permanode',
 		createContent: function(size) {
-			return cam.PermanodeDetail({
+			return React.createElement(cam.PermanodeDetail, {
 				meta: pm,
 				serverConnection: serverConnection,
 				timer: timer,

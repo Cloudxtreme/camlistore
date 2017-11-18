@@ -17,7 +17,7 @@ limitations under the License.
 // Package serverinit is responsible for mapping from a Camlistore
 // configuration file and instantiating HTTP Handlers for all the
 // necessary endpoints.
-package serverinit
+package serverinit // import "camlistore.org/pkg/serverinit"
 
 import (
 	"bytes"
@@ -31,25 +31,27 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
 
 	"camlistore.org/pkg/auth"
 	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/blobpacked"
 	"camlistore.org/pkg/blobserver/handlers"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/index"
+	"camlistore.org/pkg/jsonsign/signhandler"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/server"
 	"camlistore.org/pkg/server/app"
 	"camlistore.org/pkg/types/serverconfig"
-	"go4.org/jsonconfig"
 
-	"google.golang.org/cloud/compute/metadata"
+	"cloud.google.com/go/compute/metadata"
+	"go4.org/jsonconfig"
 )
 
 const camliPrefix = "/camli/"
@@ -237,11 +239,6 @@ func (hl *handlerLoader) configType(prefix string) string {
 	return ""
 }
 
-func (hl *handlerLoader) getOrSetup(prefix string) interface{} {
-	hl.setupHandler(prefix)
-	return hl.handler[prefix]
-}
-
 func (hl *handlerLoader) MyPrefix() string {
 	return hl.curPrefix
 }
@@ -315,8 +312,12 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 	hl.curPrefix = prefix
 
 	if strings.HasPrefix(h.htype, "storage-") {
-		stype := strings.TrimPrefix(h.htype, "storage-")
 		// Assume a storage interface
+		stype := strings.TrimPrefix(h.htype, "storage-")
+		if h.htype == "storage-index" && hl.reindex {
+			// Let the indexer know that we're in reindex mode
+			h.conf["reindex"] = true
+		}
 		pstorage, err := blobserver.CreateStorage(stype, hl, h.conf)
 		if err != nil {
 			exitFailure("error instantiating storage for prefix %q, type %q: %v",
@@ -326,13 +327,6 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 			log.Printf("Reindexing %s ...", h.prefix)
 			if err := ix.Reindex(); err != nil {
 				exitFailure("Error reindexing %s: %v", h.prefix, err)
-			}
-		}
-		// TODO(mpl): make an interface that is "storage that has an internal index" and switch type on it?
-		if h.htype == "storage-blobpacked" && hl.reindex {
-			log.Printf("Wiping %s, because reindexing ...", h.prefix)
-			if err := blobpacked.WipeMeta(pstorage); err != nil {
-				exitFailure("Error wiping %s's meta: %v", h.prefix, err)
 			}
 		}
 		hl.handler[h.prefix] = pstorage
@@ -349,12 +343,23 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 
 	var hh http.Handler
 	if h.htype == "app" {
-		ap, err := app.NewHandler(h.conf, hl.baseURL+"/", prefix)
+		// h.conf might already contain the server's baseURL, but
+		// camlistored.go derives (if needed) a more useful hl.baseURL,
+		// after h.conf was generated, so we provide it as well to
+		// FromJSONConfig so NewHandler can benefit from it.
+		hc, err := app.FromJSONConfig(h.conf, prefix, hl.baseURL)
+		if err != nil {
+			exitFailure("error setting up app config for prefix %q: %v", h.prefix, err)
+		}
+		ap, err := app.NewHandler(hc)
 		if err != nil {
 			exitFailure("error setting up app for prefix %q: %v", h.prefix, err)
 		}
 		hh = ap
 		auth.AddMode(ap.AuthMode())
+		// TODO(mpl): this check is weak, as the user could very well
+		// use another binary name for the publisher app. We should
+		// introduce/use another identifier.
 		if ap.ProgramName() == "publisher" {
 			if err := hl.initPublisherRootNode(ap); err != nil {
 				exitFailure("Error looking/setting up root node for publisher on %v: %v", h.prefix, err)
@@ -408,6 +413,10 @@ type Config struct {
 	// apps is the list of server apps configured during InstallHandlers,
 	// and that should be started after camlistored has started serving.
 	apps []*app.Handler
+	// signHandler is found and configured during InstallHandlers, or nil.
+	// It is stored in the Config, so we can call UploadPublicKey on on it as
+	// soon as camlistored is ready for it.
+	signHandler *signhandler.Handler
 }
 
 // detectConfigChange returns an informative error if conf contains obsolete keys.
@@ -484,6 +493,16 @@ func load(filename string, opener func(filename string) (jsonconfig.File, error)
 		return nil, fmt.Errorf("Could not unmarshal into a serverconfig.Config: %v", err)
 	}
 
+	// At this point, conf.Obj.UnknownKeys() contains all the names found in
+	// the given high-level configuration. We check them against
+	// highLevelConfFields(), which gives us all the possible valid
+	// configuration names, to catch typos or invalid names.
+	allFields := highLevelConfFields()
+	for _, v := range conf.Obj.UnknownKeys() {
+		if _, ok := allFields[v]; !ok {
+			return nil, fmt.Errorf("unknown high-level configuration parameter: %q", v)
+		}
+	}
 	conf, err = genLowLevelConfig(&hiLevelConf)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -518,6 +537,7 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 	defer func() {
 		if e := recover(); e != nil {
 			log.Printf("Caught panic installer handlers: %v", e)
+			debug.PrintStack()
 			err = fmt.Errorf("Caught panic: %v", e)
 		}
 	}()
@@ -550,6 +570,9 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 	}
 
 	for prefix, vei := range prefixes {
+		if prefix == "_knownkeys" {
+			continue
+		}
 		if !strings.HasPrefix(prefix, "/") {
 			exitFailure("prefix %q doesn't start with /", prefix)
 		}
@@ -595,6 +618,9 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 		if helpHandler, ok := handler.(*server.HelpHandler); ok {
 			helpHandler.SetServerConfig(config.Obj)
 		}
+		if signHandler, ok := handler.(*signhandler.Handler); ok {
+			config.signHandler = signHandler
+		}
 		if in, ok := handler.(blobserver.HandlerIniter); ok {
 			if err := in.InitHandler(hl); err != nil {
 				return nil, fmt.Errorf("Error calling InitHandler on %s: %v", pfx, err)
@@ -608,9 +634,17 @@ func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reind
 	if v, _ := strconv.ParseBool(os.Getenv("CAMLI_HTTP_PPROF")); v {
 		hi.Handle("/debug/pprof/", profileHandler{})
 	}
+	hi.Handle("/debug/goroutines", auth.RequireAuth(http.HandlerFunc(dumpGoroutines), auth.OpRead))
 	hi.Handle("/debug/config", auth.RequireAuth(configHandler{config}, auth.OpAll))
 	hi.Handle("/debug/logs/", auth.RequireAuth(http.HandlerFunc(logsHandler), auth.OpAll))
 	return multiCloser(hl.closers), nil
+}
+
+func dumpGoroutines(w http.ResponseWriter, r *http.Request) {
+	buf := make([]byte, 2<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write(buf)
 }
 
 // StartApps starts all the server applications that were configured
@@ -624,6 +658,15 @@ func (config *Config) StartApps() error {
 		}
 	}
 	return nil
+}
+
+// UploadPublicKey uploads the public key blob with the sign handler that was
+// configured during InstallHandlers.
+func (config *Config) UploadPublicKey() error {
+	if config.signHandler == nil {
+		return nil
+	}
+	return config.signHandler.UploadPublicKey()
 }
 
 // AppURL returns a map of app name to app base URL for all the configured
@@ -678,16 +721,22 @@ type configHandler struct {
 
 var (
 	knownKeys     = regexp.MustCompile(`(?ms)^\s+"_knownkeys": {.+?},?\n`)
-	sensitiveLine = regexp.MustCompile(`(?m)^\s+\"(auth|aws_secret_access_key|password)\": "[^\"]+".*\n`)
+	sensitiveLine = regexp.MustCompile(`(?m)^\s+\"(auth|aws_secret_access_key|password|client_secret|application_key|passphrase)\": "[^\"]+".*\n`)
+	trailingComma = regexp.MustCompile(`,(\n\s*\})`)
 )
 
-func (h configHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h configHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	b, _ := json.MarshalIndent(h.c.Obj, "", "    ")
 	b = knownKeys.ReplaceAll(b, nil)
+	b = trailingComma.ReplaceAll(b, []byte("$1"))
 	b = sensitiveLine.ReplaceAllFunc(b, func(ln []byte) []byte {
 		i := bytes.IndexByte(ln, ':')
-		return []byte(string(ln[:i+1]) + " REDACTED\n")
+		r := string(ln[:i+1]) + ` "REDACTED"`
+		if bytes.HasSuffix(bytes.TrimSpace(ln), []byte{','}) {
+			r += ","
+		}
+		return []byte(r + "\n")
 	})
 	w.Write(b)
 }
@@ -738,4 +787,28 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "no such logs", 404)
 	}
+}
+
+// highLevelConfFields returns all the possible fields of a serverconfig.Config,
+// in their JSON form. This allows checking that the parameters in the high-level
+// server configuration file are at least valid names, which is useful to catch
+// typos.
+func highLevelConfFields() map[string]bool {
+	knownFields := make(map[string]bool)
+	var c serverconfig.Config
+	s := reflect.ValueOf(&c).Elem()
+	for i := 0; i < s.NumField(); i++ {
+		f := s.Type().Field(i)
+		jsonTag, ok := f.Tag.Lookup("json")
+		if !ok {
+			panic(fmt.Sprintf("%q field in serverconfig.Config does not have a json tag", f.Name))
+		}
+		jsonFields := strings.Split(strings.TrimSuffix(strings.TrimPrefix(jsonTag, `"`), `"`), ",")
+		jsonName := jsonFields[0]
+		if jsonName == "" {
+			panic(fmt.Sprintf("no json field name for %q field in serverconfig.Config", f.Name))
+		}
+		knownFields[jsonName] = true
+	}
+	return knownFields
 }

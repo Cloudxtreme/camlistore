@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package storagetest tests blobserver.Storage implementations
-package storagetest
+package storagetest // import "camlistore.org/pkg/blobserver/storagetest"
 
 import (
 	"errors"
@@ -176,11 +176,18 @@ func (r *run) testRemove(blobRefs []blob.Ref) {
 	if err := sto.RemoveBlobs(blobRefs); err != nil {
 		if strings.Contains(err.Error(), "not implemented") {
 			t.Logf("RemoveBlobs: %v", err)
+			return
 		} else {
 			t.Fatalf("RemoveBlobs: %v", err)
 		}
 	}
 	r.testEnumerate(nil) // verify they're all gone
+	if len(blobRefs) > 0 {
+		t.Logf("Testing double-delete")
+		if err := sto.RemoveBlobs([]blob.Ref{blobRefs[0]}); err != nil {
+			t.Fatalf("Double RemoveBlobs: %v", err)
+		}
+	}
 }
 
 func (r *run) testSubFetcher() {

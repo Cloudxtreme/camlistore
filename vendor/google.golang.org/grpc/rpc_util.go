@@ -34,11 +34,13 @@
 package grpc
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
-	"math/rand"
 	"os"
 	"time"
 
@@ -46,6 +48,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/transport"
 )
 
@@ -60,7 +63,7 @@ type Codec interface {
 	String() string
 }
 
-// protoCodec is a Codec implemetation with protobuf. It is the default codec for gRPC.
+// protoCodec is a Codec implementation with protobuf. It is the default codec for gRPC.
 type protoCodec struct{}
 
 func (protoCodec) Marshal(v interface{}) ([]byte, error) {
@@ -74,6 +77,73 @@ func (protoCodec) Unmarshal(data []byte, v interface{}) error {
 func (protoCodec) String() string {
 	return "proto"
 }
+
+// Compressor defines the interface gRPC uses to compress a message.
+type Compressor interface {
+	// Do compresses p into w.
+	Do(w io.Writer, p []byte) error
+	// Type returns the compression algorithm the Compressor uses.
+	Type() string
+}
+
+// NewGZIPCompressor creates a Compressor based on GZIP.
+func NewGZIPCompressor() Compressor {
+	return &gzipCompressor{}
+}
+
+type gzipCompressor struct {
+}
+
+func (c *gzipCompressor) Do(w io.Writer, p []byte) error {
+	z := gzip.NewWriter(w)
+	if _, err := z.Write(p); err != nil {
+		return err
+	}
+	return z.Close()
+}
+
+func (c *gzipCompressor) Type() string {
+	return "gzip"
+}
+
+// Decompressor defines the interface gRPC uses to decompress a message.
+type Decompressor interface {
+	// Do reads the data from r and uncompress them.
+	Do(r io.Reader) ([]byte, error)
+	// Type returns the compression algorithm the Decompressor uses.
+	Type() string
+}
+
+type gzipDecompressor struct {
+}
+
+// NewGZIPDecompressor creates a Decompressor based on GZIP.
+func NewGZIPDecompressor() Decompressor {
+	return &gzipDecompressor{}
+}
+
+func (d *gzipDecompressor) Do(r io.Reader) ([]byte, error) {
+	z, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	defer z.Close()
+	return ioutil.ReadAll(z)
+}
+
+func (d *gzipDecompressor) Type() string {
+	return "gzip"
+}
+
+// callInfo contains all related configuration and information about an RPC.
+type callInfo struct {
+	failFast  bool
+	headerMD  metadata.MD
+	trailerMD metadata.MD
+	traceInfo traceInfo // in trace.go
+}
+
+var defaultCallInfo = callInfo{failFast: true}
 
 // CallOption configures a Call before it starts or extracts information from
 // a Call after it completes.
@@ -113,60 +183,106 @@ func Trailer(md *metadata.MD) CallOption {
 	})
 }
 
-// The format of the payload: compressed or not?
-type payloadFormat uint8
-
-const (
-	compressionNone payloadFormat = iota // no compression
-	compressionFlate
-	// More formats
-)
-
-// parser reads complelete gRPC messages from the underlying reader.
-type parser struct {
-	s io.Reader
+// FailFast configures the action to take when an RPC is attempted on broken
+// connections or unreachable servers. If failfast is true, the RPC will fail
+// immediately. Otherwise, the RPC client will block the call until a
+// connection is available (or the call is canceled or times out) and will retry
+// the call if it fails due to a transient error. Please refer to
+// https://github.com/grpc/grpc/blob/master/doc/fail_fast.md
+func FailFast(failFast bool) CallOption {
+	return beforeCall(func(c *callInfo) error {
+		c.failFast = failFast
+		return nil
+	})
 }
 
-// recvMsg is to read a complete gRPC message from the stream. It is blocking if
-// the message has not been complete yet. It returns the message and its type,
-// EOF is returned with nil msg and 0 pf if the entire stream is done. Other
-// non-nil error is returned if something is wrong on reading.
-func (p *parser) recvMsg() (pf payloadFormat, msg []byte, err error) {
+// compressedFlag is the leading 1 byte "Compressed-Flag"
+// of the 5 byte message header. Currently only two values
+// are defined: 0 and 1.
+// See http://www.grpc.io/docs/guides/wire.html
+type compressedFlag uint8
+
+const (
+	uncompressed compressedFlag = 0 // not compressed
+	compressed   compressedFlag = 1 // compressed
+)
+
+// parser reads complete gRPC messages from the underlying reader.
+type parser struct {
+	// r is the underlying reader.
+	// See the comment on recvMsg for the permissible
+	// error types.
+	r io.Reader
+
 	// The header of a gRPC message. Find more detail
 	// at http://www.grpc.io/docs/guides/wire.html.
-	var buf [5]byte
+	header [5]byte
+}
 
-	if _, err := io.ReadFull(p.s, buf[:]); err != nil {
+// recvMsg reads a complete gRPC message from the stream.
+//
+// It returns the message and its payload (compression/encoding)
+// format. The caller owns the returned msg memory.
+//
+// If there is an error, possible values are:
+//   * io.EOF, when no messages remain
+//   * io.ErrUnexpectedEOF
+//   * of type transport.ConnectionError
+//   * of type transport.StreamError
+// No other error values or types must be returned, which also means
+// that the underlying io.Reader must not return an incompatible
+// error.
+func (p *parser) recvMsg(maxMsgSize int) (cf compressedFlag, msg []byte, err error) {
+	if _, err := io.ReadFull(p.r, p.header[:]); err != nil {
 		return 0, nil, err
 	}
 
-	pf = payloadFormat(buf[0])
-	length := binary.BigEndian.Uint32(buf[1:])
+	cf = compressedFlag(p.header[0])
+	length := binary.BigEndian.Uint32(p.header[1:])
 
 	if length == 0 {
-		return pf, nil, nil
+		return cf, nil, nil
 	}
+	if length > uint32(maxMsgSize) {
+		return 0, nil, Errorf(codes.Internal, "grpc: received message length %d exceeding the max size %d", length, maxMsgSize)
+	}
+	// TODO(bradfitz,zhaoq): garbage. reuse buffer after proto decoding instead
+	// of making it for each message:
 	msg = make([]byte, int(length))
-	if _, err := io.ReadFull(p.s, msg); err != nil {
+	if _, err := io.ReadFull(p.r, msg); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return 0, nil, err
 	}
-	return pf, msg, nil
+	return cf, msg, nil
 }
 
 // encode serializes msg and prepends the message header. If msg is nil, it
 // generates the message header of 0 message length.
-func encode(c Codec, msg interface{}, pf payloadFormat) ([]byte, error) {
-	var b []byte
-	var length uint
+func encode(c Codec, msg interface{}, cp Compressor, cbuf *bytes.Buffer, outPayload *stats.OutPayload) ([]byte, error) {
+	var (
+		b      []byte
+		length uint
+	)
 	if msg != nil {
 		var err error
 		// TODO(zhaoq): optimize to reduce memory alloc and copying.
 		b, err = c.Marshal(msg)
 		if err != nil {
 			return nil, err
+		}
+		if outPayload != nil {
+			outPayload.Payload = msg
+			// TODO truncate large payload.
+			outPayload.Data = b
+			outPayload.Length = len(b)
+		}
+		if cp != nil {
+			if err := cp.Do(cbuf, b); err != nil {
+				return nil, err
+			}
+			b = cbuf.Bytes()
 		}
 		length = uint(len(b))
 	}
@@ -175,38 +291,80 @@ func encode(c Codec, msg interface{}, pf payloadFormat) ([]byte, error) {
 	}
 
 	const (
-		payloadLen = 1
-		sizeLen    = 4
+		compressFlagLen = 1
+		sizeLen         = 4
 	)
 
-	var buf = make([]byte, payloadLen+sizeLen+len(b))
+	var buf = make([]byte, compressFlagLen+sizeLen+len(b))
 
 	// Write payload format
-	buf[0] = byte(pf)
+	if cp == nil {
+		buf[0] = byte(uncompressed)
+	} else {
+		buf[0] = byte(compressed)
+	}
 	// Write length of b into buf
 	binary.BigEndian.PutUint32(buf[1:], uint32(length))
 	// Copy encoded msg to buf
 	copy(buf[5:], b)
 
+	if outPayload != nil {
+		outPayload.WireLength = len(buf)
+	}
+
 	return buf, nil
 }
 
-func recv(p *parser, c Codec, m interface{}) error {
-	pf, d, err := p.recvMsg()
+func checkRecvPayload(cf compressedFlag, recvCompress string, dc Decompressor) error {
+	switch cf {
+	case uncompressed:
+	case compressed:
+		if dc == nil || recvCompress != dc.Type() {
+			return Errorf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", recvCompress)
+		}
+	default:
+		return Errorf(codes.Internal, "grpc: received unexpected payload format %d", cf)
+	}
+	return nil
+}
+
+// TODO(bradfitz): remove this function once transport.Stream is deleted; rename recvNew
+func recv(p *parser, c Codec, s *transport.Stream, dc Decompressor, dstMsg interface{}, maxMsgSize int, inPayload *stats.InPayload) error {
+	return recvNew(p, c, s.RecvCompress(), dc, dstMsg, maxMsgSize, inPayload)
+}
+
+// TODO(bradfitz): rename/refactor this, once recv above is deleted.
+func recvNew(p *parser, c Codec, recvCompress string, dc Decompressor, dstMsg interface{}, maxMsgSize int, inPayload *stats.InPayload) error {
+	cf, d, err := p.recvMsg(maxMsgSize)
 	if err != nil {
 		return err
 	}
-	switch pf {
-	case compressionNone:
-		if err := c.Unmarshal(d, m); err != nil {
-			if rErr, ok := err.(rpcError); ok {
-				return rErr
-			} else {
-				return Errorf(codes.Internal, "grpc: %v", err)
-			}
+	if inPayload != nil {
+		inPayload.WireLength = len(d)
+	}
+	if err := checkRecvPayload(cf, recvCompress, dc); err != nil {
+		return err
+	}
+	if cf == compressed {
+		d, err = dc.Do(bytes.NewReader(d))
+		if err != nil {
+			return Errorf(codes.Internal, "grpc: failed to decompress the received message %v", err)
 		}
-	default:
-		return Errorf(codes.Internal, "gprc: compression is not supported yet.")
+	}
+	if len(d) > maxMsgSize {
+		// TODO: Revisit the error code. Currently keep it consistent with java
+		// implementation.
+		return Errorf(codes.Internal, "grpc: received a message of %d bytes exceeding %d limit", len(d), maxMsgSize)
+	}
+	if err := c.Unmarshal(d, dstMsg); err != nil {
+		return Errorf(codes.Internal, "grpc: failed to unmarshal the received message %v", err)
+	}
+	if inPayload != nil {
+		inPayload.RecvTime = time.Now()
+		inPayload.Payload = dstMsg
+		// TODO truncate large payload.
+		inPayload.Data = d
+		inPayload.Length = len(d)
 	}
 	return nil
 }
@@ -217,8 +375,8 @@ type rpcError struct {
 	desc string
 }
 
-func (e rpcError) Error() string {
-	return fmt.Sprintf("rpc error: code = %d desc = %q", e.code, e.desc)
+func (e *rpcError) Error() string {
+	return fmt.Sprintf("rpc error: code = %d desc = %s", e.code, e.desc)
 }
 
 // Code returns the error code for err if it was produced by the rpc system.
@@ -227,7 +385,7 @@ func Code(err error) codes.Code {
 	if err == nil {
 		return codes.OK
 	}
-	if e, ok := err.(rpcError); ok {
+	if e, ok := err.(*rpcError); ok {
 		return e.code
 	}
 	return codes.Unknown
@@ -239,7 +397,7 @@ func ErrorDesc(err error) string {
 	if err == nil {
 		return ""
 	}
-	if e, ok := err.(rpcError); ok {
+	if e, ok := err.(*rpcError); ok {
 		return e.desc
 	}
 	return err.Error()
@@ -251,7 +409,7 @@ func Errorf(c codes.Code, format string, a ...interface{}) error {
 	if c == codes.OK {
 		return nil
 	}
-	return rpcError{
+	return &rpcError{
 		code: c,
 		desc: fmt.Sprintf(format, a...),
 	}
@@ -260,18 +418,37 @@ func Errorf(c codes.Code, format string, a ...interface{}) error {
 // toRPCErr converts an error into a rpcError.
 func toRPCErr(err error) error {
 	switch e := err.(type) {
-	case rpcError:
+	case *rpcError:
 		return err
 	case transport.StreamError:
-		return rpcError{
+		return &rpcError{
 			code: e.Code,
 			desc: e.Desc,
 		}
 	case transport.ConnectionError:
-		return rpcError{
+		return &rpcError{
 			code: codes.Internal,
 			desc: e.Desc,
 		}
+	default:
+		switch err {
+		case context.DeadlineExceeded:
+			return &rpcError{
+				code: codes.DeadlineExceeded,
+				desc: err.Error(),
+			}
+		case context.Canceled:
+			return &rpcError{
+				code: codes.Canceled,
+				desc: err.Error(),
+			}
+		case ErrClientConnClosing:
+			return &rpcError{
+				code: codes.FailedPrecondition,
+				desc: err.Error(),
+			}
+		}
+
 	}
 	return Errorf(codes.Unknown, "%v", err)
 }
@@ -304,34 +481,45 @@ func convertCode(err error) codes.Code {
 	return codes.Unknown
 }
 
-const (
-	// how long to wait after the first failure before retrying
-	baseDelay = 1.0 * time.Second
-	// upper bound of backoff delay
-	maxDelay = 120 * time.Second
-	// backoff increases by this factor on each retry
-	backoffFactor = 1.6
-	// backoff is randomized downwards by this factor
-	backoffJitter = 0.2
-)
-
-func backoff(retries int) (t time.Duration) {
-	if retries == 0 {
-		return baseDelay
-	}
-	backoff, max := float64(baseDelay), float64(maxDelay)
-	for backoff < max && retries > 0 {
-		backoff *= backoffFactor
-		retries--
-	}
-	if backoff > max {
-		backoff = max
-	}
-	// Randomize backoff delays so that if a cluster of requests start at
-	// the same time, they won't operate in lockstep.
-	backoff *= 1 + backoffJitter*(rand.Float64()*2-1)
-	if backoff < 0 {
-		return 0
-	}
-	return time.Duration(backoff)
+// MethodConfig defines the configuration recommended by the service providers for a
+// particular method.
+// This is EXPERIMENTAL and subject to change.
+type MethodConfig struct {
+	// WaitForReady indicates whether RPCs sent to this method should wait until
+	// the connection is ready by default (!failfast). The value specified via the
+	// gRPC client API will override the value set here.
+	WaitForReady bool
+	// Timeout is the default timeout for RPCs sent to this method. The actual
+	// deadline used will be the minimum of the value specified here and the value
+	// set by the application via the gRPC client API.  If either one is not set,
+	// then the other will be used.  If neither is set, then the RPC has no deadline.
+	Timeout time.Duration
+	// MaxReqSize is the maximum allowed payload size for an individual request in a
+	// stream (client->server) in bytes. The size which is measured is the serialized,
+	// uncompressed payload in bytes. The actual value used is the minumum of the value
+	// specified here and the value set by the application via the gRPC client API. If
+	// either one is not set, then the other will be used.  If neither is set, then the
+	// built-in default is used.
+	// TODO: support this.
+	MaxReqSize uint64
+	// MaxRespSize is the maximum allowed payload size for an individual response in a
+	// stream (server->client) in bytes.
+	// TODO: support this.
+	MaxRespSize uint64
 }
+
+// ServiceConfig is provided by the service provider and contains parameters for how
+// clients that connect to the service should behave.
+// This is EXPERIMENTAL and subject to change.
+type ServiceConfig struct {
+	// Methods contains a map for the methods in this service.
+	Methods map[string]MethodConfig
+}
+
+// SupportPackageIsVersion4 is referenced from generated protocol buffer files
+// to assert that that code is compatible with this version of the grpc package.
+//
+// This constant may be renamed in the future if a change in the generated code
+// requires a synchronised update of grpc-go and protoc-gen-go. This constant
+// should not be referenced from any other code.
+const SupportPackageIsVersion4 = true

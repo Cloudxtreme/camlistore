@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -64,6 +65,8 @@ type Index struct {
 	corpus *Corpus // or nil, if not being kept in memory
 
 	mu sync.RWMutex // guards following
+	//mu syncdebug.RWMutexTracker  // (when debugging)
+
 	// needs maps from a blob to the missing blobs it needs to
 	// finish indexing.
 	needs map[blob.Ref][]blob.Ref
@@ -71,15 +74,25 @@ type Index struct {
 	// and the value(s) are blobs waiting to be reindexed.
 	neededBy     map[blob.Ref][]blob.Ref
 	readyReindex map[blob.Ref]bool // set of things ready to be re-indexed
-	oooRunning   bool              // whether outOfOrderIndexerLoop is running.
+	// reindexWg is used to make sure that we wait for all asynchronous, out
+	// of order, indexing to be finished, at the end of reindexing.
+	reindexWg sync.WaitGroup
+	// oooDisabled reports whether out of order indexing is disabled. It
+	// should only be the case in some very specific tests.
+	oooDisabled bool
 	// blobSource is used for fetching blobs when indexing files and other
 	// blobs types that reference other objects.
 	// The only write access to blobSource should be its initialization (transition
 	// from nil to non-nil), once, and protected by mu.
 	blobSource blobserver.FetcherEnumerator
 
-	tickleOoo chan bool // tickle out-of-order reindex loop, whenever readyReindex is added to
+	hasWiped bool // whether Wipe has been called on s. So we don't redo it in Reindex() for nothing.
 }
+
+func (x *Index) Lock()    { x.mu.Lock() }
+func (x *Index) Unlock()  { x.mu.Unlock() }
+func (x *Index) RLock()   { x.mu.RLock() }
+func (x *Index) RUnlock() { x.mu.RUnlock() }
 
 var (
 	_ blobserver.Storage = (*Index)(nil)
@@ -88,36 +101,24 @@ var (
 
 var aboutToReindex = false
 
-// SetImpendingReindex notes that the user ran the camlistored binary with the --reindex flag.
-// Because the index is about to be wiped, schema version checks should be suppressed.
-func SetImpendingReindex() {
-	// TODO: remove this function, once we refactor how indexes are created.
-	// They'll probably not all have their own storage constructor registered.
-	aboutToReindex = true
-}
+// TODO(mpl): I'm not sure there are any cases where we don't want the index to
+// have a blobSource, so maybe we should phase out InitBlobSource and integrate it
+// to New or something. But later.
 
 // InitBlobSource sets the index's blob source and starts the background
 // out-of-order indexing loop. It panics if the blobSource is already set.
 // If the index's key fetcher is nil, it is also set to the blobSource
 // argument.
 func (x *Index) InitBlobSource(blobSource blobserver.FetcherEnumerator) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
+	x.Lock()
+	defer x.Unlock()
 	if x.blobSource != nil {
 		panic("blobSource of Index already set")
 	}
 	x.blobSource = blobSource
-	if x.oooRunning {
-		panic("outOfOrderIndexerLoop should never have previously started without a blobSource")
-	}
 	if x.KeyFetcher == nil {
 		x.KeyFetcher = blobSource
 	}
-	if disableOoo, _ := strconv.ParseBool(os.Getenv("CAMLI_TESTREINDEX_DISABLE_OOO")); disableOoo {
-		// For Reindex test in pkg/index/indextest/tests.go
-		return
-	}
-	go x.outOfOrderIndexerLoop()
 }
 
 // New returns a new index using the provided key/value storage implementation.
@@ -127,7 +128,6 @@ func New(s sorted.KeyValue) (*Index, error) {
 		needs:        make(map[blob.Ref][]blob.Ref),
 		neededBy:     make(map[blob.Ref][]blob.Ref),
 		readyReindex: make(map[blob.Ref]bool),
-		tickleOoo:    make(chan bool, 1),
 	}
 	if aboutToReindex {
 		idx.deletes = newDeletionCache()
@@ -280,13 +280,32 @@ func (x *Index) fixMissingWholeRef(fetcher blob.Fetcher) (err error) {
 func newFromConfig(ld blobserver.Loader, config jsonconfig.Obj) (blobserver.Storage, error) {
 	blobPrefix := config.RequiredString("blobSource")
 	kvConfig := config.RequiredObject("storage")
+	reindex := config.OptionalBool("reindex", false)
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+
 	kv, err := sorted.NewKeyValue(kvConfig)
 	if err != nil {
-		return nil, err
+		if _, ok := err.(sorted.NeedWipeError); !ok {
+			return nil, err
+		}
+		if !reindex {
+			return nil, err
+		}
 	}
+	if reindex {
+		aboutToReindex = true
+		wiper, ok := kv.(sorted.Wiper)
+		if !ok {
+			return nil, fmt.Errorf("index's storage type %T doesn't support sorted.Wiper", kv)
+		}
+		if err := wiper.Wipe(); err != nil {
+			return nil, fmt.Errorf("error wiping index's sorted key/value type %T: %v", kv, err)
+		}
+		log.Printf("Index wiped.")
+	}
+
 	sto, err := ld.GetStorage(blobPrefix)
 	if err != nil {
 		return nil, err
@@ -305,10 +324,19 @@ func newFromConfig(ld blobserver.Loader, config jsonconfig.Obj) (blobserver.Stor
 		}
 		ix, err = New(kv)
 	}
+	if reindex {
+		ix.hasWiped = true
+	}
 	if err != nil {
 		return nil, err
 	}
 	ix.InitBlobSource(sto)
+
+	if !reindex {
+		if err := ix.integrityCheck(3 * time.Second); err != nil {
+			return nil, err
+		}
+	}
 
 	return ix, err
 }
@@ -349,19 +377,28 @@ func ReindexMaxProcs() int {
 }
 
 func (x *Index) Reindex() error {
+	x.Lock()
+	if x.blobSource == nil {
+		x.Unlock()
+		return errors.New("index: can't re-index: no blobSource")
+	}
+	x.Unlock()
 	reindexMaxProcs.RLock()
 	defer reindexMaxProcs.RUnlock()
 	ctx := context.TODO()
 
-	wiper, ok := x.s.(sorted.Wiper)
-	if !ok {
-		return fmt.Errorf("index's storage type %T doesn't support sorted.Wiper", x.s)
+	if !x.hasWiped {
+		wiper, ok := x.s.(sorted.Wiper)
+		if !ok {
+			return fmt.Errorf("index's storage type %T doesn't support sorted.Wiper", x.s)
+		}
+		log.Printf("Wiping index storage type %T ...", x.s)
+		if err := wiper.Wipe(); err != nil {
+			return fmt.Errorf("error wiping index's sorted key/value type %T: %v", x.s, err)
+		}
+		log.Printf("Index wiped.")
 	}
-	log.Printf("Wiping index storage type %T ...", x.s)
-	if err := wiper.Wipe(); err != nil {
-		return fmt.Errorf("error wiping index's sorted key/value type %T: %v", x.s, err)
-	}
-	log.Printf("Index wiped. Rebuilding...")
+	log.Printf("Rebuilding index...")
 
 	reindexStart, _ := blob.Parse(os.Getenv("CAMLI_REINDEX_START"))
 
@@ -420,12 +457,17 @@ func (x *Index) Reindex() error {
 	}
 
 	wg.Wait()
+	x.reindexWg.Wait()
 
-	x.mu.Lock()
+	x.RLock()
 	readyCount := len(x.readyReindex)
-	x.mu.Unlock()
+	needed := len(x.needs)
+	x.RUnlock()
 	if readyCount > 0 {
 		return fmt.Errorf("%d blobs were ready to reindex in out-of-order queue, but not yet ran", readyCount)
+	}
+	if needed > 0 {
+		return fmt.Errorf("%d blobs are still needed as dependencies", needed)
 	}
 
 	log.Printf("Index rebuild complete.")
@@ -435,6 +477,50 @@ func (x *Index) Reindex() error {
 	}
 	if err := x.initDeletesCache(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// integrityCheck enumerates blobs through x.blobSource during timemout, and
+// verifies for each of them that it has a meta row in the index. It logs a message
+// if any of them is not found. It only returns an error if something went wrong
+// during the enumeration.
+func (x *Index) integrityCheck(timeout time.Duration) error {
+	log.Print("Starting index integrity check.")
+	defer log.Print("Index integrity check done.")
+	if x.blobSource == nil {
+		return errors.New("index: can't check sanity of index: no blobSource")
+	}
+
+	// we don't actually need seen atm, but I anticipate we'll return it at some
+	// point, so we can display the blobs that were tested/seen/missed on the web UI.
+	seen := make([]blob.Ref, 0)
+	notFound := make([]blob.Ref, 0)
+	enumCtx := context.TODO()
+	stopTime := time.NewTimer(timeout)
+	defer stopTime.Stop()
+	var errEOT = errors.New("time's out")
+	if err := blobserver.EnumerateAll(enumCtx, x.blobSource, func(sb blob.SizedRef) error {
+		select {
+		case <-stopTime.C:
+			return errEOT
+		default:
+		}
+		if _, err := x.GetBlobMeta(enumCtx, sb.Ref); err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+			notFound = append(notFound, sb.Ref)
+			return nil
+		}
+		seen = append(seen, sb.Ref)
+		return nil
+	}); err != nil && err != errEOT {
+		return err
+	}
+	if len(notFound) > 0 {
+		// TODO(mpl): at least on GCE, display that message and maybe more on a web UI page as well.
+		log.Printf("WARNING: sanity checking of the index found %d non-indexed blobs out of %d tested blobs. Reindexing is advised.", len(notFound), len(notFound)+len(seen))
 	}
 	return nil
 }
@@ -615,15 +701,15 @@ func (x *Index) isDeletedNoCache(br blob.Ref) bool {
 
 // GetRecentPermanodes sends results to dest filtered by owner, limit, and
 // before.  A zero value for before will default to the current time.  The
-// results will have duplicates supressed, with most recent permanode
+// results will have duplicates suppressed, with most recent permanode
 // returned.
 // Note, permanodes more recent than before will still be fetched from the
 // index then skipped. This means runtime scales linearly with the number of
 // nodes more recent than before.
-func (x *Index) GetRecentPermanodes(dest chan<- camtypes.RecentPermanode, owner blob.Ref, limit int, before time.Time) (err error) {
+func (x *Index) GetRecentPermanodes(ctx context.Context, dest chan<- camtypes.RecentPermanode, owner blob.Ref, limit int, before time.Time) (err error) {
 	defer close(dest)
 
-	keyId, err := x.KeyId(owner)
+	keyId, err := x.KeyId(ctx, owner)
 	if err == sorted.ErrNotFound {
 		log.Printf("No recent permanodes because keyId for owner %v not found", owner)
 		return nil
@@ -676,11 +762,11 @@ func (x *Index) GetRecentPermanodes(dest chan<- camtypes.RecentPermanode, owner 
 	return nil
 }
 
-func (x *Index) AppendClaims(dst []camtypes.Claim, permaNode blob.Ref,
+func (x *Index) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
 	signerFilter blob.Ref,
 	attrFilter string) ([]camtypes.Claim, error) {
 	if x.corpus != nil {
-		return x.corpus.AppendClaims(dst, permaNode, signerFilter, attrFilter)
+		return x.corpus.AppendClaims(ctx, dst, permaNode, signerFilter, attrFilter)
 	}
 	var (
 		keyId string
@@ -688,7 +774,7 @@ func (x *Index) AppendClaims(dst []camtypes.Claim, permaNode blob.Ref,
 		it    sorted.Iterator
 	)
 	if signerFilter.Valid() {
-		keyId, err = x.KeyId(signerFilter)
+		keyId, err = x.KeyId(ctx, signerFilter)
 		if err == sorted.ErrNotFound {
 			return nil, nil
 		}
@@ -769,9 +855,9 @@ func kvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.C
 	}, true
 }
 
-func (x *Index) GetBlobMeta(br blob.Ref) (camtypes.BlobMeta, error) {
+func (x *Index) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	if x.corpus != nil {
-		return x.corpus.GetBlobMeta(br)
+		return x.corpus.GetBlobMeta(ctx, br)
 	}
 	key := "meta:" + br.String()
 	meta, err := x.s.Get(key)
@@ -797,15 +883,15 @@ func (x *Index) GetBlobMeta(br blob.Ref) (camtypes.BlobMeta, error) {
 	}, nil
 }
 
-func (x *Index) KeyId(signer blob.Ref) (string, error) {
+func (x *Index) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 	if x.corpus != nil {
-		return x.corpus.KeyId(signer)
+		return x.corpus.KeyId(ctx, signer)
 	}
 	return x.s.Get("signerkeyid:" + signer.String())
 }
 
-func (x *Index) PermanodeOfSignerAttrValue(signer blob.Ref, attr, val string) (permaNode blob.Ref, err error) {
-	keyId, err := x.KeyId(signer)
+func (x *Index) PermanodeOfSignerAttrValue(ctx context.Context, signer blob.Ref, attr, val string) (permaNode blob.Ref, err error) {
+	keyId, err := x.KeyId(ctx, signer)
 	if err == sorted.ErrNotFound {
 		return blob.Ref{}, os.ErrNotExist
 	}
@@ -825,7 +911,7 @@ func (x *Index) PermanodeOfSignerAttrValue(signer blob.Ref, attr, val string) (p
 
 // This is just like PermanodeOfSignerAttrValue except we return multiple and dup-suppress.
 // If request.Query is "", it is not used in the prefix search.
-func (x *Index) SearchPermanodesWithAttr(dest chan<- blob.Ref, request *camtypes.PermanodeByAttrRequest) (err error) {
+func (x *Index) SearchPermanodesWithAttr(ctx context.Context, dest chan<- blob.Ref, request *camtypes.PermanodeByAttrRequest) (err error) {
 	defer close(dest)
 	if request.FuzzyMatch {
 		// TODO(bradfitz): remove this for now? figure out how to handle it generically?
@@ -835,7 +921,7 @@ func (x *Index) SearchPermanodesWithAttr(dest chan<- blob.Ref, request *camtypes
 		return errors.New("index: missing Attribute in SearchPermanodesWithAttr")
 	}
 
-	keyId, err := x.KeyId(request.Signer)
+	keyId, err := x.KeyId(ctx, request.Signer)
 	if err == sorted.ErrNotFound {
 		return nil
 	}
@@ -850,6 +936,10 @@ func (x *Index) SearchPermanodesWithAttr(dest chan<- blob.Ref, request *camtypes
 		it = x.queryPrefix(keySignerAttrValue, keyId, request.Attribute, request.Query)
 	}
 	defer closeIterator(it, &err)
+	before := request.At
+	if before.IsZero() {
+		before = time.Now()
+	}
 	for it.Next() {
 		cl, ok := kvSignerAttrValue(it.Key(), it.Value())
 		if !ok {
@@ -859,6 +949,9 @@ func (x *Index) SearchPermanodesWithAttr(dest chan<- blob.Ref, request *camtypes
 			continue
 		}
 		if x.IsDeleted(cl.Permanode) {
+			continue
+		}
+		if cl.Date.After(before) {
 			continue
 		}
 		pnstr := cl.Permanode.String()
@@ -911,9 +1004,9 @@ func kvSignerAttrValue(k, v string) (c camtypes.Claim, ok bool) {
 	}, true
 }
 
-func (x *Index) PathsOfSignerTarget(signer, target blob.Ref) (paths []*camtypes.Path, err error) {
+func (x *Index) PathsOfSignerTarget(ctx context.Context, signer, target blob.Ref) (paths []*camtypes.Path, err error) {
 	paths = []*camtypes.Path{}
-	keyId, err := x.KeyId(signer)
+	keyId, err := x.KeyId(ctx, signer)
 	if err != nil {
 		if err == sorted.ErrNotFound {
 			err = nil
@@ -998,9 +1091,9 @@ func kvPathBackward(k, v string) (p camtypes.Path, ok bool, active bool) {
 	}, true, active
 }
 
-func (x *Index) PathsLookup(signer, base blob.Ref, suffix string) (paths []*camtypes.Path, err error) {
+func (x *Index) PathsLookup(ctx context.Context, signer, base blob.Ref, suffix string) (paths []*camtypes.Path, err error) {
 	paths = []*camtypes.Path{}
-	keyId, err := x.KeyId(signer)
+	keyId, err := x.KeyId(ctx, signer)
 	if err != nil {
 		if err == sorted.ErrNotFound {
 			err = nil
@@ -1076,8 +1169,8 @@ func kvPathForward(k, v string) (p camtypes.Path, ok bool, active bool) {
 	}, true, active
 }
 
-func (x *Index) PathLookup(signer, base blob.Ref, suffix string, at time.Time) (*camtypes.Path, error) {
-	paths, err := x.PathsLookup(signer, base, suffix)
+func (x *Index) PathLookup(ctx context.Context, signer, base blob.Ref, suffix string, at time.Time) (*camtypes.Path, error) {
+	paths, err := x.PathsLookup(ctx, signer, base, suffix)
 	if err != nil {
 		return nil, err
 	}
@@ -1132,9 +1225,9 @@ func (x *Index) loadKey(key string, val *string, err *error, wg *sync.WaitGroup)
 	*val, *err = x.s.Get(key)
 }
 
-func (x *Index) GetFileInfo(fileRef blob.Ref) (camtypes.FileInfo, error) {
+func (x *Index) GetFileInfo(ctx context.Context, fileRef blob.Ref) (camtypes.FileInfo, error) {
 	if x.corpus != nil {
-		return x.corpus.GetFileInfo(fileRef)
+		return x.corpus.GetFileInfo(ctx, fileRef)
 	}
 	ikey := "fileinfo|" + fileRef.String()
 	tkey := "filetimes|" + fileRef.String()
@@ -1212,9 +1305,9 @@ func kvImageInfo(v []byte) (ii camtypes.ImageInfo, ok bool) {
 	return ii, true
 }
 
-func (x *Index) GetImageInfo(fileRef blob.Ref) (camtypes.ImageInfo, error) {
+func (x *Index) GetImageInfo(ctx context.Context, fileRef blob.Ref) (camtypes.ImageInfo, error) {
 	if x.corpus != nil {
-		return x.corpus.GetImageInfo(fileRef)
+		return x.corpus.GetImageInfo(ctx, fileRef)
 	}
 	// it might be that the key does not exist because image.DecodeConfig failed earlier
 	// (because of unsupported JPEG features like progressive mode).
@@ -1233,20 +1326,65 @@ func (x *Index) GetImageInfo(fileRef blob.Ref) (camtypes.ImageInfo, error) {
 	return ii, nil
 }
 
-func (x *Index) GetMediaTags(fileRef blob.Ref) (tags map[string]string, err error) {
+func (x *Index) GetMediaTags(ctx context.Context, fileRef blob.Ref) (tags map[string]string, err error) {
 	if x.corpus != nil {
-		return x.corpus.GetMediaTags(fileRef)
+		return x.corpus.GetMediaTags(ctx, fileRef)
 	}
-	fi, err := x.GetFileInfo(fileRef)
+	fi, err := x.GetFileInfo(ctx, fileRef)
 	if err != nil {
 		return nil, err
 	}
 	it := x.queryPrefix(keyMediaTag, fi.WholeRef.String())
 	defer closeIterator(it, &err)
 	for it.Next() {
+		if tags == nil {
+			tags = make(map[string]string)
+		}
 		tags[it.Key()] = it.Value()
 	}
 	return tags, nil
+}
+
+func (x *Index) GetFileLocation(ctx context.Context, fileRef blob.Ref) (camtypes.Location, error) {
+	if x.corpus != nil {
+		lat, long, ok := x.corpus.FileLatLong(fileRef)
+		if !ok {
+			return camtypes.Location{}, os.ErrNotExist
+		}
+		// TODO(mpl): Brad says to move this check lower, in corpus func and/or when building corpus from index rows.
+		if math.IsNaN(long) || math.IsNaN(lat) {
+			return camtypes.Location{}, fmt.Errorf("Latitude or Longitude in corpus for %v is NaN. Reindex to fix it.", fileRef)
+		}
+		return camtypes.Location{Latitude: lat, Longitude: long}, nil
+	}
+	fi, err := x.GetFileInfo(ctx, fileRef)
+	if err != nil {
+		return camtypes.Location{}, err
+	}
+	it := x.queryPrefixString(keyEXIFGPS.Key(fi.WholeRef.String()))
+	defer closeIterator(it, &err)
+	if !it.Next() {
+		return camtypes.Location{}, os.ErrNotExist
+	}
+
+	var lat, long float64
+	key, v := it.Key(), it.Value()
+	pipe := strings.Index(v, "|")
+	if pipe < 0 {
+		return camtypes.Location{}, fmt.Errorf("index: bogus key %q = %q", key, v)
+	}
+	lat, err = strconv.ParseFloat(v[:pipe], 64)
+	if err != nil {
+		return camtypes.Location{}, fmt.Errorf("index: bogus value at position 0 in key %q = %q", key, v)
+	}
+	long, err = strconv.ParseFloat(v[pipe+1:], 64)
+	if err != nil {
+		return camtypes.Location{}, fmt.Errorf("index: bogus value at position 1 in key %q = %q", key, v)
+	}
+	if math.IsNaN(long) || math.IsNaN(lat) {
+		return camtypes.Location{}, fmt.Errorf("Latitude or Longitude in index for %v is NaN. Reindex to fix it.", fileRef)
+	}
+	return camtypes.Location{Latitude: lat, Longitude: long}, nil
 }
 
 func (x *Index) EdgesTo(ref blob.Ref, opts *camtypes.EdgesToOpts) (edges []*camtypes.Edge, err error) {
@@ -1390,34 +1528,48 @@ func enumerateBlobMeta(s sorted.KeyValue, cb func(camtypes.BlobMeta) error) (err
 	return nil
 }
 
-func enumerateSignerKeyId(s sorted.KeyValue, cb func(blob.Ref, string)) (err error) {
-	const pfx = "signerkeyid:"
-	it := queryPrefixString(s, pfx)
-	defer closeIterator(it, &err)
-	for it.Next() {
-		if br, ok := blob.Parse(strings.TrimPrefix(it.Key(), pfx)); ok {
-			cb(br, it.Value())
-		}
-	}
-	return
-}
+var errStopIteration = errors.New("stop iteration") // local error, doesn't escape this package
 
-// EnumerateBlobMeta sends all metadata about all known blobs to ch and then closes ch.
-func (x *Index) EnumerateBlobMeta(ctx context.Context, ch chan<- camtypes.BlobMeta) (err error) {
+// EnumerateBlobMeta calls fn for all known meta blobs.
+// If fn returns false, iteration stops and an nil error is returned.
+// If ctx becomes done, iteration stops and ctx.Err() is returned.
+func (x *Index) EnumerateBlobMeta(ctx context.Context, fn func(camtypes.BlobMeta) bool) error {
 	if x.corpus != nil {
-		x.corpus.RLock()
-		defer x.corpus.RUnlock()
-		return x.corpus.EnumerateBlobMetaLocked(ctx, ch)
+		var err error
+		var n int
+		done := ctx.Done()
+		x.corpus.EnumerateBlobMeta(func(m camtypes.BlobMeta) bool {
+			// Every so often, check context.
+			n++
+			if n%256 == 0 {
+				select {
+				case <-done:
+					err = ctx.Err()
+					return false
+				default:
+
+				}
+			}
+			return fn(m)
+		})
+		return err
 	}
-	defer close(ch)
-	return enumerateBlobMeta(x.s, func(bm camtypes.BlobMeta) error {
+	done := ctx.Done()
+	err := enumerateBlobMeta(x.s, func(bm camtypes.BlobMeta) error {
 		select {
-		case ch <- bm:
-		case <-ctx.Done():
+		case <-done:
 			return ctx.Err()
+		default:
+			if !fn(bm) {
+				return errStopIteration
+			}
+			return nil
 		}
-		return nil
 	})
+	if err == errStopIteration {
+		err = nil
+	}
+	return err
 }
 
 // Storage returns the index's underlying Storage implementation.
@@ -1430,7 +1582,6 @@ func (x *Index) Close() error {
 	if cl, ok := x.s.(io.Closer); ok {
 		return cl.Close()
 	}
-	close(x.tickleOoo)
 	return nil
 }
 
@@ -1465,10 +1616,8 @@ func (x *Index) noteNeeded(have, missing blob.Ref) error {
 }
 
 func (x *Index) noteNeededMemory(have, missing blob.Ref) {
-	x.mu.Lock()
 	x.needs[have] = append(x.needs[have], missing)
 	x.neededBy[missing] = append(x.neededBy[missing], have)
-	x.mu.Unlock()
 }
 
 const camliTypeMIMEPrefix = "application/json; camliType="

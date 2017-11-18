@@ -22,7 +22,7 @@ limitations under the License.
 goog.provide('cam.TagsControl');
 
 goog.require('goog.array');
-goog.require('goog.labs.Promise');
+goog.require('goog.Promise');
 goog.require('goog.object');
 goog.require('goog.Uri');
 
@@ -54,7 +54,7 @@ cam.TagsControl = React.createClass({
 	},
 
 	executePromises: function(componentId, promises, callbackSuccess) {
-		goog.labs.Promise.all(promises).thenCatch(function(e) {
+		goog.Promise.all(promises).thenCatch(function(e) {
 			console.error('%s: error executing promises: %s', componentId, e);
 			alert('The system encountered an error updating tags: ' + e);
 		}).then(function(results) {
@@ -89,23 +89,21 @@ cam.TagsControl = React.createClass({
 					className: 'cam-tagscontrol-header'
 				}
 			),
-			cam.AddTagsInput(
-				{
-					blobrefs: blobrefs,
-					serverConnection: this.props.serverConnection,
-					doesBlobHaveTag: this.doesBlobHaveTag,
-					executePromises: this.executePromises
-				}
-			),
-			cam.EditTagsControl(
-				{
-					blobs: blobs,
-					blobrefs: blobrefs,
-					serverConnection: this.props.serverConnection,
-					doesBlobHaveTag: this.doesBlobHaveTag,
-					executePromises: this.executePromises
-				}
-			)
+
+			React.createElement(cam.AddTagsInput, {
+				blobrefs: blobrefs,
+				serverConnection: this.props.serverConnection,
+				doesBlobHaveTag: this.doesBlobHaveTag,
+				executePromises: this.executePromises
+			}),
+
+			React.createElement(cam.EditTagsControl, {
+				blobs: blobs,
+				blobrefs: blobrefs,
+				serverConnection: this.props.serverConnection,
+				doesBlobHaveTag: this.doesBlobHaveTag,
+				executePromises: this.executePromises
+			})
 		);
 	}
 });
@@ -134,7 +132,7 @@ cam.AddTagsInput = React.createClass({
 	},
 
 	getInputNode: function() {
-		return this.refs['inputField'].getDOMNode();
+		return this.refs['inputField'];
 	},
 
 	handleOnSubmit_: function(e) {
@@ -175,7 +173,7 @@ cam.AddTagsInput = React.createClass({
 		blobrefs.forEach(function(pm) {
 			tags.forEach(function(tag) {
 				if (!doesBlobHaveTag(pm, tag)) {
-					promises.push(new goog.labs.Promise(sc.newAddAttributeClaim.bind(sc, pm, 'tag', tag)));
+					promises.push(new goog.Promise(sc.newAddAttributeClaim.bind(sc, pm, 'tag', tag)));
 				}
 			});
 		});
@@ -242,7 +240,7 @@ cam.EditTagsControl = React.createClass({
 
 		blobrefs.forEach(function(pm) {
 			if (!doesBlobHaveTag(pm, tag)) {
-				promises.push(new goog.labs.Promise(sc.newAddAttributeClaim.bind(sc, pm, 'tag', tag)));
+				promises.push(new goog.Promise(sc.newAddAttributeClaim.bind(sc, pm, 'tag', tag)));
 			}
 		});
 
@@ -257,7 +255,7 @@ cam.EditTagsControl = React.createClass({
 
 		blobrefs.forEach(function(pm) {
 			if (doesBlobHaveTag(pm, tag)) {
-				promises.push(new goog.labs.Promise(sc.newDelAttributeClaim.bind(sc, pm, 'tag', tag)));
+				promises.push(new goog.Promise(sc.newDelAttributeClaim.bind(sc, pm, 'tag', tag)));
 			}
 		});
 

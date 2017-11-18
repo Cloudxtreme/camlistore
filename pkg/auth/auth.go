@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package auth implements Camlistore authentication.
-package auth
+package auth // import "camlistore.org/pkg/auth"
 
 import (
 	"crypto/rand"
@@ -50,8 +50,10 @@ const (
 	OpAll    = OpUpload | OpEnumerate | OpStat | OpRemove | OpGet | OpSign | OpDiscovery
 )
 
+const OmitAuthToken = "OmitAuthToken"
+
 var (
-	// Each mode defines an auth logic which depends on the choosen auth mechanism.
+	// Each mode defines an auth logic which depends on the chosen auth mechanism.
 	// Access is allowed if any of the modes allows it.
 	// No need to guard for now as all the writes are done sequentially during setup.
 	modes []AuthMode
@@ -88,6 +90,7 @@ var authConstructor = map[string]AuthConfigParser{
 	"none":      newNoneAuth,
 	"localhost": newLocalhostAuth,
 	"userpass":  newUserPassAuth,
+	"token":     NewTokenAuth,
 	"devauth":   newDevAuth,
 	"basic":     newBasicAuth,
 }
@@ -157,6 +160,12 @@ func NewBasicAuth(username, password string) AuthMode {
 	}
 }
 
+// NewTokenAuth returns an Authmode similar to HTTP Basic Auth, which is only
+// relying on token instead of a username and password.
+func NewTokenAuth(token string) (AuthMode, error) {
+	return &tokenAuth{token: token}, nil
+}
+
 // ErrNoAuth is returned when there is no configured authentication.
 var ErrNoAuth = errors.New("auth: no configured authentication")
 
@@ -192,10 +201,28 @@ func SetMode(m AuthMode) {
 	modes = []AuthMode{m}
 }
 
-// AddMode adds the given authentication mode to the list of modes that
-// future requests can authenticate against.
+// AddMode adds the given authentication mode to the list of modes that future
+// requests can authenticate against.
 func AddMode(am AuthMode) {
 	modes = append(modes, am)
+}
+
+type tokenAuth struct {
+	token string
+}
+
+func (t *tokenAuth) AllowedAccess(r *http.Request) Operation {
+	if authTokenHeaderMatches(r) {
+		return OpAll
+	}
+	if websocketTokenMatches(r) {
+		return OpAll
+	}
+	return 0
+}
+
+func (t *tokenAuth) AddAuthHeader(r *http.Request) {
+	r.Header.Set("Authorization", "Token "+t.token)
 }
 
 // UserPass is used when the auth string provided in the config
@@ -423,6 +450,18 @@ var (
 func Token() string {
 	processRandOnce.Do(genProcessRand)
 	return processRand
+}
+
+// DiscoveryToken returns OmitAuthToken if the first registered auth mode is of
+// type None, and Token() otherwise.
+func DiscoveryToken() string {
+	if len(modes) == 0 {
+		return Token()
+	}
+	if _, ok := modes[0].(None); ok {
+		return OmitAuthToken
+	}
+	return Token()
 }
 
 func genProcessRand() {

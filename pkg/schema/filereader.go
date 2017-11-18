@@ -35,10 +35,6 @@ import (
 	"go4.org/types"
 )
 
-const closedIndex = -1
-
-var errClosed = errors.New("filereader is closed")
-
 // A FileReader reads the bytes of "file" and "bytes" schema blobrefs.
 type FileReader struct {
 	// Immutable stuff:
@@ -167,6 +163,8 @@ func (fr *FileReader) UnixMtime() time.Time {
 func (fr *FileReader) FileName() string { return fr.ss.FileNameString() }
 
 func (fr *FileReader) ModTime() time.Time { return fr.ss.ModTime() }
+
+func (fr *FileReader) FileMode() os.FileMode { return fr.ss.FileMode() }
 
 func (fr *FileReader) SchemaBlobRef() blob.Ref { return fr.ss.BlobRef }
 

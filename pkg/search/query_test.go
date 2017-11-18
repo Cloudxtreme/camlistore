@@ -1,9 +1,20 @@
 package search_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -12,11 +23,15 @@ import (
 	"time"
 
 	"camlistore.org/pkg/blob"
+	"camlistore.org/pkg/geocode"
 	"camlistore.org/pkg/index"
 	"camlistore.org/pkg/index/indextest"
+	"camlistore.org/pkg/osutil"
 	. "camlistore.org/pkg/search"
 	"camlistore.org/pkg/test"
+	"camlistore.org/pkg/types/camtypes"
 	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 // indexType is one of the three ways we test the query handler code.
@@ -50,26 +65,23 @@ func (i indexType) String() string {
 }
 
 type queryTest struct {
-	t     testing.TB
-	id    *indextest.IndexDeps
-	itype indexType
+	t               testing.TB
+	id              *indextest.IndexDeps
+	itype           indexType
+	candidateSource string
 
 	handlerOnce sync.Once
 	newHandler  func() *Handler
 	handler     *Handler // initialized with newHandler
+
+	// set by wantRes if the query was successful, so we can examine some extra
+	// query's results after wantRes is called. nil otherwise.
+	res *SearchResult
 }
 
 func (qt *queryTest) Handler() *Handler {
 	qt.handlerOnce.Do(func() { qt.handler = qt.newHandler() })
 	return qt.handler
-}
-
-func querySetup(t testing.TB) (*indextest.IndexDeps, *Handler) {
-	idx := index.NewMemoryIndex() // string key-value pairs in memory, as if they were on disk
-	id := indextest.NewIndexDeps(idx)
-	id.Fataler = t
-	h := NewHandler(idx, id.SignerBlobRef)
-	return id, h
 }
 
 func testQuery(t testing.TB, fn func(*queryTest)) {
@@ -120,21 +132,22 @@ func testQueryType(t testing.TB, fn func(*queryTest), itype indexType) {
 	fn(qt)
 }
 
-func dumpRes(t *testing.T, res *SearchResult) {
-	t.Logf("Got: %#v", res)
-	for i, got := range res.Blobs {
-		t.Logf(" %d. %s", i, got)
-	}
-}
-
 func (qt *queryTest) wantRes(req *SearchQuery, wanted ...blob.Ref) {
 	if qt.itype == indexClassic {
 		req.Sort = Unsorted
+	}
+	if qt.candidateSource != "" {
+		ExportSetCandidateSourceHook(func(pickedCandidate string) {
+			if pickedCandidate != qt.candidateSource {
+				qt.t.Fatalf("unexpected candidateSource: got %v, want %v", pickedCandidate, qt.candidateSource)
+			}
+		})
 	}
 	res, err := qt.Handler().Query(req)
 	if err != nil {
 		qt.t.Fatal(err)
 	}
+	qt.res = res
 
 	need := make(map[blob.Ref]bool)
 	for _, br := range wanted {
@@ -547,6 +560,120 @@ func TestQueryPermanodeValueMatchesFloat(t *testing.T) {
 	})
 }
 
+func TestQueryPermanodeLocation(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+
+		p1 := id.NewPlannedPermanode("1")
+		p2 := id.NewPlannedPermanode("2")
+		p3 := id.NewPlannedPermanode("3")
+		id.SetAttribute(p1, "latitude", "51.5")
+		id.SetAttribute(p1, "longitude", "0")
+		id.SetAttribute(p2, "latitude", "51.5")
+		id.SetAttribute(p3, "longitude", "0")
+
+		p4 := id.NewPlannedPermanode("checkin")
+		p5 := id.NewPlannedPermanode("venue")
+		id.SetAttribute(p4, "camliNodeType", "foursquare.com:checkin")
+		id.SetAttribute(p4, "foursquareVenuePermanode", p5.String())
+		id.SetAttribute(p5, "latitude", "1.0")
+		id.SetAttribute(p5, "longitude", "2.0")
+
+		// Upload a basic image
+		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		if err != nil {
+			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+		}
+		uploadFile := func(file string, modTime time.Time) blob.Ref {
+			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
+			contents, err := ioutil.ReadFile(fileName)
+			if err != nil {
+				panic(err)
+			}
+			br, _ := id.UploadFile(file, string(contents), modTime)
+			return br
+		}
+		fileRef := uploadFile("dude-gps.jpg", time.Time{})
+
+		p6 := id.NewPlannedPermanode("photo")
+		id.SetAttribute(p6, "camliContent", fileRef.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Location: &LocationConstraint{
+						Any: true,
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, p1, p4, p5, p6)
+	})
+}
+
+func TestQueryFileLocation(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+
+		// Upload a basic image
+		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		if err != nil {
+			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+		}
+		uploadFile := func(file string, modTime time.Time) blob.Ref {
+			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
+			contents, err := ioutil.ReadFile(fileName)
+			if err != nil {
+				panic(err)
+			}
+			br, _ := id.UploadFile(file, string(contents), modTime)
+			return br
+		}
+		fileRef := uploadFile("dude-gps.jpg", time.Time{})
+
+		p6 := id.NewPlannedPermanode("photo")
+		id.SetAttribute(p6, "camliContent", fileRef.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				File: &FileConstraint{
+					Location: &LocationConstraint{
+						Any: true,
+					},
+				},
+			},
+		}
+
+		qt.wantRes(sq, fileRef)
+		if qt.res == nil {
+			t.Fatal("No results struct")
+		}
+		if qt.res.LocationArea == nil {
+			t.Fatal("No location area in results")
+		}
+		want := camtypes.LocationBounds{
+			North: 42.45,
+			South: 42.45,
+			West:  18.76,
+			East:  18.76,
+		}
+		if *qt.res.LocationArea != want {
+			t.Fatalf("Wrong location area expansion: wanted %#v, got %#v", want, *qt.res.LocationArea)
+		}
+
+		ExportSetExpandLocationHook(true)
+		qt.wantRes(sq)
+		if qt.res == nil {
+			t.Fatal("No results struct")
+		}
+		if qt.res.LocationArea != nil {
+			t.Fatalf("Location area should not have been expanded")
+		}
+		ExportSetExpandLocationHook(false)
+
+	})
+}
+
 // find permanodes matching a certain file query
 func TestQueryFileConstraint(t *testing.T) {
 	testQuery(t, func(qt *queryTest) {
@@ -642,10 +769,11 @@ func TestQueryPermanodeModtime(t *testing.T) {
 // TODO: make all the indextest/tests.go
 // also test the three memory build modes that testQuery does.
 func TestDecodeFileInfo(t *testing.T) {
+	ctx := context.Background()
 	testQuery(t, func(qt *queryTest) {
 		id := qt.id
 		fileRef, wholeRef := id.UploadFile("file.gif", "GIF87afoo", time.Unix(456, 0))
-		res, err := qt.Handler().Describe(&DescribeRequest{
+		res, err := qt.Handler().Describe(ctx, &DescribeRequest{
 			BlobRef: fileRef,
 		})
 		if err != nil {
@@ -669,6 +797,26 @@ func TestDecodeFileInfo(t *testing.T) {
 			qt.t.Errorf("DescribedBlob.WholeRef: got %v, wanted %v", wholeRef, db.File.WholeRef)
 			return
 		}
+	})
+}
+
+func TestQueryFileCandidateSource(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		fileRef, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef = %q", fileRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", fileRef.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				File: &FileConstraint{
+					WholeRef: blob.SHA1FromString("hello"),
+				},
+			},
+		}
+		qt.candidateSource = "corpus_file_meta"
+		qt.wantRes(sq, fileRef)
 	})
 }
 
@@ -1072,6 +1220,74 @@ func TestQueryParent(t *testing.T) {
 	})
 }
 
+// tests the algorithm for the Around parameter, when the source of blobs is
+// unsorted, i.e. when the blobs get sorted right after the constraint has been
+// matched, and right before Around is applied.
+func testAroundUnsortedSource(limit, pos int, t *testing.T) {
+	testQueryTypes(t, []indexType{indexClassic}, func(qt *queryTest) {
+		id := qt.id
+
+		var sorted []string
+		unsorted := make(map[string]blob.Ref)
+
+		addToSorted := func(i int) {
+			p := id.NewPlannedPermanode(fmt.Sprintf("%d", i))
+			unsorted[p.String()] = p
+			sorted = append(sorted, p.String())
+		}
+		for i := 0; i < 10; i++ {
+			addToSorted(i)
+		}
+		sort.Strings(sorted)
+
+		// Predict the results
+		var want []blob.Ref
+		var around blob.Ref
+		lowLimit := pos - limit/2
+		if lowLimit < 0 {
+			lowLimit = 0
+		}
+		highLimit := lowLimit + limit
+		if highLimit > len(sorted) {
+			highLimit = len(sorted)
+		}
+		// Make the permanodes actually exist.
+		for k, v := range sorted {
+			pn := unsorted[v]
+			id.AddAttribute(pn, "x", "x")
+			if k == pos {
+				around = pn
+			}
+			if k >= lowLimit && k < highLimit {
+				want = append(want, pn)
+			}
+		}
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{},
+			},
+			Limit:  limit,
+			Around: around,
+			Sort:   BlobRefAsc,
+		}
+		qt.wantRes(sq, want...)
+	})
+
+}
+
+func TestQueryAroundCenter(t *testing.T) {
+	testAroundUnsortedSource(4, 4, t)
+}
+
+func TestQueryAroundNear(t *testing.T) {
+	testAroundUnsortedSource(5, 9, t)
+}
+
+func TestQueryAroundFar(t *testing.T) {
+	testAroundUnsortedSource(3, 4, t)
+}
+
 // 13 permanodes are created. 1 of them the parent, 11 are children
 // (== results), 1 is unrelated to the parent.
 // limit is the limit on the number of results.
@@ -1452,4 +1668,570 @@ func BenchmarkQueryRecentPermanodes(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkQueryPermanodes(b *testing.B) {
+	benchmarkQueryPermanodes(b, false)
+}
+
+func BenchmarkQueryDescribePermanodes(b *testing.B) {
+	benchmarkQueryPermanodes(b, true)
+}
+
+func benchmarkQueryPermanodes(b *testing.B, describe bool) {
+	b.ReportAllocs()
+	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
+		id := qt.id
+
+		for i := 0; i < 1000; i++ {
+			pn := id.NewPlannedPermanode(fmt.Sprint(i))
+			id.SetAttribute(pn, "foo", fmt.Sprint(i))
+		}
+
+		req := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{},
+			},
+		}
+		if describe {
+			req.Describe = &DescribeRequest{}
+		}
+
+		h := qt.Handler()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if describe {
+				*req.Describe = DescribeRequest{}
+			}
+			_, err := h.Query(req)
+			if err != nil {
+				qt.t.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkQueryPermanodeLocation(b *testing.B) {
+	b.ReportAllocs()
+	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
+		id := qt.id
+
+		// Upload a basic image
+		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		if err != nil {
+			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+		}
+		uploadFile := func(file string, modTime time.Time) blob.Ref {
+			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
+			contents, err := ioutil.ReadFile(fileName)
+			if err != nil {
+				panic(err)
+			}
+			br, _ := id.UploadFile(file, string(contents), modTime)
+			return br
+		}
+		fileRef := uploadFile("dude-gps.jpg", time.Time{})
+
+		var n int
+		newPn := func() blob.Ref {
+			n++
+			return id.NewPlannedPermanode(fmt.Sprint(n))
+		}
+
+		pn := id.NewPlannedPermanode("photo")
+		id.SetAttribute(pn, "camliContent", fileRef.String())
+
+		for i := 0; i < 5; i++ {
+			pn := newPn()
+			id.SetAttribute(pn, "camliNodeType", "foursquare.com:venue")
+			id.SetAttribute(pn, "latitude", fmt.Sprint(50-i))
+			id.SetAttribute(pn, "longitude", fmt.Sprint(i))
+			for j := 0; j < 5; j++ {
+				qn := newPn()
+				id.SetAttribute(qn, "camliNodeType", "foursquare.com:checkin")
+				id.SetAttribute(qn, "foursquareVenuePermanode", pn.String())
+			}
+		}
+		for i := 0; i < 10; i++ {
+			pn := newPn()
+			id.SetAttribute(pn, "foo", fmt.Sprint(i))
+		}
+
+		req := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Location: &LocationConstraint{Any: true},
+				},
+			},
+		}
+
+		h := qt.Handler()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			_, err := h.Query(req)
+			if err != nil {
+				qt.t.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkLocationPredicate aims at measuring the impact of
+// https://camlistore-review.googlesource.com/8049
+// ( + https://camlistore-review.googlesource.com/8649)
+// on location queries.
+// It populates the corpus with enough fake foursquare checkins/venues and
+// twitter locations to look realistic.
+func BenchmarkLocationPredicate(b *testing.B) {
+	b.ReportAllocs()
+	testQueryTypes(b, corpusTypeOnly, func(qt *queryTest) {
+		id := qt.id
+
+		var n int
+		newPn := func() blob.Ref {
+			n++
+			return id.NewPlannedPermanode(fmt.Sprint(n))
+		}
+
+		// create (~700) venues all over the world, and mark 25% of them as places we've been to
+		venueIdx := 0
+		for long := -180.0; long < 180.0; long += 10.0 {
+			for lat := -90.0; lat < 90.0; lat += 10.0 {
+				pn := newPn()
+				id.SetAttribute(pn, "camliNodeType", "foursquare.com:venue")
+				id.SetAttribute(pn, "latitude", fmt.Sprintf("%f", lat))
+				id.SetAttribute(pn, "longitude", fmt.Sprintf("%f", long))
+				if venueIdx%4 == 0 {
+					qn := newPn()
+					id.SetAttribute(qn, "camliNodeType", "foursquare.com:checkin")
+					id.SetAttribute(qn, "foursquareVenuePermanode", pn.String())
+				}
+				venueIdx++
+			}
+		}
+
+		// create 3K tweets, all with locations
+		lat := 45.18
+		long := 5.72
+		for i := 0; i < 3000; i++ {
+			pn := newPn()
+			id.SetAttribute(pn, "camliNodeType", "twitter.com:tweet")
+			id.SetAttribute(pn, "latitude", fmt.Sprintf("%f", lat))
+			id.SetAttribute(pn, "longitude", fmt.Sprintf("%f", long))
+			lat += 0.01
+			long += 0.01
+		}
+
+		// create 5K additional permanodes, but no location. Just as "noise".
+		for i := 0; i < 5000; i++ {
+			newPn()
+		}
+
+		// Create ~2600 photos all over the world.
+		for long := -180.0; long < 180.0; long += 5.0 {
+			for lat := -90.0; lat < 90.0; lat += 5.0 {
+				br, _ := id.UploadFile("photo.jpg", exifFileContentLatLong(lat, long), time.Time{})
+				pn := newPn()
+				id.SetAttribute(pn, "camliContent", br.String())
+			}
+		}
+
+		h := qt.Handler()
+		b.ResetTimer()
+
+		locations := []string{
+			"canada", "scotland", "france", "sweden", "germany", "poland", "russia", "algeria", "congo", "china", "india", "australia", "mexico", "brazil", "argentina",
+		}
+		for i := 0; i < b.N; i++ {
+			for _, loc := range locations {
+				req := &SearchQuery{
+					Expression: "loc:" + loc,
+					Limit:      -1,
+				}
+				resp, err := h.Query(req)
+				if err != nil {
+					qt.t.Fatal(err)
+				}
+				b.Logf("found %d permanodes in %v", len(resp.Blobs), loc)
+			}
+		}
+
+	})
+}
+
+var altLocCache = make(map[string][]geocode.Rect)
+
+func init() {
+	cacheGeo := func(address string, n, e, s, w float64) {
+		altLocCache[address] = []geocode.Rect{{
+			NorthEast: geocode.LatLong{Lat: n, Long: e},
+			SouthWest: geocode.LatLong{Lat: s, Long: w},
+		}}
+	}
+
+	cacheGeo("canada", 83.0956562, -52.6206965, 41.6765559, -141.00187)
+	cacheGeo("scotland", 60.8607515, -0.7246751, 54.6332381, -8.6498706)
+	cacheGeo("france", 51.0891285, 9.560067700000001, 41.3423275, -5.142307499999999)
+	cacheGeo("sweden", 69.0599709, 24.1665922, 55.3367024, 10.9631865)
+	cacheGeo("germany", 55.0581235, 15.0418962, 47.2701114, 5.8663425)
+	cacheGeo("poland", 54.835784, 24.1458933, 49.0020251, 14.1228641)
+	cacheGeo("russia", 81.858122, -169.0456324, 41.1853529, 19.6404268)
+	cacheGeo("algeria", 37.0898204, 11.999999, 18.968147, -8.667611299999999)
+	cacheGeo("congo", 3.707791, 18.6436109, -5.0289719, 11.1530037)
+	cacheGeo("china", 53.5587015, 134.7728098, 18.1576156, 73.4994136)
+	cacheGeo("india", 35.5087008, 97.395561, 6.7535159, 68.1623859)
+	cacheGeo("australia", -9.2198214, 159.2557541, -54.7772185, 112.9215625)
+	cacheGeo("mexico", 32.7187629, -86.7105711, 14.5345486, -118.3649292)
+	cacheGeo("brazil", 5.2717863, -29.3448224, -33.7506241, -73.98281709999999)
+	cacheGeo("argentina", -21.7810459, -53.6374811, -55.05727899999999, -73.56036019999999)
+
+	geocode.AltLookupFn = func(ctx context.Context, addr string) ([]geocode.Rect, error) {
+		r, ok := altLocCache[addr]
+		if ok {
+			return r, nil
+		}
+		return nil, nil
+	}
+}
+
+var exifFileContent struct {
+	once sync.Once
+	jpeg []byte
+}
+
+// exifFileContentLatLong returns the contents of a
+// jpeg/exif file with the GPS coordinates lat and long.
+func exifFileContentLatLong(lat, long float64) string {
+	exifFileContent.once.Do(func() {
+		var buf bytes.Buffer
+		jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 128, 128)), nil)
+		exifFileContent.jpeg = buf.Bytes()
+	})
+
+	x := rawExifLatLong(lat, long)
+	j := exifFileContent.jpeg
+
+	app1sec := []byte{0xff, 0xe1, 0, 0}
+	binary.BigEndian.PutUint16(app1sec[2:], uint16(len(x)+2))
+
+	p := make([]byte, 0, len(j)+len(app1sec)+len(x))
+	p = append(p, j[:2]...)   // ff d8
+	p = append(p, app1sec...) // exif section header
+	p = append(p, x...)       // raw exif
+	p = append(p, j[2:]...)   // jpeg image
+
+	return string(p)
+}
+
+// rawExifLatLong creates raw exif for lat/long
+// for storage in a jpeg file.
+func rawExifLatLong(lat, long float64) []byte {
+
+	x := exifBuf{
+		bo: binary.BigEndian,
+		p:  []byte("MM"),
+	}
+
+	x.putUint16(42) // magic
+
+	ifd0ofs := x.reservePtr() // room for ifd0 offset
+	x.storePtr(ifd0ofs)
+
+	const (
+		gpsSubIfdTag = 0x8825
+
+		gpsLatitudeRef  = 1
+		gpsLatitude     = 2
+		gpsLongitudeRef = 3
+		gpsLongitude    = 4
+
+		typeAscii    = 2
+		typeLong     = 4
+		typeRational = 5
+	)
+
+	// IFD0
+	x.storePtr(ifd0ofs)
+	x.putUint16(1) // 1 tag
+
+	x.putTag(gpsSubIfdTag, typeLong, 1)
+	gpsofs := x.reservePtr()
+
+	// IFD1
+	x.putUint32(0) // no IFD1
+
+	// GPS sub-IFD
+	x.storePtr(gpsofs)
+	x.putUint16(4) // 4 tags
+
+	x.putTag(gpsLatitudeRef, typeAscii, 2)
+	if lat >= 0 {
+		x.next(4)[0] = 'N'
+	} else {
+		x.next(4)[0] = 'S'
+	}
+
+	x.putTag(gpsLatitude, typeRational, 3)
+	latptr := x.reservePtr()
+
+	x.putTag(gpsLongitudeRef, typeAscii, 2)
+	if long >= 0 {
+		x.next(4)[0] = 'E'
+	} else {
+		x.next(4)[0] = 'W'
+	}
+
+	x.putTag(gpsLongitude, typeRational, 3)
+	longptr := x.reservePtr()
+
+	// write data referenced in GPS sub-IFD
+	x.storePtr(latptr)
+	x.putDegMinSecRat(lat)
+
+	x.storePtr(longptr)
+	x.putDegMinSecRat(long)
+
+	return append([]byte("Exif\x00\x00"), x.p...)
+}
+
+type exifBuf struct {
+	bo binary.ByteOrder
+	p  []byte
+}
+
+func (x *exifBuf) next(n int) []byte {
+	l := len(x.p)
+	x.p = append(x.p, make([]byte, n)...)
+	return x.p[l:]
+}
+
+func (x *exifBuf) putTag(tag, typ uint16, len uint32) {
+	x.putUint16(tag)
+	x.putUint16(typ)
+	x.putUint32(len)
+}
+
+func (x *exifBuf) putUint16(n uint16) { x.bo.PutUint16(x.next(2), n) }
+func (x *exifBuf) putUint32(n uint32) { x.bo.PutUint32(x.next(4), n) }
+
+func (x *exifBuf) putDegMinSecRat(v float64) {
+	if v < 0 {
+		v = -v
+	}
+	deg := uint32(v)
+	v = 60 * (v - float64(deg))
+	min := uint32(v)
+	v = 60 * (v - float64(min))
+	μsec := uint32(v * 1e6)
+
+	x.putUint32(deg)
+	x.putUint32(1)
+	x.putUint32(min)
+	x.putUint32(1)
+	x.putUint32(μsec)
+	x.putUint32(1e6)
+}
+
+// reservePtr reserves room for a ptr in x.
+func (x *exifBuf) reservePtr() int {
+	l := len(x.p)
+	x.next(4)
+	return l
+}
+
+// storePtr stores the current write offset at p
+// that have been reserved with reservePtr.
+func (x *exifBuf) storePtr(p int) {
+	x.bo.PutUint32(x.p[p:], uint32(len(x.p)))
+}
+
+// function to generate data for TestBestByLocation
+func generateLocationPoints(north, south, west, east float64, limit int) string {
+	points := make([]camtypes.Location, limit)
+	height := north - south
+	width := east - west
+	if west >= east {
+		// area is spanning over the antimeridian
+		width += 360
+	}
+	for i := 0; i < limit; i++ {
+		lat := rand.Float64()*height + south
+		long := camtypes.Longitude(rand.Float64()*width + west).WrapTo180()
+		points[i] = camtypes.Location{
+			Latitude:  lat,
+			Longitude: long,
+		}
+	}
+	data, err := json.Marshal(points)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return string(data)
+}
+
+type locationPoints struct {
+	Name    string
+	Comment string
+	Points  []camtypes.Location
+}
+
+func TestBestByLocation(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	data := make(map[string]locationPoints)
+	f, err := os.Open(filepath.Join("testdata", "locationPoints.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, v := range data {
+		testBestByLocation(t, v, false)
+	}
+}
+
+// call with generate=true to regenerate the png files int testdata/ from testdata/locationPoints.json
+func testBestByLocation(t *testing.T, data locationPoints, generate bool) {
+	var res SearchResult
+	var blobs []*SearchResultBlob
+	meta := make(map[string]*DescribedBlob)
+	var area camtypes.LocationBounds
+	locm := make(map[blob.Ref]camtypes.Location)
+	for _, v := range data.Points {
+		br := blob.RefFromString(fmt.Sprintf("%v,%v", v.Latitude, v.Longitude))
+		blobs = append(blobs, &SearchResultBlob{
+			Blob: br,
+		})
+		loc := camtypes.Location{
+			Latitude:  v.Latitude,
+			Longitude: v.Longitude,
+		}
+		meta[br.String()] = &DescribedBlob{
+			Location: &loc,
+		}
+		locm[br] = loc
+		area = area.Expand(loc)
+	}
+	res.Blobs = blobs
+	res.Describe = &DescribeResponse{
+		Meta: meta,
+	}
+	res.LocationArea = &area
+
+	var widthRatio, heightRatio float64
+	initImage := func() *image.RGBA {
+		maxRelLat := area.North - area.South
+		maxRelLong := area.East - area.West
+		if area.West >= area.East {
+			// area is spanning over the antimeridian
+			maxRelLong += 360
+		}
+		// draw it all on a 1000 px wide image
+		height := int(1000 * maxRelLat / maxRelLong)
+		img := image.NewRGBA(image.Rect(0, 0, 1000, height))
+		for i := 0; i < 1000; i++ {
+			for j := 0; j < 1000; j++ {
+				img.Set(i, j, image.White)
+			}
+		}
+		widthRatio = 1000. / maxRelLong
+		heightRatio = float64(height) / maxRelLat
+		return img
+	}
+
+	img := initImage()
+	for _, v := range data.Points {
+		// draw a little cross of 3x3, because 1px dot is not visible enough.
+		relLong := v.Longitude - area.West
+		if v.Longitude < area.West {
+			relLong += 360
+		}
+		crossX := int(relLong * widthRatio)
+		crossY := int((area.North - v.Latitude) * heightRatio)
+		for i := -1; i < 2; i++ {
+			img.Set(crossX+i, crossY, color.RGBA{127, 0, 0, 127})
+		}
+		for j := -1; j < 2; j++ {
+			img.Set(crossX, crossY+j, color.RGBA{127, 0, 0, 127})
+		}
+	}
+
+	cmpImage := func(img *image.RGBA, wantImgFile string) {
+		f, err := os.Open(wantImgFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		wantImg, err := png.Decode(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < wantImg.Bounds().Max.Y; j++ {
+			for i := 0; i < wantImg.Bounds().Max.X; i++ {
+				r1, g1, b1, a1 := wantImg.At(i, j).RGBA()
+				r2, g2, b2, a2 := img.At(i, j).RGBA()
+				if r1 != r2 || g1 != g2 || b1 != b2 || a1 != a2 {
+					t.Fatalf("%v different from %v", wantImg.At(i, j), img.At(i, j))
+				}
+			}
+		}
+	}
+
+	genPng := func(img *image.RGBA, name string) {
+		f, err := os.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := png.Encode(f, img); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if generate {
+		genPng(img, filepath.Join("testdata", fmt.Sprintf("%v-beforeMapSort.png", data.Name)))
+	} else {
+		cmpImage(img, filepath.Join("testdata", fmt.Sprintf("%v-beforeMapSort.png", data.Name)))
+	}
+
+	ExportBestByLocation(&res, locm, 100)
+
+	// check that all longitudes are in the [-180,180] range
+	for _, v := range res.Blobs {
+		longitude := meta[v.Blob.String()].Location.Longitude
+		if longitude < -180. || longitude > 180. {
+			t.Errorf("out of range location: %v", longitude)
+		}
+	}
+
+	img = initImage()
+	for _, v := range res.Blobs {
+		loc := meta[v.Blob.String()].Location
+		longitude := loc.Longitude
+		latitude := loc.Latitude
+		// draw a little cross of 3x3, because 1px dot is not visible enough.
+		relLong := longitude - area.West
+		if longitude < area.West {
+			relLong += 360
+		}
+		crossX := int(relLong * widthRatio)
+		crossY := int((area.North - latitude) * heightRatio)
+		for i := -1; i < 2; i++ {
+			img.Set(crossX+i, crossY, color.RGBA{127, 0, 0, 127})
+		}
+		for j := -1; j < 2; j++ {
+			img.Set(crossX, crossY+j, color.RGBA{127, 0, 0, 127})
+		}
+	}
+	if generate {
+		genPng(img, filepath.Join("testdata", fmt.Sprintf("%v-afterMapSort.png", data.Name)))
+	} else {
+		cmpImage(img, filepath.Join("testdata", fmt.Sprintf("%v-afterMapSort.png", data.Name)))
+	}
 }

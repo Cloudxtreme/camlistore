@@ -15,14 +15,16 @@ limitations under the License.
 */
 
 // Package allimporters registers all the importer implementations.
-package allimporters
+package allimporters // import "camlistore.org/pkg/importer/allimporters"
 
 import (
 	_ "camlistore.org/pkg/importer/dummy"
 	_ "camlistore.org/pkg/importer/feed"
 	_ "camlistore.org/pkg/importer/flickr"
 	_ "camlistore.org/pkg/importer/foursquare"
+	_ "camlistore.org/pkg/importer/gphotos"
 	_ "camlistore.org/pkg/importer/picasa"
 	_ "camlistore.org/pkg/importer/pinboard"
+	_ "camlistore.org/pkg/importer/plaid"
 	_ "camlistore.org/pkg/importer/twitter"
 )

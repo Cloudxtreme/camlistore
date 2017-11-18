@@ -20,7 +20,7 @@ limitations under the License.
 // This reduces the amount of data that must be decompressed into memory when
 // the full resolution image isn't required, i.e. in the case of generating
 // thumbnails.
-package fastjpeg
+package fastjpeg // import "camlistore.org/pkg/images/fastjpeg"
 
 import (
 	"bytes"
@@ -103,7 +103,7 @@ func djpegStatus() string {
 	if Available() {
 		return "djpeg available"
 	}
-	return "djpeg optimizaton unavailable"
+	return "djpeg optimization unavailable"
 }
 
 func readPNM(buf *bytes.Buffer) (image.Image, error) {

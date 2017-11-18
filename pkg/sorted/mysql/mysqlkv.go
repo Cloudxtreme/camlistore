@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package mysql provides an implementation of sorted.KeyValue
 // on top of MySQL.
-package mysql
+package mysql // import "camlistore.org/pkg/sorted/mysql"
 
 import (
 	"database/sql"
@@ -31,7 +31,7 @@ import (
 	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/sorted/sqlkv"
-	_ "camlistore.org/third_party/github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
 )
@@ -40,7 +40,9 @@ func init() {
 	sorted.RegisterKeyValue("mysql", newKeyValueFromJSONConfig)
 }
 
-func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
+// newKVDB returns an unusable KeyValue, with a database, but no tables yet. It
+// should be followed by Wipe or finalize.
+func newKVDB(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 	var (
 		user     = cfg.RequiredString("user")
 		database = cfg.RequiredString("database")
@@ -49,6 +51,9 @@ func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 	)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if !validDatabaseName(database) {
+		return nil, fmt.Errorf("%q looks like an invalid database name", database)
 	}
 	var err error
 	if host != "" {
@@ -76,41 +81,49 @@ func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 	if err := CreateDB(db, database); err != nil {
 		return nil, err
 	}
-	for _, tableSQL := range SQLCreateTables() {
-		tableSQL = strings.Replace(tableSQL, "/*DB*/", database, -1)
-		if _, err := db.Exec(tableSQL); err != nil {
-			errMsg := "error creating table with %q: %v."
-			createError := err
-			sv, err := serverVersion(db)
-			if err != nil {
-				return nil, err
-			}
-			if !hasLargeVarchar(sv) {
-
-				errMsg += "\nYour MySQL server is too old (< 5.0.3) to support VARCHAR larger than 255."
-			}
-			return nil, fmt.Errorf(errMsg, tableSQL, createError)
-		}
-	}
-	if _, err := db.Exec(fmt.Sprintf(`REPLACE INTO %s.meta VALUES ('version', '%d')`, database, SchemaVersion())); err != nil {
-		return nil, fmt.Errorf("error setting schema version: %v", err)
-	}
-
-	kv := &keyValue{
-		dsn: dsn,
-		db:  db,
+	return &keyValue{
+		database: database,
+		dsn:      dsn,
+		db:       db,
 		KeyValue: &sqlkv.KeyValue{
 			DB:          db,
 			TablePrefix: database + ".",
 			Gate:        syncutil.NewGate(20), // arbitrary limit. TODO: configurable, automatically-learned?
 		},
+	}, nil
+}
+
+// Wipe resets the KeyValue by dropping and recreating the database tables.
+func (kv *keyValue) Wipe() error {
+	if _, err := kv.db.Exec("DROP TABLE IF EXISTS " + kv.database + ".rows"); err != nil {
+		return err
 	}
+	if _, err := kv.db.Exec("DROP TABLE IF EXISTS " + kv.database + ".meta"); err != nil {
+		return err
+	}
+	return kv.finalize()
+}
+
+// finalize should be called on a keyValue initialized with newKVDB.
+func (kv *keyValue) finalize() error {
+	if err := createTables(kv.db, kv.database); err != nil {
+		return err
+	}
+
 	if err := kv.ping(); err != nil {
-		return nil, fmt.Errorf("MySQL db unreachable: %v", err)
+		return fmt.Errorf("MySQL db unreachable: %v", err)
 	}
+
 	version, err := kv.SchemaVersion()
 	if err != nil {
-		return nil, fmt.Errorf("error getting schema version (need to init database?): %v", err)
+		return fmt.Errorf("error getting current database schema version: %v", err)
+	}
+	if version == 0 {
+		// Newly created table case
+		if _, err := kv.db.Exec(fmt.Sprintf(`REPLACE INTO %s.meta VALUES ('version', ?)`, kv.database), requiredSchemaVersion); err != nil {
+			return fmt.Errorf("error setting schema version: %v", err)
+		}
+		return nil
 	}
 	if version != requiredSchemaVersion {
 		if version == 20 && requiredSchemaVersion == 21 {
@@ -119,13 +132,32 @@ func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 		if env.IsDev() {
 			// Good signal that we're using the devcam server, so help out
 			// the user with a more useful tip:
-			return nil, fmt.Errorf("database schema version is %d; expect %d (run \"devcam server --wipe\" to wipe both your blobs and re-populate the database schema)", version, requiredSchemaVersion)
+			return sorted.NeedWipeError{
+				Msg: fmt.Sprintf("database schema version is %d; expect %d (run \"devcam server --wipe\" to wipe both your blobs and re-populate the database schema)", version, requiredSchemaVersion),
+			}
 		}
-		return nil, fmt.Errorf("database schema version is %d; expect %d (need to re-init/upgrade database?)",
-			version, requiredSchemaVersion)
+		return sorted.NeedWipeError{
+			Msg: fmt.Sprintf("database schema version is %d; expect %d (need to re-init/upgrade database?)",
+				version, requiredSchemaVersion),
+		}
 	}
 
-	return kv, nil
+	return nil
+}
+
+func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
+	kv, err := newKVDB(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return kv, kv.(*keyValue).finalize()
+}
+
+var dbnameRx = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
+// validDatabaseName reports whether dbname is a valid-looking database name.
+func validDatabaseName(dbname string) bool {
+	return dbnameRx.MatchString(dbname)
 }
 
 // CreateDB creates the named database if it does not already exist.
@@ -135,6 +167,25 @@ func CreateDB(db *sql.DB, dbname string) error {
 	}
 	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbname)); err != nil {
 		return fmt.Errorf("error creating database %v: %v", dbname, err)
+	}
+	return nil
+}
+
+func createTables(db *sql.DB, database string) error {
+	for _, tableSQL := range SQLCreateTables() {
+		tableSQL = strings.Replace(tableSQL, "/*DB*/", database, -1)
+		if _, err := db.Exec(tableSQL); err != nil {
+			errMsg := "error creating table with %q: %v."
+			createError := err
+			sv, err := serverVersion(db)
+			if err != nil {
+				return err
+			}
+			if !hasLargeVarchar(sv) {
+				errMsg += "\nYour MySQL server is too old (< 5.0.3) to support VARCHAR larger than 255."
+			}
+			return fmt.Errorf(errMsg, tableSQL, createError)
+		}
 	}
 	return nil
 }
@@ -162,8 +213,9 @@ func openOrCachedDB(dsn string) (*sql.DB, error) {
 type keyValue struct {
 	*sqlkv.KeyValue
 
-	dsn string
-	db  *sql.DB
+	database string
+	dsn      string
+	db       *sql.DB
 }
 
 // Close overrides KeyValue.Close because we need to remove the DB from the pool
@@ -181,8 +233,13 @@ func (kv *keyValue) ping() error {
 	return err
 }
 
+// SchemaVersion returns the schema version found in the meta table. If no
+// version is found it returns (0, nil), as the table should be considered empty.
 func (kv *keyValue) SchemaVersion() (version int, err error) {
 	err = kv.db.QueryRow("SELECT value FROM " + kv.KeyValue.TablePrefix + "meta WHERE metakey='version'").Scan(&version)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	return
 }
 

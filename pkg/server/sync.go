@@ -18,6 +18,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"html"
@@ -39,7 +40,7 @@ import (
 	"camlistore.org/pkg/index"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/types/camtypes"
-	"camlistore.org/third_party/code.google.com/p/xsrftoken"
+	"code.google.com/p/xsrftoken"
 	"go4.org/jsonconfig"
 	"golang.org/x/net/context"
 
@@ -87,13 +88,18 @@ type SyncHandler struct {
 	totalCopyBytes int64
 	totalErrors    int64
 	vshards        []string // validation shards. if 0, validation not running
-	vshardDone     int      // shards validated
+	vshardDone     int      // shards already processed (incl. errors)
 	vshardErrs     []string
-	vmissing       int64 // missing blobs found during validat
-	vdestCount     int   // number of blobs seen on dest during validate
-	vdestBytes     int64 // number of blob bytes seen on dest during validate
-	vsrcCount      int   // number of blobs seen on src during validate
-	vsrcBytes      int64 // number of blob bytes seen on src during validate
+	vmissing       int64    // missing blobs found during validate
+	vdestCount     int      // number of blobs seen on dest during validate
+	vdestBytes     int64    // number of blob bytes seen on dest during validate
+	vsrcCount      int      // number of blobs seen on src during validate
+	vsrcBytes      int64    // number of blob bytes seen on src during validate
+	comparedBlobs  int      // total number of blobs compared by hourly runs
+	comparedBytes  uint64   // total number of bytes compared by hourly runs
+	comparedRounds int      // total number of hourly compare runs
+	compareErrors  []string // all errors encountered by hourly runs
+	compLastBlob   string   // last blob compared by hourly runs
 
 	// syncLoop tries to send on alarmIdlec each time we've slept for a full
 	// queueSyncInterval. Initialized as a synchronous chan if we're not an
@@ -132,6 +138,7 @@ func newSyncFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handler,
 		queueConf      = conf.OptionalObject("queue")
 		copierPoolSize = conf.OptionalInt("copierPoolSize", 5)
 		validate       = conf.OptionalBool("validateOnStart", validateOnStartDefault)
+		hourlyCompare  = conf.OptionalInt("hourlyCompareBytes", 0)
 	)
 	if err := conf.Validate(); err != nil {
 		return nil, err
@@ -142,7 +149,7 @@ func newSyncFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handler,
 	if len(queueConf) == 0 {
 		return nil, errors.New(`Missing required "queue" object`)
 	}
-	q, err := sorted.NewKeyValue(queueConf)
+	q, err := sorted.NewKeyValueMaybeWipe(queueConf)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +204,13 @@ func newSyncFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handler,
 
 	if validate {
 		go sh.startFullValidation()
+	}
+
+	if hourlyCompare != 0 {
+		if _, ok := sh.to.(blob.Fetcher); !ok {
+			return nil, errors.New(`can't specify "hourlyCompareBytes" if destination is not a Fetcher`)
+		}
+		go sh.hourlyCompare(uint64(hourlyCompare))
 	}
 
 	blobserver.GetHub(fromBs).AddReceiveHook(sh.enqueue)
@@ -388,15 +402,31 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	f("<li>Previous copy errors: %d %s</li>", sh.totalErrors, clarification)
 	f("</ul>")
 
+	if sh.comparedRounds > 0 || sh.comparedBlobs > 0 {
+		f("<h2>Hourly compares</h2><ul>")
+		f("<li>Hourly rounds: %d</li>", sh.comparedRounds)
+		f("<li>Compared blobs: %d</li>", sh.comparedBlobs)
+		f("<li>Compared bytes: %d</li>", sh.comparedBytes)
+		f("<li>Latest blob: %s</li>", sh.compLastBlob)
+		f("</ul>")
+		if len(sh.compareErrors) > 0 {
+			f("<h3>Compare failures</h3><ul>")
+			for _, err := range sh.compareErrors {
+				f("<li><strong>%s</strong></li>", err)
+			}
+			f("</ul>")
+		}
+	}
+
 	f("<h2>Validation</h2>")
-	if len(sh.vshards) == 0 {
-		f("Validation disabled")
+	f("<p>Background scan of source and destination to ensure that the destination has everything the source does, or is at least enqueued to sync.</p>")
+	if len(sh.vshards) == 0 || sh.vshardDone == len(sh.vshards) {
 		token := xsrftoken.Generate(auth.Token(), "user", "runFullValidate")
 		f("<form method='POST'><input type='hidden' name='mode' value='validate'><input type='hidden' name='token' value='%s'><input type='submit' value='Start validation'></form>", token)
-	} else {
-		f("<p>Background scan of source and destination to ensure that the destination has everything the source does, or is at least enqueued to sync.</p>")
+	}
+	if len(sh.vshards) != 0 {
 		f("<ul>")
-		f("<li>Shards complete: %d/%d (%.1f%%)</li>",
+		f("<li>Shards processed: %d/%d (%.1f%%)</li>",
 			sh.vshardDone,
 			len(sh.vshards),
 			100*float64(sh.vshardDone)/float64(len(sh.vshards)))
@@ -687,6 +717,12 @@ func (sh *SyncHandler) enqueue(sb blob.SizedRef) error {
 
 func (sh *SyncHandler) startFullValidation() {
 	sh.mu.Lock()
+	if sh.vshardDone == len(sh.vshards) {
+		sh.vshards, sh.vshardErrs = nil, nil
+		sh.vshardDone, sh.vmissing = 0, 0
+		sh.vdestCount, sh.vdestBytes = 0, 0
+		sh.vsrcCount, sh.vsrcBytes = 0, 0
+	}
 	if len(sh.vshards) != 0 {
 		sh.mu.Unlock()
 		return
@@ -724,7 +760,7 @@ func (sh *SyncHandler) runFullValidation() {
 		pfx := pfx
 		gate.Start()
 		go func() {
-			wg.Done()
+			defer wg.Done()
 			defer gate.Done()
 			sh.validateShardPrefix(pfx)
 		}()
@@ -740,9 +776,8 @@ func (sh *SyncHandler) validateShardPrefix(pfx string) (err error) {
 			errs := fmt.Sprintf("Failed to validate prefix %s: %v", pfx, err)
 			sh.logf("%s", errs)
 			sh.vshardErrs = append(sh.vshardErrs, errs)
-		} else {
-			sh.vshardDone++
 		}
+		sh.vshardDone++
 		sh.mu.Unlock()
 	}()
 	ctx, cancel := context.WithCancel(context.TODO())
@@ -938,7 +973,7 @@ func (cs *copyStatus) setError(err error) {
 
 	// Kinda lame. TODO: use a ring buffer or container/list instead.
 	if len(sh.recentErrors) == maxRecentErrors {
-		copy(sh.recentErrors[1:], sh.recentErrors)
+		copy(sh.recentErrors, sh.recentErrors[1:])
 		sh.recentErrors = sh.recentErrors[:maxRecentErrors-1]
 	}
 	sh.recentErrors = append(sh.recentErrors, br)
@@ -1028,6 +1063,67 @@ func (sh *SyncHandler) EnumerateBlobs(ctx context.Context, dest chan<- blob.Size
 
 func (sh *SyncHandler) RemoveBlobs(blobs []blob.Ref) error {
 	panic("Unimplemeted RemoveBlobs")
+}
+
+var stopEnumeratingError = errors.New("sentinel error: reached the hourly compare quota")
+
+// Every hour, hourlyCompare picks blob names from a random point in the source,
+// downloads up to hourlyBytes from the destination, and verifies them.
+func (sh *SyncHandler) hourlyCompare(hourlyBytes uint64) {
+	ticker := time.NewTicker(time.Hour).C
+	for {
+		content := make([]byte, 16)
+		if _, err := rand.Read(content); err != nil {
+			panic(err)
+		}
+		after := blob.SHA1FromBytes(content).String()
+		var roundBytes uint64
+		var roundBlobs int
+		err := blobserver.EnumerateAllFrom(context.TODO(), sh.from, after, func(sr blob.SizedRef) error {
+			sh.mu.Lock()
+			if _, ok := sh.needCopy[sr.Ref]; ok {
+				sh.mu.Unlock()
+				return nil // skip blobs in the copy queue
+			}
+			sh.mu.Unlock()
+
+			if roundBytes+uint64(sr.Size) > hourlyBytes {
+				return stopEnumeratingError
+			}
+			blob, size, err := sh.to.(blob.Fetcher).Fetch(sr.Ref)
+			if err != nil {
+				return fmt.Errorf("error fetching %s: %v", sr.Ref, err)
+			}
+			if size != sr.Size {
+				return fmt.Errorf("%s: expected size %d, got %d", sr.Ref, sr.Size, size)
+			}
+			h := sr.Ref.Hash()
+			if _, err := io.Copy(h, blob); err != nil {
+				return fmt.Errorf("error while reading %s: %v", sr.Ref, err)
+			}
+			if !sr.HashMatches(h) {
+				return fmt.Errorf("expected %s, got %x", sr.Ref, h.Sum(nil))
+			}
+
+			sh.mu.Lock()
+			sh.comparedBlobs++
+			sh.comparedBytes += uint64(size)
+			sh.compLastBlob = sr.Ref.String()
+			sh.mu.Unlock()
+			roundBlobs++
+			roundBytes += uint64(size)
+			return nil
+		})
+		sh.mu.Lock()
+		if err != nil && err != stopEnumeratingError {
+			sh.compareErrors = append(sh.compareErrors, fmt.Sprintf("%s %v", time.Now(), err))
+			sh.logf("!! hourly compare error !!: %v", err)
+		}
+		sh.comparedRounds++
+		sh.mu.Unlock()
+		sh.logf("compared %d blobs (%d bytes)", roundBlobs, roundBytes)
+		<-ticker
+	}
 }
 
 // chanError is a Future around an incoming error channel of one item.

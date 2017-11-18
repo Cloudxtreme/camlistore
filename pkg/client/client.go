@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package client implements a Camlistore client.
-package client
+package client // import "camlistore.org/pkg/client"
 
 import (
 	"bytes"
@@ -47,6 +47,7 @@ import (
 	"camlistore.org/pkg/types/camtypes"
 
 	"go4.org/syncutil"
+	"golang.org/x/net/context"
 	"golang.org/x/net/http2"
 )
 
@@ -64,17 +65,20 @@ type Client struct {
 	prefixv       string        // URL prefix before "/camli/"
 	isSharePrefix bool          // URL is a request for a share blob
 
-	discoOnce      syncutil.Once
-	searchRoot     string      // Handler prefix, or "" if none
-	downloadHelper string      // or "" if none
-	storageGen     string      // storage generation, or "" if not reported
-	syncHandlers   []*SyncInfo // "from" and "to" url prefix for each syncHandler
-	serverKeyID    string      // Server's GPG public key ID.
-	helpRoot       string      // Handler prefix, or "" if none
+	discoOnce              syncutil.Once
+	searchRoot             string      // Handler prefix, or "" if none
+	downloadHelper         string      // or "" if none
+	storageGen             string      // storage generation, or "" if not reported
+	syncHandlers           []*SyncInfo // "from" and "to" url prefix for each syncHandler
+	serverKeyID            string      // Server's GPG public key ID.
+	helpRoot               string      // Handler prefix, or "" if none
+	shareRoot              string      // Share handler prefix, or "" if none
+	serverPublicKeyBlobRef blob.Ref    // Server's public key blobRef
 
-	signerOnce sync.Once
-	signer     *schema.Signer
-	signerErr  error
+	signerOnce  sync.Once
+	signer      *schema.Signer
+	signerErr   error
+	signHandler string // Handler prefix, or "" if none
 
 	authMode auth.AuthMode
 	// authErr is set when no auth config is found but we want to defer warning
@@ -125,13 +129,29 @@ type Client struct {
 	// via maps the access path from a share root to a desired target.
 	// It is non-nil when in "sharing" mode, where the Client is fetching
 	// a share.
-	via map[string]string // target => via (target is referenced from via)
+	viaMu sync.RWMutex
+	via   map[blob.Ref]blob.Ref // target => via (target is referenced from via)
 
-	log             *log.Logger // not nil
+	// Verbose controls how much logging from the client is printed. The caller
+	// should set it only before using the client, and treat it as read-only after
+	// that.
+	Verbose bool
+	// Logger is the logger used by the client. It defaults to a standard
+	// logger to os.Stderr if the client is initialized by one of the package's
+	// functions. Like Verbose, it should be set only before using the client, and
+	// not be modified afterwards.
+	Logger *log.Logger
+
 	httpGate        *syncutil.Gate
 	transportConfig *TransportConfig // or nil
 
 	paramsOnly bool // config file and env vars are ignored.
+
+	// sameOrigin indicates whether URLs in requests should be stripped from
+	// their scheme and HostPort parts. This is meant for when using the client
+	// through gopherjs in the web UI. Because we'll run into CORS errors if
+	// requests have a Host part.
+	sameOrigin bool
 }
 
 const maxParallelHTTP_h1 = 5
@@ -184,7 +204,7 @@ func (c *Client) NewPathClient(path string) *Client {
 func NewStorageClient(s blobserver.Storage) *Client {
 	return &Client{
 		sto:       s,
-		log:       log.New(os.Stderr, "", log.Ldate|log.Ltime),
+		Logger:    log.New(os.Stderr, "", log.Ldate|log.Ltime),
 		haveCache: noHaveCache{},
 	}
 }
@@ -299,6 +319,20 @@ func (o optionTrustedCert) modifyClient(c *Client) {
 	}
 }
 
+// OptionSameOrigin sets whether URLs in requests should be stripped from
+// their scheme and HostPort parts. This is meant for when using the client
+// through gopherjs in the web UI. Because we'll run into CORS errors if
+// requests have a Host part.
+func OptionSameOrigin(v bool) ClientOption {
+	return optionSameOrigin(v)
+}
+
+type optionSameOrigin bool
+
+func (o optionSameOrigin) modifyClient(c *Client) {
+	c.sameOrigin = bool(o)
+}
+
 // noop is for use with syncutil.Onces.
 func noop() error { return nil }
 
@@ -310,7 +344,7 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	var root string
 	m := shareURLRx.FindStringSubmatch(shareBlobURL)
 	if m == nil {
-		return nil, blob.Ref{}, fmt.Errorf("Unkown share URL base")
+		return nil, blob.Ref{}, fmt.Errorf("Unknown share URL base")
 	}
 	c = New(m[1], opts...)
 	c.discoOnce.Do(noop)
@@ -318,7 +352,7 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	c.prefixv = m[1]
 	c.isSharePrefix = true
 	c.authMode = auth.None{}
-	c.via = make(map[string]string)
+	c.via = make(map[blob.Ref]blob.Ref)
 	root = m[2]
 
 	req := c.newRequest("GET", shareBlobURL, nil)
@@ -328,7 +362,11 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	}
 	defer res.Body.Close()
 	var buf bytes.Buffer
-	b, err := schema.BlobFromReader(blob.ParseOrZero(root), io.TeeReader(res.Body, &buf))
+	rootbr, ok := blob.Parse(root)
+	if !ok {
+		return nil, blob.Ref{}, fmt.Errorf("invalid root blob ref for sharing: %q", root)
+	}
+	b, err := schema.BlobFromReader(rootbr, io.TeeReader(res.Body, &buf))
 	if err != nil {
 		return nil, blob.Ref{}, fmt.Errorf("error parsing JSON from %s: %v , with response: %q", shareBlobURL, err, buf.Bytes())
 	}
@@ -339,7 +377,7 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	if !target.Valid() {
 		return nil, blob.Ref{}, fmt.Errorf("no target.")
 	}
-	c.via[target.String()] = root
+	c.via[target] = rootbr
 	return c, target, nil
 }
 
@@ -375,11 +413,9 @@ func (c *Client) SetHaveCache(cache HaveCache) {
 	c.haveCache = cache
 }
 
-func (c *Client) SetLogger(logger *log.Logger) {
-	if logger == nil {
-		c.log = log.New(ioutil.Discard, "", 0)
-	} else {
-		c.log = logger
+func (c *Client) printf(format string, v ...interface{}) {
+	if c.Verbose && c.Logger != nil {
+		c.Logger.Printf(format, v)
 	}
 }
 
@@ -394,6 +430,9 @@ var ErrNoSearchRoot = errors.New("client: server doesn't support search")
 
 // ErrNoHelpRoot is returned by HelpRoot if the server doesn't have a help handler.
 var ErrNoHelpRoot = errors.New("client: server does not have a help handler")
+
+// ErrNoShareRoot is returned by ShareRoot if the server doesn't have a share handler.
+var ErrNoShareRoot = errors.New("client: server does not have a share handler")
 
 // ErrNoSigning is returned by ServerKeyID if the server doesn't support signing.
 var ErrNoSigning = fmt.Errorf("client: server doesn't support signing")
@@ -430,6 +469,19 @@ func (c *Client) ServerKeyID() (string, error) {
 	return c.serverKeyID, nil
 }
 
+// ServerPublicKeyBlobRef returns the server's public key blobRef
+// If the server isn't running a sign handler, the error will be ErrNoSigning.
+func (c *Client) ServerPublicKeyBlobRef() (blob.Ref, error) {
+	if err := c.condDiscovery(); err != nil {
+		return blob.Ref{}, err
+	}
+
+	if !c.serverPublicKeyBlobRef.Valid() {
+		return blob.Ref{}, ErrNoSigning
+	}
+	return c.serverPublicKeyBlobRef, nil
+}
+
 // SearchRoot returns the server's search handler.
 // If the server isn't running an index and search handler, the error
 // will be ErrNoSearchRoot.
@@ -454,6 +506,32 @@ func (c *Client) HelpRoot() (string, error) {
 		return "", ErrNoHelpRoot
 	}
 	return c.helpRoot, nil
+}
+
+// ShareRoot returns the server's share handler prefix URL.
+// If the server isn't running a share handler, the error will be
+// ErrNoShareRoot.
+func (c *Client) ShareRoot() (string, error) {
+	if err := c.condDiscovery(); err != nil {
+		return "", err
+	}
+	if c.shareRoot == "" {
+		return "", ErrNoShareRoot
+	}
+	return c.shareRoot, nil
+}
+
+// SignHandler returns the server's sign handler.
+// If the server isn't running a sign handler, the error will be
+// ErrNoSigning.
+func (c *Client) SignHandler() (string, error) {
+	if err := c.condDiscovery(); err != nil {
+		return "", err
+	}
+	if c.signHandler == "" {
+		return "", ErrNoSigning
+	}
+	return c.signHandler, nil
 }
 
 // StorageGeneration returns the server's unique ID for its storage
@@ -542,7 +620,8 @@ func (c *Client) GetPermanodesWithAttr(req *search.WithAttrRequest) (*search.Wit
 	return res, nil
 }
 
-func (c *Client) Describe(req *search.DescribeRequest) (*search.DescribeResponse, error) {
+func (c *Client) Describe(ctx context.Context, req *search.DescribeRequest) (*search.DescribeResponse, error) {
+	// TODO: use ctx (wait for Go 1.7?)
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
@@ -582,18 +661,22 @@ func (c *Client) GetClaims(req *search.ClaimsRequest) (*search.ClaimsResponse, e
 	return res, nil
 }
 
-func (c *Client) Query(req *search.SearchQuery) (*search.SearchResult, error) {
+func (c *Client) query(req *search.SearchQuery) (*http.Response, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
 	}
 	url := sr + req.URLSuffix()
-	body, err := json.MarshalIndent(req, "", "\t")
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	hreq := c.newRequest("POST", url, bytes.NewReader(body))
-	hres, err := c.expect2XX(hreq)
+	return c.expect2XX(hreq)
+}
+
+func (c *Client) Query(req *search.SearchQuery) (*search.SearchResult, error) {
+	hres, err := c.query(req)
 	if err != nil {
 		return nil, err
 	}
@@ -602,6 +685,17 @@ func (c *Client) Query(req *search.SearchQuery) (*search.SearchResult, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+// QueryRaw sends req and returns the body of the response, which should be the
+// unparsed JSON of a search.SearchResult.
+func (c *Client) QueryRaw(req *search.SearchQuery) ([]byte, error) {
+	hres, err := c.query(req)
+	if err != nil {
+		return nil, err
+	}
+	defer hres.Body.Close()
+	return ioutil.ReadAll(hres.Body)
 }
 
 // SearchExistingFileSchema does a search query looking for an
@@ -690,6 +784,15 @@ func (c *Client) blobPrefix() (string, error) {
 // discoRoot returns the user defined server for this client. It prepends "https://" if no scheme was specified.
 func (c *Client) discoRoot() string {
 	s := c.server
+	if c.sameOrigin {
+		s = strings.TrimPrefix(s, "http://")
+		s = strings.TrimPrefix(s, "https://")
+		parts := strings.SplitN(s, "/", 1)
+		if len(parts) < 2 {
+			return "/"
+		}
+		return "/" + parts[1]
+	}
 	if !strings.HasPrefix(s, "http") {
 		s = "https://" + s
 	}
@@ -797,17 +900,27 @@ func (c *Client) doDiscovery() error {
 		return err
 	}
 
-	u, err := root.Parse(disco.SearchRoot)
-	if err != nil {
-		return fmt.Errorf("client: invalid searchRoot %q; failed to resolve", disco.SearchRoot)
+	if disco.SearchRoot == "" {
+		c.searchRoot = ""
+	} else {
+		u, err := root.Parse(disco.SearchRoot)
+		if err != nil {
+			return fmt.Errorf("client: invalid searchRoot %q; failed to resolve", disco.SearchRoot)
+		}
+		c.searchRoot = u.String()
 	}
-	c.searchRoot = u.String()
 
-	u, err = root.Parse(disco.HelpRoot)
+	u, err := root.Parse(disco.HelpRoot)
 	if err != nil {
 		return fmt.Errorf("client: invalid helpRoot %q; failed to resolve", disco.HelpRoot)
 	}
 	c.helpRoot = u.String()
+
+	u, err = root.Parse(disco.ShareRoot)
+	if err != nil {
+		return fmt.Errorf("client: invalid shareRoot %q; failed to resolve", disco.ShareRoot)
+	}
+	c.shareRoot = u.String()
 
 	c.storageGen = disco.StorageGeneration
 
@@ -845,6 +958,8 @@ func (c *Client) doDiscovery() error {
 
 	if disco.Signing != nil {
 		c.serverKeyID = disco.Signing.PublicKeyID
+		c.serverPublicKeyBlobRef = disco.Signing.PublicKeyBlobRef
+		c.signHandler = disco.Signing.SignHandler
 	}
 	return nil
 }
@@ -868,16 +983,41 @@ func (c *Client) GetJSON(url string, data interface{}) error {
 // but with implementation details like gated requests. The
 // URL's host must match the client's configured server.
 func (c *Client) Post(url string, bodyType string, body io.Reader) error {
-	if !strings.HasPrefix(url, c.discoRoot()) {
-		return fmt.Errorf("wrong URL (%q) for this server", url)
+	resp, err := c.post(url, bodyType, body)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// Sign sends a request to the sign handler on server to sign the contents of r,
+// and return them signed. It uses the same implementation details, such as gated
+// requests, as Post.
+func (c *Client) Sign(server string, r io.Reader) (signed []byte, err error) {
+	signHandler, err := c.SignHandler()
+	if err != nil {
+		return nil, err
+	}
+	signServer := strings.TrimSuffix(server, "/") + signHandler
+	resp, err := c.post(signServer, "application/x-www-form-urlencoded", r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
+}
+
+func (c *Client) post(url string, bodyType string, body io.Reader) (*http.Response, error) {
+	if !c.sameOrigin && !strings.HasPrefix(url, c.discoRoot()) {
+		return nil, fmt.Errorf("wrong URL (%q) for this server", url)
 	}
 	req := c.newRequest("POST", url, body)
 	req.Header.Set("Content-Type", bodyType)
 	res, err := c.expect2XX(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return res.Body.Close()
+	return res, nil
 }
 
 // newRequests creates a request with the authentication header, and with the
@@ -919,12 +1059,6 @@ func (c *Client) doReqGated(req *http.Request) (*http.Response, error) {
 	c.httpGate.Start()
 	defer c.httpGate.Done()
 	return c.httpClient.Do(req)
-}
-
-// insecureTLS returns whether the client is using TLS without any
-// verification of the server's cert.
-func (c *Client) insecureTLS() bool {
-	return c.useTLS() && c.insecureAnyTLSCert
 }
 
 // DialFunc returns the adequate dial function when we're on android.
@@ -1177,7 +1311,7 @@ func newClient(server string, mode auth.AuthMode, opts ...ClientOption) *Client 
 	c := &Client{
 		server:    server,
 		haveCache: noHaveCache{},
-		log:       log.New(os.Stderr, "", log.Ldate|log.Ltime),
+		Logger:    log.New(os.Stderr, "", log.Ldate|log.Ltime),
 		authMode:  mode,
 	}
 	for _, v := range opts {

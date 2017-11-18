@@ -307,6 +307,57 @@ var keywordTests = []keywordTestcase{
 		},
 	},
 
+	{
+		object: newRef(),
+		args:   []string{"sha1-foobar"},
+		want: &Constraint{
+			BlobRefPrefix: "sha1-foobar",
+		},
+	},
+
+	{
+		object: newWith(),
+		args:   []string{"fitz"},
+		want: &Constraint{
+			Permanode: &PermanodeConstraint{
+				Attr: "with",
+				ValueInSet: &Constraint{
+					Logical: &LogicalConstraint{
+						Op: "and",
+						A: &Constraint{
+							Permanode: &PermanodeConstraint{
+								Attr:  "camliNodeType",
+								Value: "foursquare.com:person",
+							},
+						},
+						B: &Constraint{
+							Logical: &LogicalConstraint{
+								Op: "or",
+								A: &Constraint{
+									Permanode: &PermanodeConstraint{
+										Attr: "givenName",
+										ValueMatches: &StringConstraint{
+											Contains:        "fitz",
+											CaseInsensitive: true,
+										},
+									},
+								},
+								B: &Constraint{
+									Permanode: &PermanodeConstraint{
+										Attr: "familyName",
+										ValueMatches: &StringConstraint{
+											Contains:        "fitz",
+											CaseInsensitive: true,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}},
+	},
+
 	// Image predicates
 	{
 		object: newIsImage(),
@@ -523,23 +574,24 @@ var keywordTests = []keywordTestcase{
 
 	// Location predicates
 	{
-		object: newLocation(),
+		object: newNamedLocation(),
 		args:   []string{"Uitdam"}, // Small dutch town
-		want: orConst(&Constraint{
-			Permanode: &PermanodeConstraint{
-				Attr: "camliContent",
-				ValueInSet: &Constraint{
-					File: &FileConstraint{
-						IsImage:  true,
-						Location: uitdamLC,
-					},
-				},
-			},
-		}, &Constraint{
+		want: &Constraint{
 			Permanode: &PermanodeConstraint{
 				Location: uitdamLC,
 			},
-		}),
+		},
+		ctx: newGeocodeContext(),
+	},
+
+	{
+		object: newLocation(),
+		args:   []string{"52.4486802,5.0353014,52.4152441,5.094973299999999"}, // Small dutch town
+		want: &Constraint{
+			Permanode: &PermanodeConstraint{
+				Location: uitdamLC,
+			},
+		},
 		ctx: newGeocodeContext(),
 	},
 
@@ -652,20 +704,30 @@ func TestLocationConstraint(t *testing.T) {
 		t.Error("Any should match")
 	}
 
-	c = LocationConstraint{North: 2, South: 1, West: 0, East: 2}
+	c0 := LocationConstraint{North: 2, South: 1, West: 0, East: 2}
+	c180 := LocationConstraint{North: 2, South: 1, West: 179, East: -179}
 	tests := []struct {
+		c LocationConstraint
+
 		lat, long float64
 		want      bool
 	}{
-		{1, 1, true},
-		{3, 1, false},  // too north
-		{1, 3, false},  // too east
-		{1, -1, false}, // too west
-		{0, 1, false},  // too south
+		{c0, 1, 1, true},
+		{c0, 3, 1, false},  // too north
+		{c0, 1, 3, false},  // too east
+		{c0, 1, -1, false}, // too west
+		{c0, 0, 1, false},  // too south
+
+		{c180, 1, 179, true},
+		{c180, 3, 179, false},  // too north
+		{c180, 1, -178, false}, // too east
+		{c180, 1, 177, false},  // too west
+		{c180, 0, 179, false},  // too south
 	}
+
 	for _, tt := range tests {
-		if got := c.matchesLatLong(tt.lat, tt.long); got != tt.want {
-			t.Errorf("matches(%v, %v) = %v; want %v", tt.lat, tt.long, got, tt.want)
+		if got := tt.c.matchesLatLong(tt.lat, tt.long); got != tt.want {
+			t.Errorf("%#v.matches(%v, %v) = %v; want %v", tt.c, tt.lat, tt.long, got, tt.want)
 		}
 	}
 }

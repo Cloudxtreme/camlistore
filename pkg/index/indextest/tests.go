@@ -17,11 +17,12 @@ limitations under the License.
 // Package indextest contains the unit tests for the indexer so they
 // can be re-used for each specific implementation of the index
 // Storage interface.
-package indextest
+package indextest // import "camlistore.org/pkg/index/indextest"
 
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -43,6 +44,8 @@ import (
 	"camlistore.org/pkg/types/camtypes"
 	"golang.org/x/net/context"
 )
+
+var flagShowReindexRace = flag.Bool("show_reindex_race", false, "demonstrate the reindex race reported at issue #756")
 
 // An IndexDeps is a helper for populating and querying an Index for tests.
 type IndexDeps struct {
@@ -289,6 +292,7 @@ Enpn/oOOfYFa5h0AFndZd1blMvruXfdAobjVABEBAAE=
 }
 
 func Index(t *testing.T, initIdx func() *index.Index) {
+	ctx := context.Background()
 	oldLocal := time.Local
 	time.Local = time.UTC
 	defer func() { time.Local = oldLocal }()
@@ -334,7 +338,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	}
 
 	// Upload some files.
-	var jpegFileRef, exifFileRef, mediaFileRef, mediaWholeRef blob.Ref
+	var jpegFileRef, exifFileRef, exifWholeRef, badExifWholeRef, nanExifWholeRef, mediaFileRef, mediaWholeRef blob.Ref
 	{
 		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
 		if err != nil {
@@ -350,7 +354,9 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 			return
 		}
 		jpegFileRef, _ = uploadFile("dude.jpg", noTime)
-		exifFileRef, _ = uploadFile("dude-exif.jpg", time.Unix(1361248796, 0))
+		exifFileRef, exifWholeRef = uploadFile("dude-exif.jpg", time.Unix(1361248796, 0))
+		_, badExifWholeRef = uploadFile("bad-exif.jpg", time.Unix(1361248796, 0))
+		_, nanExifWholeRef = uploadFile("nan-exif.jpg", time.Unix(1361248796, 0))
 		mediaFileRef, mediaWholeRef = uploadFile("0s.mp3", noTime)
 	}
 
@@ -380,6 +386,24 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	key = "filetimes|" + exifFileRef.String()
 	if g, e := id.Get(key), "2013-02-18T01%3A11%3A20Z%2C2013-02-19T04%3A39%3A56Z"; g != e {
 		t.Errorf("EXIF dude-exif.jpg key %q = %q; want %q", key, g, e)
+	}
+
+	key = "exifgps|" + exifWholeRef.String()
+	// Test that small values aren't printed as scientific notation.
+	if g, e := id.Get(key), "-0.0000010|-120.0000000"; g != e {
+		t.Errorf("EXIF dude-exif.jpg key %q = %q; want %q", key, g, e)
+	}
+
+	// Check that indexer ignores exif lat/fields that are out of bounds.
+	key = "exifgps|" + badExifWholeRef.String()
+	if g, e := id.Get(key), ""; g != e {
+		t.Errorf("EXIF bad-exif.jpg key %q = %q; want %q", key, g, e)
+	}
+
+	// Check that indexer ignores NaN exif lat/long.
+	key = "exifgps|" + nanExifWholeRef.String()
+	if g, e := id.Get(key), ""; g != e {
+		t.Errorf("EXIF nan-exif.jpg key %q = %q; want %q", key, g, e)
 	}
 
 	key = "have:" + pn.String()
@@ -431,14 +455,14 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 
 	// PermanodeOfSignerAttrValue
 	{
-		gotPN, err := id.Index.PermanodeOfSignerAttrValue(id.SignerBlobRef, "camliRoot", "rootval")
+		gotPN, err := id.Index.PermanodeOfSignerAttrValue(ctx, id.SignerBlobRef, "camliRoot", "rootval")
 		if err != nil {
 			t.Fatalf("id.Index.PermanodeOfSignerAttrValue = %v", err)
 		}
 		if gotPN.String() != pn.String() {
 			t.Errorf("id.Index.PermanodeOfSignerAttrValue = %q, want %q", gotPN, pn)
 		}
-		_, err = id.Index.PermanodeOfSignerAttrValue(id.SignerBlobRef, "camliRoot", "MISSING")
+		_, err = id.Index.PermanodeOfSignerAttrValue(ctx, id.SignerBlobRef, "camliRoot", "MISSING")
 		if err == nil {
 			t.Errorf("expected an error from PermanodeOfSignerAttrValue on missing value")
 		}
@@ -452,7 +476,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 			Attribute: "tag",
 			Query:     "foo1",
 		}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -473,7 +497,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 		}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -511,7 +535,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 			Attribute: "title",
 			Query:     "pony",
 		}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -530,7 +554,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	{
 		verify := func(prefix string, want []camtypes.RecentPermanode, before time.Time) {
 			ch := make(chan camtypes.RecentPermanode, 10) // expect 2 results, but maybe more if buggy.
-			err := id.Index.GetRecentPermanodes(ch, id.SignerBlobRef, 50, before)
+			err := id.Index.GetRecentPermanodes(ctx, ch, id.SignerBlobRef, 50, before)
 			if err != nil {
 				t.Fatalf("[%s] GetRecentPermanodes = %v", prefix, err)
 			}
@@ -610,7 +634,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 
 	// GetBlobMeta
 	{
-		meta, err := id.Index.GetBlobMeta(pn)
+		meta, err := id.Index.GetBlobMeta(ctx, pn)
 		if err != nil {
 			t.Errorf("GetBlobMeta(%q) = %v", pn, err)
 		} else {
@@ -621,7 +645,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 				t.Errorf("GetBlobMeta(%q) size is zero", pn)
 			}
 		}
-		_, err = id.Index.GetBlobMeta(blob.ParseOrZero("abc-123"))
+		_, err = id.Index.GetBlobMeta(ctx, blob.ParseOrZero("abc-123"))
 		if err != os.ErrNotExist {
 			t.Errorf("GetBlobMeta(dummy blobref) = %v; want os.ErrNotExist", err)
 		}
@@ -629,7 +653,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 
 	// AppendClaims
 	{
-		claims, err := id.Index.AppendClaims(nil, pn, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn, id.SignerBlobRef, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
@@ -689,6 +713,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 }
 
 func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
+	ctx := context.Background()
 	id := NewIndexDeps(initIdx())
 	id.Fataler = t
 	defer id.DumpIndex(t)
@@ -712,7 +737,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 		{"targ-125", 0},
 	}
 	for _, tt := range tests {
-		paths, err := id.Index.PathsOfSignerTarget(signer, blob.ParseOrZero(tt.blobref))
+		paths, err := id.Index.PathsOfSignerTarget(ctx, signer, blob.ParseOrZero(tt.blobref))
 		if err != nil {
 			t.Fatalf("PathsOfSignerTarget(%q): %v", tt.blobref, err)
 		}
@@ -736,7 +761,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 		{"void", 0},
 	}
 	for _, tt := range tests {
-		paths, err := id.Index.PathsLookup(id.SignerBlobRef, pn, tt.blobref)
+		paths, err := id.Index.PathsLookup(ctx, id.SignerBlobRef, pn, tt.blobref)
 		if err != nil {
 			t.Fatalf("PathsLookup(%q): %v", tt.blobref, err)
 		}
@@ -766,7 +791,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 	}
 	for _, tt := range tests {
 		signer := id.SignerBlobRef
-		paths, err := id.Index.PathsOfSignerTarget(signer, blob.ParseOrZero(tt.blobref))
+		paths, err := id.Index.PathsOfSignerTarget(ctx, signer, blob.ParseOrZero(tt.blobref))
 		if err != nil {
 			t.Fatalf("PathsOfSignerTarget(%q): %v", tt.blobref, err)
 		}
@@ -781,7 +806,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 		{"void", 0},
 	}
 	for _, tt := range tests {
-		paths, err := id.Index.PathsLookup(id.SignerBlobRef, pn, tt.blobref)
+		paths, err := id.Index.PathsLookup(ctx, id.SignerBlobRef, pn, tt.blobref)
 		if err != nil {
 			t.Fatalf("PathsLookup(%q): %v", tt.blobref, err)
 		}
@@ -802,7 +827,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 	}
 	for _, tt := range tests {
 		signer := id.SignerBlobRef
-		paths, err := id.Index.PathsOfSignerTarget(signer, blob.ParseOrZero(tt.blobref))
+		paths, err := id.Index.PathsOfSignerTarget(ctx, signer, blob.ParseOrZero(tt.blobref))
 		if err != nil {
 			t.Fatalf("PathsOfSignerTarget(%q): %v", tt.blobref, err)
 		}
@@ -827,7 +852,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 		{"void", 0},
 	}
 	for _, tt := range tests {
-		paths, err := id.Index.PathsLookup(id.SignerBlobRef, pn, tt.blobref)
+		paths, err := id.Index.PathsLookup(ctx, id.SignerBlobRef, pn, tt.blobref)
 		if err != nil {
 			t.Fatalf("PathsLookup(%q): %v", tt.blobref, err)
 		}
@@ -849,6 +874,7 @@ func PathsOfSignerTarget(t *testing.T, initIdx func() *index.Index) {
 }
 
 func Files(t *testing.T, initIdx func() *index.Index) {
+	ctx := context.Background()
 	id := NewIndexDeps(initIdx())
 	id.Fataler = t
 	fileTime := time.Unix(1361250375, 0)
@@ -880,7 +906,7 @@ func Files(t *testing.T, initIdx func() *index.Index) {
 			t.Fatalf("%q = %q, want %q", key, g, e)
 		}
 
-		fi, err := id.Index.GetFileInfo(fileRef)
+		fi, err := id.Index.GetFileInfo(ctx, fileRef)
 		if err != nil {
 			t.Fatalf("GetFileInfo = %v", err)
 		}
@@ -971,6 +997,7 @@ func EdgesTo(t *testing.T, initIdx func() *index.Index) {
 }
 
 func Delete(t *testing.T, initIdx func() *index.Index) {
+	ctx := context.Background()
 	idx := initIdx()
 	id := NewIndexDeps(idx)
 	id.Fataler = t
@@ -996,7 +1023,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 			Query:     "foo1"}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -1032,7 +1059,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 			Query:     "foo1"}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -1060,7 +1087,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 			Query:     "foo1"}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -1088,7 +1115,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 			Query:     "foo1"}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -1103,7 +1130,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 	}
 	// and now check that AppendClaims finds nothing for pn
 	{
-		claims, err := id.Index.AppendClaims(nil, pn1, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn1, id.SignerBlobRef, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
@@ -1124,7 +1151,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 			Signer:    id.SignerBlobRef,
 			Attribute: "tag",
 			Query:     "foo1"}
-		err := id.Index.SearchPermanodesWithAttr(ch, req)
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
 		if err != nil {
 			t.Fatalf("SearchPermanodesWithAttr = %v", err)
 		}
@@ -1139,7 +1166,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 	}
 	// and check that AppendClaims finds cl1, with the right modtime too
 	{
-		claims, err := id.Index.AppendClaims(nil, pn1, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn1, id.SignerBlobRef, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
@@ -1177,24 +1204,35 @@ func (s searchResults) String() string {
 
 func Reindex(t *testing.T, initIdx func() *index.Index) {
 	defaultReindexMaxProcs := index.ReindexMaxProcs()
-	// if not startOoo, the outOfOrderIndexerLoop will not be started,
-	// which should demonstrate that:
-	// since delpn1 will be enumerated before pn1, and indexing of delpn1
-	// requires pn1, reindexing will fail.
-	reindex := func(t *testing.T, initIdx func() *index.Index, startOoo bool) {
-		if startOoo {
-			index.SetReindexMaxProcs(defaultReindexMaxProcs)
-			os.Setenv("CAMLI_TESTREINDEX_DISABLE_OOO", "false")
-		} else {
-			// We set the concurrency to 1, otherwise we could get "lucky" as the
-			// 2nd goroutine could index pn1 before the 1st goroutine notices it
-			// is missing as a dependency of delpn1 (which is the point of our test).
+	// if noAsyncIndexing, there won't be any out of order indexing taking place.
+	// During reindexing, since delpn1 is enumerated before pn1, and since
+	// pn1 is a dependency of delpn1, reindexing of delpn1 is supposed to fail
+	// when noAsyncIndexing.
+	reindex := func(t *testing.T, initIdx func() *index.Index, noAsyncIndexing bool) {
+		if noAsyncIndexing {
+			// idx.Reindex starts reindexMaxProcs goroutines to
+			// index the blobs that are enumerated.
+			// The first one created will receive delpn1 to index
+			// (because it's first in the enumeration order), and is
+			// supposed to fail at it, because pn1, which is a
+			// dependency of delpn1, has not yet been seen/indexed.
+			// If at least 2 goroutines were created, it could
+			// happen that "by chance" the 2nd (or 3rd, etc) would
+			// index pn1 before the first goroutine "notices" that pn1
+			// is missing, which would defeat the purpose of our test.
+			// Therefore, we disable the reindexMaxProcs-based
+			// concurrency in Reindex to make sure that does not
+			// happen.
 			index.SetReindexMaxProcs(1)
-			os.Setenv("CAMLI_TESTREINDEX_DISABLE_OOO", "true")
+		} else {
+			index.SetReindexMaxProcs(defaultReindexMaxProcs)
 		}
 		idx := initIdx()
 		id := NewIndexDeps(idx)
 		id.Fataler = t
+		if noAsyncIndexing {
+			idx.DisableOutOfOrderIndexing()
+		}
 
 		pn1 := id.NewPlannedPermanode("foo1") // sha1-f06e30253644014922f955733a641cbc64d43d73
 		t.Logf("uploaded permanode %q", pn1)
@@ -1208,16 +1246,44 @@ func Reindex(t *testing.T, initIdx func() *index.Index) {
 		}
 
 		err := id.Index.Reindex()
-		if !startOoo && err == nil {
-			t.Fatal("Reindexing without outOfOrderIndexerLoop should have failed")
+		if noAsyncIndexing {
+			if err == nil {
+				t.Fatal("Reindexing without out of order indexing should have failed")
+			}
+			t.Logf("Reindexing without out of order indexing failed as expected: %v", err)
 		}
-		if startOoo && err != nil {
-			t.Fatal(err)
+		if !noAsyncIndexing && err != nil {
+			t.Fatalf("Reindexing with out of order indexing failed: %v", err)
 		}
 	}
 
 	reindex(t, initIdx, false)
 	reindex(t, initIdx, true)
+}
+
+func ShowReindexRace(t *testing.T, initIdx func() *index.Index) {
+	if !*flagShowReindexRace {
+		t.Skipf("skipping test without --show_reindex_race")
+	}
+	os.Setenv("CAMLI_SHOW_REINDEX_RACE", "true")
+	idx := initIdx()
+	id := NewIndexDeps(idx)
+	id.Fataler = t
+
+	pn1 := id.NewPlannedPermanode("foo1") // sha1-f06e30253644014922f955733a641cbc64d43d73
+	t.Logf("uploaded permanode %q", pn1)
+
+	// delete pn1
+	delpn1 := id.Delete(pn1) // sha1-1d4c60cb3ce967edfb3194afd36124ce3f87ece0
+	t.Logf("del claim %q deletes %q", delpn1, pn1)
+	deleted := idx.IsDeleted(pn1)
+	if !deleted {
+		t.Fatal("pn1 should be deleted")
+	}
+
+	if err := id.Index.Reindex(); err != nil {
+		t.Fatalf("Reindexing was not finished: %v", err)
+	}
 }
 
 type enumArgs struct {

@@ -32,17 +32,18 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/types/camtypes"
-	"go4.org/types"
-
 	"go4.org/syncutil"
+	"go4.org/types"
+	"golang.org/x/net/context"
 )
 
 func (sh *Handler) serveDescribe(rw http.ResponseWriter, req *http.Request) {
 	defer httputil.RecoverJSON(rw, req)
 	var dr DescribeRequest
 	dr.fromHTTP(req)
+	ctx := context.TODO()
 
-	res, err := sh.Describe(&dr)
+	res, err := sh.Describe(ctx, &dr)
 	if err != nil {
 		httputil.ServeJSONError(rw, err)
 		return
@@ -52,7 +53,18 @@ func (sh *Handler) serveDescribe(rw http.ResponseWriter, req *http.Request) {
 
 const verboseDescribe = false
 
-func (sh *Handler) Describe(dr *DescribeRequest) (dres *DescribeResponse, err error) {
+// Describe returns a response for the given describe request. It acquires RLock
+// on the Handler's index.
+func (sh *Handler) Describe(ctx context.Context, dr *DescribeRequest) (dres *DescribeResponse, err error) {
+	sh.index.RLock()
+	defer sh.index.RUnlock()
+
+	return sh.DescribeLocked(ctx, dr)
+}
+
+// DescribeLocked returns a response for the given describe request. It is the
+// caller's responsibility to lock the search handler's index.
+func (sh *Handler) DescribeLocked(ctx context.Context, dr *DescribeRequest) (dres *DescribeResponse, err error) {
 	if verboseDescribe {
 		t0 := time.Now()
 		defer func() {
@@ -66,12 +78,12 @@ func (sh *Handler) Describe(dr *DescribeRequest) (dres *DescribeResponse, err er
 	}
 	sh.initDescribeRequest(dr)
 	if dr.BlobRef.Valid() {
-		dr.Describe(dr.BlobRef, dr.depth())
+		dr.StartDescribe(ctx, dr.BlobRef, dr.depth())
 	}
 	for _, br := range dr.BlobRefs {
-		dr.Describe(br, dr.depth())
+		dr.StartDescribe(ctx, br, dr.depth())
 	}
-	if err := dr.expandRules(); err != nil {
+	if err := dr.expandRules(ctx); err != nil {
 		return nil, err
 	}
 	metaMap, err := dr.metaMap()
@@ -116,8 +128,9 @@ type DescribeRequest struct {
 	sh            *Handler
 	mu            sync.Mutex // protects following:
 	m             MetaMap
-	done          map[blobrefAndDepth]bool // blobref -> true
-	errs          map[string]error         // blobref -> error
+	started       map[blobrefAndDepth]bool // blobref -> true
+	blobDesLock   map[blob.Ref]*sync.Mutex
+	errs          map[string]error // blobref -> error
 	resFromRule   map[*DescribeRule]map[blob.Ref]bool
 	flatRuleCache []*DescribeRule // flattened once, by flatRules
 
@@ -228,6 +241,22 @@ type DescribedBlob struct {
 
 	// if camliType "directory"
 	DirChildren []blob.Ref `json:"dirChildren,omitempty"`
+
+	// Location specifies the location of the entity referenced
+	// by the blob.
+	//
+	// If camliType is "file", then location comes from the metadata
+	// (currently Exif) metadata of the file content.
+	//
+	// If camliType is "permanode", then location comes
+	// from one of the following sources:
+	//  1. Permanode attributes "latitude" and "longitude"
+	//  2. Referenced permanode attributes (eg. for "foursquare.com:checkin"
+	//     its "foursquareVenuePermanode")
+	//  3. Location in permanode camliContent file metadata
+	// The sources are checked in this order, the location from
+	// the first source yielding a valid result is returned.
+	Location *camtypes.Location `json:"location,omitempty"`
 
 	// Stub is set if this is not loaded, but referenced.
 	Stub bool `json:"-"`
@@ -453,10 +482,6 @@ func (b *DescribedBlob) peerBlob(br blob.Ref) *DescribedBlob {
 	return &DescribedBlob{Request: b.Request, BlobRef: br, Stub: true}
 }
 
-func (b *DescribedBlob) isPermanode() bool {
-	return b.Permanode != nil
-}
-
 type DescribedPermanode struct {
 	Attr    url.Values `json:"attr"` // a map[string][]string
 	ModTime time.Time  `json:"modtime,omitempty"`
@@ -474,21 +499,6 @@ func (dp *DescribedPermanode) IsContainer() bool {
 		}
 	}
 	return false
-}
-
-func (dp *DescribedPermanode) jsonMap() map[string]interface{} {
-	m := jsonMap()
-
-	am := jsonMap()
-	m["attr"] = am
-	for k, vv := range dp.Attr {
-		if len(vv) > 0 {
-			vl := make([]string, len(vv))
-			copy(vl[:], vv[:])
-			am[k] = vl
-		}
-	}
-	return m
 }
 
 // NewDescribeRequest returns a new DescribeRequest holding the state
@@ -523,7 +533,7 @@ func (de DescribeError) Error() string {
 // Result waits for all outstanding lookups to complete and
 // returns the map of blobref (strings) to their described
 // results. The returned error is non-nil if any errors
-// occured, and will be of type DescribeError.
+// occurred, and will be of type DescribeError.
 func (dr *DescribeRequest) Result() (desmap map[string]*DescribedBlob, err error) {
 	dr.wg.Wait()
 	// TODO: set "done" / locked flag, so no more DescribeBlob can
@@ -572,8 +582,8 @@ func (dr *DescribeRequest) describedBlob(b blob.Ref) *DescribedBlob {
 	return des
 }
 
-func (dr *DescribeRequest) DescribeSync(br blob.Ref) (*DescribedBlob, error) {
-	dr.Describe(br, 1)
+func (dr *DescribeRequest) DescribeSync(ctx context.Context, br blob.Ref) (*DescribedBlob, error) {
+	dr.StartDescribe(ctx, br, 1)
 	res, err := dr.Result()
 	if err != nil {
 		return nil, err
@@ -581,39 +591,38 @@ func (dr *DescribeRequest) DescribeSync(br blob.Ref) (*DescribedBlob, error) {
 	return res[br.String()], nil
 }
 
-// Describe starts a lookup of br, down to the provided depth.
-// It returns immediately.
-func (dr *DescribeRequest) Describe(br blob.Ref, depth int) {
+// StartDescribe starts a lookup of br, down to the provided depth.
+// It returns immediately. One should call Result to wait for the description to
+// be completed.
+func (dr *DescribeRequest) StartDescribe(ctx context.Context, br blob.Ref, depth int) {
 	if depth <= 0 {
 		return
 	}
 	dr.mu.Lock()
 	defer dr.mu.Unlock()
-	if dr.done == nil {
-		dr.done = make(map[blobrefAndDepth]bool)
+	if dr.blobDesLock == nil {
+		dr.blobDesLock = make(map[blob.Ref]*sync.Mutex)
 	}
-	doneKey := blobrefAndDepth{br, depth}
-	if dr.done[doneKey] {
+	desBlobMu, ok := dr.blobDesLock[br]
+	if !ok {
+		desBlobMu = new(sync.Mutex)
+		dr.blobDesLock[br] = desBlobMu
+	}
+	if dr.started == nil {
+		dr.started = make(map[blobrefAndDepth]bool)
+	}
+	key := blobrefAndDepth{br, depth}
+	if dr.started[key] {
 		return
 	}
-	dr.done[doneKey] = true
+	dr.started[key] = true
 	dr.wg.Add(1)
 	go func() {
 		defer dr.wg.Done()
-		dr.describeReally(br, depth)
+		desBlobMu.Lock()
+		defer desBlobMu.Unlock()
+		dr.doDescribe(ctx, br, depth)
 	}()
-}
-
-// requires dr.mu is held
-func (dr *DescribeRequest) isDescribedOrError(br blob.Ref) bool {
-	brs := br.String()
-	if _, ok := dr.m[brs]; ok {
-		return true
-	}
-	if _, ok := dr.errs[brs]; ok {
-		return true
-	}
-	return false
 }
 
 // requires dr.mu be held.
@@ -675,7 +684,7 @@ func (dr *DescribeRequest) noteResultFromRule(rule *DescribeRule, br blob.Ref) {
 	m[br] = true
 }
 
-func (dr *DescribeRequest) expandRules() error {
+func (dr *DescribeRequest) expandRules(ctx context.Context) error {
 	loop := true
 
 	for loop {
@@ -694,7 +703,7 @@ func (dr *DescribeRequest) expandRules() error {
 		}
 		dr.mu.Unlock()
 		for _, br := range new {
-			dr.Describe(br, 1)
+			dr.StartDescribe(ctx, br, 1)
 		}
 		dr.wg.Wait()
 		dr.mu.Lock()
@@ -715,8 +724,8 @@ func (dr *DescribeRequest) addError(br blob.Ref, err error) {
 	dr.errs[br.String()] = err
 }
 
-func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
-	meta, err := dr.sh.index.GetBlobMeta(br)
+func (dr *DescribeRequest) doDescribe(ctx context.Context, br blob.Ref, depth int) {
+	meta, err := dr.sh.index.GetBlobMeta(ctx, br)
 	if err == os.ErrNotExist {
 		return
 	}
@@ -737,9 +746,20 @@ func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
 	switch des.CamliType {
 	case "permanode":
 		des.Permanode = new(DescribedPermanode)
-		dr.populatePermanodeFields(des.Permanode, br, dr.sh.owner, depth)
+		dr.populatePermanodeFields(ctx, des.Permanode, br, dr.sh.owner, depth)
+		var at time.Time
+		if !dr.At.IsAnyZero() {
+			at = dr.At.Time()
+		}
+		if loc, err := dr.sh.lh.PermanodeLocation(ctx, br, at, dr.sh.owner); err == nil {
+			des.Location = &loc
+		} else {
+			if err != os.ErrNotExist {
+				log.Printf("PermanodeLocation(permanode %s): %v", br, err)
+			}
+		}
 	case "file":
-		fi, err := dr.sh.index.GetFileInfo(br)
+		fi, err := dr.sh.index.GetFileInfo(ctx, br)
 		if err != nil {
 			if os.IsNotExist(err) {
 				log.Printf("index.GetFileInfo(file %s) failed; index stale?", br)
@@ -750,7 +770,7 @@ func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
 		}
 		des.File = &fi
 		if des.File.IsImage() {
-			imgInfo, err := dr.sh.index.GetImageInfo(br)
+			imgInfo, err := dr.sh.index.GetImageInfo(ctx, br)
 			if err != nil {
 				if !os.IsNotExist(err) {
 					dr.addError(br, err)
@@ -759,13 +779,20 @@ func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
 				des.Image = &imgInfo
 			}
 		}
-		if mediaTags, err := dr.sh.index.GetMediaTags(br); err == nil {
+		if mediaTags, err := dr.sh.index.GetMediaTags(ctx, br); err == nil {
 			des.MediaTags = mediaTags
+		}
+		if loc, err := dr.sh.index.GetFileLocation(ctx, br); err == nil {
+			des.Location = &loc
+		} else {
+			if err != os.ErrNotExist {
+				log.Printf("index.GetFileLocation(file %s): %v", br, err)
+			}
 		}
 	case "directory":
 		var g syncutil.Group
 		g.Go(func() (err error) {
-			fi, err := dr.sh.index.GetFileInfo(br)
+			fi, err := dr.sh.index.GetFileInfo(ctx, br)
 			if os.IsNotExist(err) {
 				log.Printf("index.GetFileInfo(directory %s) failed; index stale?", br)
 			}
@@ -775,7 +802,7 @@ func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
 			return
 		})
 		g.Go(func() (err error) {
-			des.DirChildren, err = dr.getDirMembers(br, depth)
+			des.DirChildren, err = dr.getDirMembers(ctx, br, depth)
 			return
 		})
 		if err := g.Err(); err != nil {
@@ -784,11 +811,11 @@ func (dr *DescribeRequest) describeReally(br blob.Ref, depth int) {
 	}
 }
 
-func (dr *DescribeRequest) populatePermanodeFields(pi *DescribedPermanode, pn, signer blob.Ref, depth int) {
+func (dr *DescribeRequest) populatePermanodeFields(ctx context.Context, pi *DescribedPermanode, pn, signer blob.Ref, depth int) {
 	pi.Attr = make(url.Values)
 	attr := pi.Attr
 
-	claims, err := dr.sh.index.AppendClaims(nil, pn, signer, "")
+	claims, err := dr.sh.index.AppendClaims(ctx, nil, pn, signer, "")
 	if err != nil {
 		log.Printf("Error getting claims of %s: %v", pn.String(), err)
 		dr.addError(pn, fmt.Errorf("Error getting claims of %s: %v", pn.String(), err))
@@ -844,14 +871,14 @@ claimLoop:
 
 	// Descend into any references in current attributes.
 	for key, vals := range attr {
-		dr.describeRefs(key, depth)
+		dr.describeRefs(ctx, key, depth)
 		for _, v := range vals {
-			dr.describeRefs(v, depth)
+			dr.describeRefs(ctx, v, depth)
 		}
 	}
 }
 
-func (dr *DescribeRequest) getDirMembers(br blob.Ref, depth int) ([]blob.Ref, error) {
+func (dr *DescribeRequest) getDirMembers(ctx context.Context, br blob.Ref, depth int) ([]blob.Ref, error) {
 	limit := dr.maxDirChildren()
 	ch := make(chan blob.Ref)
 	errch := make(chan error)
@@ -861,7 +888,7 @@ func (dr *DescribeRequest) getDirMembers(br blob.Ref, depth int) ([]blob.Ref, er
 
 	var members []blob.Ref
 	for child := range ch {
-		dr.Describe(child, depth)
+		dr.StartDescribe(ctx, child, depth)
 		members = append(members, child)
 	}
 	if err := <-errch; err != nil {
@@ -870,10 +897,10 @@ func (dr *DescribeRequest) getDirMembers(br blob.Ref, depth int) ([]blob.Ref, er
 	return members, nil
 }
 
-func (dr *DescribeRequest) describeRefs(str string, depth int) {
+func (dr *DescribeRequest) describeRefs(ctx context.Context, str string, depth int) {
 	for _, match := range blobRefPattern.FindAllString(str, -1) {
 		if ref, ok := blob.ParseKnown(match); ok {
-			dr.Describe(ref, depth-1)
+			dr.StartDescribe(ctx, ref, depth-1)
 		}
 	}
 }

@@ -19,7 +19,7 @@ goog.provide('cam.BlobDetail');
 goog.require('cam.blobref');
 goog.require('cam.ServerConnection');
 
-goog.require('goog.labs.Promise');
+goog.require('goog.Promise');
 
 cam.BlobDetail = React.createClass({
 	displayName: 'BlobDetail',
@@ -40,21 +40,30 @@ cam.BlobDetail = React.createClass({
 		};
 	},
 
+	componentWillReceiveProps: function(nextProps) {
+		// this.props == nextProps is for the very first load.
+		if (this.props == nextProps || this.props.meta.blobRef != nextProps.meta.blobRef) {
+			var sc = this.props.serverConnection;
+
+			// TODO(mpl): see if we can get any of the information below
+			// from the search session, in particular from the resolved meta.
+			sc.getBlobContents(nextProps.meta.blobRef, this.handleBlobContents_);
+			sc.permanodeClaims(nextProps.meta.blobRef, this.handleClaims_);
+
+			goog.Promise.all([
+				new goog.Promise(sc.pathsOfSignerTarget.bind(sc, nextProps.meta.blobRef)),
+				new goog.Promise(sc.search.bind(sc, {
+					permanode: {
+						attr: 'camliMember',
+						value: nextProps.meta.blobRef,
+					},
+				}, null))
+			]).then(this.handleRefs_);
+		}
+	},
+
 	componentWillMount: function() {
-		var sc = this.props.serverConnection;
-
-		sc.getBlobContents(this.props.meta.blobRef, this.handleBlobContents_);
-		sc.permanodeClaims(this.props.meta.blobRef, this.handleClaims_);
-
-		goog.labs.Promise.all([
-			new goog.labs.Promise(sc.pathsOfSignerTarget.bind(sc, this.props.meta.blobRef)),
-			new goog.labs.Promise(sc.search.bind(sc, {
-				permanode: {
-					attr: 'camliMember',
-					value: this.props.meta.blobRef,
-				},
-			}, null, null, null))
-		]).then(this.handleRefs_);
+		this.componentWillReceiveProps(this.props, true);
 	},
 
 	render: function() {
@@ -86,7 +95,7 @@ cam.BlobDetail = React.createClass({
 				null,
 				refs.map(function(blobref) {
 					return React.DOM.li(
-						{},
+						{key: blobref},
 						React.DOM.a(
 							{
 								href: this.props.getDetailURL(blobref),
@@ -194,7 +203,7 @@ cam.BlobDetail.getAspect = function(getDetailURL, serverConnection, blobref, tar
 		fragment: 'blob',
 		title: 'Blob',
 		createContent: function(size) {
-			return cam.BlobDetail({
+			return React.createElement(cam.BlobDetail, {
 				getDetailURL: getDetailURL,
 				meta: m,
 				serverConnection: serverConnection,

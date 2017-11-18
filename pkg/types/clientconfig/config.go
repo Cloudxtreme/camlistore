@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package clientconfig provides types related to the client configuration
 // file.
-package clientconfig
+package clientconfig // import "camlistore.org/pkg/types/clientconfig"
 
 import (
 	"errors"
@@ -63,7 +63,7 @@ func (conf *Config) Alias(server string) string {
 	return serverAlias
 }
 
-// GenerateClientConfig retuns a client configuration which can be used to
+// GenerateClientConfig returns a client configuration which can be used to
 // access a server defined by the provided low-level server configuration.
 func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 	missingConfig := func(param string) (*Config, error) {
@@ -79,13 +79,45 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 		return missingConfig(param)
 	}
 
-	listen := serverConfig.OptionalString("listen", "")
-	baseURL := serverConfig.OptionalString("baseURL", "")
-	if listen == "" {
-		listen = baseURL
+	// checking these early, so we can get to keyId
+	param = "prefixes"
+	prefixes := serverConfig.OptionalObject(param)
+	if len(prefixes) == 0 {
+		return missingConfig(param)
 	}
-	if listen == "" {
-		return nil, errors.New("required value for 'listen' or 'baseURL' not found")
+	param = "/sighelper/"
+	sighelper := prefixes.OptionalObject(param)
+	if len(sighelper) == 0 {
+		return missingConfig(param)
+	}
+	param = "handlerArgs"
+	handlerArgs := sighelper.OptionalObject(param)
+	if len(handlerArgs) == 0 {
+		return missingConfig(param)
+	}
+	param = "keyId"
+	keyId := handlerArgs.OptionalString(param, "")
+	if keyId == "" {
+		return missingConfig(param)
+	}
+
+	var listen, baseURL string
+	camliNetIP := serverConfig.OptionalString("camliNetIP", "")
+	if camliNetIP != "" {
+		listen = ":443"
+		// TODO(mpl): move the camliNetDomain const from camlistored.go
+		// to somewhere importable, so we can use it here. but later.
+		camliNetDomain := "camlistore.net"
+		baseURL = fmt.Sprintf("https://%s.%s/", keyId, camliNetDomain)
+	} else {
+		listen = serverConfig.OptionalString("listen", "")
+		baseURL = serverConfig.OptionalString("baseURL", "")
+		if listen == "" {
+			listen = baseURL
+		}
+		if listen == "" {
+			return nil, errors.New("required value for 'listen' or 'baseURL' not found")
+		}
 	}
 
 	https := serverConfig.OptionalBool("https", false)
@@ -97,12 +129,7 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 		}
 	}
 
-	param = "httpsCert"
-	httpsCert := serverConfig.OptionalString(param, "")
-	if https && httpsCert == "" {
-		return missingConfig(param)
-	}
-
+	httpsCert := serverConfig.OptionalString("httpsCert", "")
 	// TODO(mpl): See if we can detect that the cert is not self-signed,and in
 	// that case not add it to the trustedCerts
 	var trustedList []string
@@ -116,30 +143,6 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 			return nil, fmt.Errorf("could not get fingerprints of certificate: %v", err)
 		}
 		trustedList = []string{sig}
-	}
-
-	param = "prefixes"
-	prefixes := serverConfig.OptionalObject(param)
-	if len(prefixes) == 0 {
-		return missingConfig(param)
-	}
-
-	param = "/sighelper/"
-	sighelper := prefixes.OptionalObject(param)
-	if len(sighelper) == 0 {
-		return missingConfig(param)
-	}
-
-	param = "handlerArgs"
-	handlerArgs := sighelper.OptionalObject(param)
-	if len(handlerArgs) == 0 {
-		return missingConfig(param)
-	}
-
-	param = "keyId"
-	keyId := handlerArgs.OptionalString(param, "")
-	if keyId == "" {
-		return missingConfig(param)
 	}
 
 	param = "secretRing"

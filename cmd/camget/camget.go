@@ -37,6 +37,12 @@ import (
 	"go4.org/types"
 )
 
+func init() {
+	// So we can simply use log.Printf and log.Fatalf.
+	// For logging that depends on verbosity (cmdmain.FlagVerbose), use cmdmain.Logf/Printf.
+	log.SetOutput(cmdmain.Stderr)
+}
+
 var (
 	// Keeping flagVersion and flagVerbose declared like this, so we don't forget and
 	// erroneously redeclare them again in conflict with the cmdmain ones, which is not
@@ -57,6 +63,10 @@ var (
 func main() {
 	client.AddFlags()
 	flag.Parse()
+
+	if *cmdmain.FlagHelp {
+		flag.PrintDefaults()
+	}
 
 	if *flagVersion {
 		fmt.Fprintf(os.Stderr, "camget version: %s\n", buildinfo.Version())
@@ -120,6 +130,19 @@ func main() {
 	defer diskCacheFetcher.Clean()
 	if *flagVerbose {
 		log.Printf("Using temp blob cache directory %s", diskCacheFetcher.Root)
+	}
+	if *flagShared != "" {
+		diskCacheFetcher.SetCacheHitHook(func(br blob.Ref, rc io.ReadCloser) (io.ReadCloser, error) {
+			var buf bytes.Buffer
+			if err := cl.UpdateShareChain(br, io.TeeReader(rc, &buf)); err != nil {
+				rc.Close()
+				return nil, err
+			}
+			return struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(&buf, rc), rc}, nil
+		})
 	}
 
 	for _, br := range items {

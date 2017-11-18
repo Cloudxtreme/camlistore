@@ -28,6 +28,7 @@ import (
 	"camlistore.org/pkg/client"
 	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/search"
+	"golang.org/x/net/context"
 )
 
 type listCmd struct {
@@ -46,7 +47,6 @@ func init() {
 			describe: false,
 		}
 		flags.StringVar(&cmd.syncCmd.src, "src", "", "Source blobserver is either a URL prefix (with optional path), a host[:port], a path (starting with /, ./, or ../), or blank to use the Camlistore client config's default host.")
-		flags.BoolVar(&cmd.verbose, "verbose", false, "Be verbose.")
 		flags.BoolVar(&cmd.describe, "describe", false, "Use describe requests to get each blob's type. Requires a source server with a search endpoint. Mostly used for demos. Requires many extra round-trips to the server currently.")
 		return cmd
 	})
@@ -99,7 +99,7 @@ func (c *listCmd) RunCommand(args []string) error {
 			return nil
 		}
 		// TODO(mpl): setting depth to 1, not 0, because otherwise r.depth() in pkg/search/handler.go defaults to 4. Can't remember why we disallowed 0 right now, and I do not want to change that in pkg/search/handler.go and risk breaking things.
-		described, err := c.cl.Describe(&search.DescribeRequest{
+		described, err := c.cl.Describe(context.Background(), &search.DescribeRequest{
 			BlobRefs: blobRefs,
 			Depth:    1,
 		})

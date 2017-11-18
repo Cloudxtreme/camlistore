@@ -29,47 +29,46 @@ import (
 	"strings"
 	"time"
 
+	fontawesomestatic "embed/fontawesome"
+	glitchstatic "embed/glitch"
+	leafletstatic "embed/leaflet"
+	lessstatic "embed/less"
+	reactstatic "embed/react"
+
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
+	"camlistore.org/pkg/cacher"
 	"camlistore.org/pkg/constants"
 	"camlistore.org/pkg/fileembed"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/misc/closure"
+	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/server/app"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/types/camtypes"
 	uistatic "camlistore.org/server/camlistored/ui"
 	closurestatic "camlistore.org/server/camlistored/ui/closure"
-	"camlistore.org/third_party/code.google.com/p/rsc/qr"
-	fontawesomestatic "camlistore.org/third_party/fontawesome"
-	glitchstatic "camlistore.org/third_party/glitch"
-	lessstatic "camlistore.org/third_party/less"
-	reactstatic "camlistore.org/third_party/react"
+	"code.google.com/p/rsc/qr"
 	"go4.org/jsonconfig"
-
 	"go4.org/syncutil"
 )
 
 var (
-	staticFilePattern = regexp.MustCompile(`^([a-zA-Z0-9\-\_\.]+\.(html|js|css|png|jpg|gif|svg))$`)
-	identOrDotPattern = regexp.MustCompile(`^[a-zA-Z\_]+(\.[a-zA-Z\_]+)*$`)
-
-	// Download URL suffix:
-	//   $1: blobref (checked in download handler)
-	//   $2: optional "/filename" to be sent as recommended download name,
-	//       if sane looking
-	downloadPattern = regexp.MustCompile(`^download/([^/]+)(/.*)?$`)
-
+	staticFilePattern  = regexp.MustCompile(`^([a-zA-Z0-9\-\_\.]+\.(html|js|css|png|jpg|gif|svg))$`)
+	identOrDotPattern  = regexp.MustCompile(`^[a-zA-Z\_]+(\.[a-zA-Z\_]+)*$`)
 	thumbnailPattern   = regexp.MustCompile(`^thumbnail/([^/]+)(/.*)?$`)
 	treePattern        = regexp.MustCompile(`^tree/([^/]+)(/.*)?$`)
 	closurePattern     = regexp.MustCompile(`^closure/(([^/]+)(/.*)?)$`)
 	lessPattern        = regexp.MustCompile(`^less/(.+)$`)
 	reactPattern       = regexp.MustCompile(`^react/(.+)$`)
+	leafletPattern     = regexp.MustCompile(`^leaflet/(.+)$`)
 	fontawesomePattern = regexp.MustCompile(`^fontawesome/(.+)$`)
 	glitchPattern      = regexp.MustCompile(`^glitch/(.+)$`)
 
 	disableThumbCache, _ = strconv.ParseBool(os.Getenv("CAMLI_DISABLE_THUMB_CACHE"))
+
+	vendorEmbed = filepath.Join("vendor", "embed")
 )
 
 // UIHandler handles serving the UI and discovery JSON.
@@ -99,6 +98,7 @@ type UIHandler struct {
 	closureHandler         http.Handler
 	fileLessHandler        http.Handler
 	fileReactHandler       http.Handler
+	fileLeafletHandler     http.Handler
 	fileFontawesomeHandler http.Handler
 	fileGlitchHandler      http.Handler
 }
@@ -113,7 +113,7 @@ func newKVOrNil(conf jsonconfig.Obj) (sorted.KeyValue, error) {
 	if len(conf) == 0 {
 		return nil, nil
 	}
-	return sorted.NewKeyValue(conf)
+	return sorted.NewKeyValueMaybeWipe(conf)
 }
 
 func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, err error) {
@@ -160,6 +160,14 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 			log.Printf("Using the default \"%v\" as the sourceRoot for AppEngine", uistatic.GaeSourceRoot)
 			ui.sourceRoot = uistatic.GaeSourceRoot
 		}
+		if ui.sourceRoot == "" && uistatic.Files.IsEmpty() {
+			ui.sourceRoot, err = osutil.GoPackagePath("camlistore.org")
+			if err != nil {
+				log.Printf("Warning: server not compiled with linked-in UI resources (HTML, JS, CSS), and camlistore.org not found in GOPATH.")
+			} else {
+				log.Printf("Using UI resources (HTML, JS, CSS) from disk, under %v", ui.sourceRoot)
+			}
+		}
 	}
 	if ui.sourceRoot != "" {
 		ui.uiDir = filepath.Join(ui.sourceRoot, filepath.FromSlash("server/camlistored/ui"))
@@ -183,19 +191,23 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 	}
 
 	if ui.sourceRoot != "" {
-		ui.fileReactHandler, err = makeFileServer(ui.sourceRoot, filepath.Join("third_party", "react"), "react.js")
+		ui.fileReactHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "react"), "react-dom.min.js")
 		if err != nil {
 			return nil, fmt.Errorf("Could not make react handler: %s", err)
 		}
-		ui.fileGlitchHandler, err = makeFileServer(ui.sourceRoot, filepath.Join("third_party", "glitch"), "npc_piggy__x1_walk_png_1354829432.png")
+		ui.fileLeafletHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "leaflet"), "leaflet.js")
+		if err != nil {
+			return nil, fmt.Errorf("Could not make leaflet handler: %s", err)
+		}
+		ui.fileGlitchHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "glitch"), "npc_piggy__x1_walk_png_1354829432.png")
 		if err != nil {
 			return nil, fmt.Errorf("Could not make glitch handler: %s", err)
 		}
-		ui.fileFontawesomeHandler, err = makeFileServer(ui.sourceRoot, filepath.Join("third_party", "fontawesome"), "css/font-awesome.css")
+		ui.fileFontawesomeHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "fontawesome"), "css/font-awesome.css")
 		if err != nil {
 			return nil, fmt.Errorf("Could not make fontawesome handler: %s", err)
 		}
-		ui.fileLessHandler, err = makeFileServer(ui.sourceRoot, filepath.Join("third_party", "less"), "less.js")
+		ui.fileLessHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "less"), "less.js")
 		if err != nil {
 			return nil, fmt.Errorf("Could not make less handler: %s", err)
 		}
@@ -257,6 +269,9 @@ func (ui *UIHandler) InitHandler(hl blobserver.FindHandlerByTyper) error {
 		if !ok {
 			panic(fmt.Sprintf("UI: handler for %v has type \"app\" but is not app.Handler", prefix))
 		}
+		// TODO(mpl): this check is weak, as the user could very well
+		// use another binary name for the publisher app. We should
+		// introduce/use another identifier.
 		if ah.ProgramName() != "publisher" {
 			continue
 		}
@@ -325,7 +340,7 @@ func makeClosureHandler(root, handlerName string) (http.Handler, error) {
 		return closureRedirector(root), nil
 	}
 
-	path := filepath.Join("third_party", "closure", "lib", "closure")
+	path := filepath.Join(vendorEmbed, "closure", "lib", "closure")
 	return makeFileServer(root, path, filepath.Join("goog", "base.js"))
 }
 
@@ -386,10 +401,6 @@ func wantsBlobInfo(req *http.Request) bool {
 	return httputil.IsGet(req) && blob.ValidRefString(req.FormValue("b"))
 }
 
-func wantsFileTreePage(req *http.Request) bool {
-	return httputil.IsGet(req) && blob.ValidRefString(req.FormValue("d"))
-}
-
 func getSuffixMatches(req *http.Request, pattern *regexp.Regexp) bool {
 	if httputil.IsGet(req) {
 		suffix := httputil.PathSuffix(req)
@@ -421,6 +432,8 @@ func (ui *UIHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		ui.serveFromDiskOrStatic(rw, req, lessPattern, ui.fileLessHandler, lessstatic.Files)
 	case getSuffixMatches(req, reactPattern):
 		ui.serveFromDiskOrStatic(rw, req, reactPattern, ui.fileReactHandler, reactstatic.Files)
+	case getSuffixMatches(req, leafletPattern):
+		ui.serveFromDiskOrStatic(rw, req, leafletPattern, ui.fileLeafletHandler, leafletstatic.Files)
 	case getSuffixMatches(req, glitchPattern):
 		ui.serveFromDiskOrStatic(rw, req, glitchPattern, ui.fileGlitchHandler, glitchstatic.Files)
 	case getSuffixMatches(req, fontawesomePattern):
@@ -437,8 +450,6 @@ func (ui *UIHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				file = "permanode.html"
 			case wantsBlobInfo(req):
 				file = "blobinfo.html"
-			case wantsFileTreePage(req):
-				file = "filetree.html"
 			case req.URL.Path == httputil.PathBase(req):
 				file = "index.html"
 			default:
@@ -486,41 +497,32 @@ func (ui *UIHandler) discovery() *camtypes.UIDiscovery {
 		pubRoots[v.Name] = rd
 	}
 
+	mapClustering, _ := strconv.ParseBool(os.Getenv("CAMLI_DEV_MAP_CLUSTERING"))
 	uiDisco := &camtypes.UIDiscovery{
 		UIRoot:          ui.prefix,
 		UploadHelper:    ui.prefix + "?camli.mode=uploadhelper",
 		DownloadHelper:  path.Join(ui.prefix, "download") + "/",
 		DirectoryHelper: path.Join(ui.prefix, "tree") + "/",
 		PublishRoots:    pubRoots,
+		MapClustering:   mapClustering,
 	}
 	return uiDisco
 }
 
-func (ui *UIHandler) serveDownload(rw http.ResponseWriter, req *http.Request) {
+func (ui *UIHandler) serveDownload(w http.ResponseWriter, r *http.Request) {
 	if ui.root.Storage == nil {
-		http.Error(rw, "No BlobRoot configured", 500)
-		return
-	}
-
-	suffix := httputil.PathSuffix(req)
-	m := downloadPattern.FindStringSubmatch(suffix)
-	if m == nil {
-		httputil.ErrorRouting(rw, req)
-		return
-	}
-
-	fbr, ok := blob.Parse(m[1])
-	if !ok {
-		http.Error(rw, "Invalid blobref", 400)
+		http.Error(w, "No BlobRoot configured", 500)
 		return
 	}
 
 	dh := &DownloadHandler{
-		Fetcher: ui.root.Storage,
+		// TODO(mpl): for more efficiency, the cache itself should be a
+		// blobpacked, or really anything better optimized for file reading
+		// than a blobserver.localdisk (which is what ui.Cache most likely is).
+		Fetcher: cacher.NewCachingFetcher(ui.Cache, ui.root.Storage),
 		Search:  ui.search,
-		Cache:   ui.Cache,
 	}
-	dh.ServeHTTP(rw, req, fbr)
+	dh.ServeHTTP(w, r)
 }
 
 func (ui *UIHandler) serveThumbnail(rw http.ResponseWriter, req *http.Request) {

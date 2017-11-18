@@ -18,6 +18,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -39,6 +40,8 @@ import (
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/server/app"
 	"camlistore.org/pkg/types/camtypes"
+
+	"cloud.google.com/go/compute/metadata"
 	"go4.org/jsonconfig"
 )
 
@@ -111,6 +114,7 @@ func (sh *StatusHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 type status struct {
 	Version      string                   `json:"version"`
+	GoInfo       string                   `json:"goInfo"`
 	Errors       []camtypes.StatusError   `json:"errors,omitempty"`
 	Sync         map[string]syncStatus    `json:"sync"`
 	Storage      map[string]storageStatus `json:"storage"`
@@ -152,6 +156,7 @@ type storageStatus struct {
 func (sh *StatusHandler) currentStatus() *status {
 	res := &status{
 		Version: buildinfo.Version(),
+		GoInfo:  fmt.Sprintf("%s %s/%s cgo=%v", runtime.Version(), runtime.GOOS, runtime.GOARCH, cgoEnabled),
 		Storage: make(map[string]storageStatus),
 		Sync:    make(map[string]syncStatus),
 	}
@@ -208,6 +213,17 @@ func (sh *StatusHandler) serveStatusJSON(rw http.ResponseWriter, req *http.Reque
 	httputil.ReturnJSON(rw, sh.currentStatus())
 }
 
+func (sh *StatusHandler) googleCloudConsole() (string, error) {
+	if !env.OnGCE() {
+		return "", errors.New("not on GCE")
+	}
+	projID, err := metadata.ProjectID()
+	if err != nil {
+		return "", fmt.Errorf("Error getting project ID: %v", err)
+	}
+	return "https://console.cloud.google.com/compute/instances?project=" + projID, nil
+}
+
 var quotedPrefix = regexp.MustCompile(`[;"]/(\S+?/)[&"]`)
 
 func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Request) {
@@ -243,7 +259,19 @@ func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Reque
 	f("</ul>")
 
 	f("<h2>Admin</h2>")
-	f("<form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button></form>")
+	f("<ul>")
+	f("  <li><form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button>")
+	f("<input type='checkbox' name='reindex'> reindex <input type='checkbox' name='recovery'> recovery</form></li>")
+	f("</form></li>")
+	if env.OnGCE() {
+		console, err := sh.googleCloudConsole()
+		if err != nil {
+			log.Printf("error getting Google Cloud Console URL: %v", err)
+		} else {
+			f("   <li><b>Updating:</b> When a new image for Camlistore on GCE is available, you can update by hitting \"Reset\" (or \"Stop\", then \"Start\") for your instance on your <a href='%s'>Google Cloud Console</a>.<br>Alternatively, you can ssh to your instance and restart the Camlistore service with: <b>sudo systemctl restart camlistored</b>.</li>", console)
+		}
+	}
+	f("</ul>")
 
 	f("<h2>Handlers</h2>")
 	f("<p>As JSON: <a href='status.json'>status.json</a>; and the <a href='%s?camli.mode=config'>discovery JSON</a>.</p>", st.rootPrefix)
@@ -285,13 +313,16 @@ func (sh *StatusHandler) serveRestart(rw http.ResponseWriter, req *http.Request)
 		}
 	}
 
+	reindex := (req.FormValue("reindex") == "on")
+	recovery := (req.FormValue("recovery") == "on")
+
 	log.Println("Restarting camlistored")
 	rw.Header().Set("Connection", "close")
 	http.Redirect(rw, req, sh.prefix, http.StatusFound)
 	if f, ok := rw.(http.Flusher); ok {
 		f.Flush()
 	}
-	osutil.RestartProcess()
+	osutil.RestartProcess(fmt.Sprintf("-reindex=%t", reindex), fmt.Sprintf("-recovery=%t", recovery))
 }
 
 var cgoEnabled bool

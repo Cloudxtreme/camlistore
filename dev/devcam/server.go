@@ -72,7 +72,9 @@ type serverCmd struct {
 	openBrowser      bool
 	flickrAPIKey     string
 	foursquareAPIKey string
+	gphotosAPIKey    string
 	picasaAPIKey     string
+	plaidAPIKey      string
 	twitterAPIKey    string
 	extraArgs        string // passed to camlistored
 	// end of flag vars
@@ -116,7 +118,9 @@ func init() {
 		flags.BoolVar(&cmd.openBrowser, "openbrowser", false, "Open the start page on startup.")
 		flags.StringVar(&cmd.flickrAPIKey, "flickrapikey", "", "The key and secret to use with the Flickr importer. Formatted as '<key>:<secret>'.")
 		flags.StringVar(&cmd.foursquareAPIKey, "foursquareapikey", "", "The key and secret to use with the Foursquare importer. Formatted as '<clientID>:<clientSecret>'.")
+		flags.StringVar(&cmd.gphotosAPIKey, "gphotoskey", "", "The username and password to use with the Google Photos importer. Formatted as '<clientID>:<clientSecret>'.")
 		flags.StringVar(&cmd.picasaAPIKey, "picasakey", "", "The username and password to use with the Picasa importer. Formatted as '<username>:<password>'.")
+		flags.StringVar(&cmd.plaidAPIKey, "plaidkey", "", "The client_id and secret to use with the Plaid importer. Formatted as '<client_id>:<secret>'.")
 		flags.StringVar(&cmd.twitterAPIKey, "twitterapikey", "", "The key and secret to use with the Twitter importer. Formatted as '<APIkey>:<APIsecret>'.")
 		flags.StringVar(&cmd.root, "root", "", "A directory to store data in. Defaults to a location in the OS temp directory.")
 		flags.StringVar(&cmd.extraArgs, "extraargs", "",
@@ -315,6 +319,10 @@ func (c *serverCmd) setEnvVars() error {
 		setenv("CAMLI_PICASA_ENABLED", "true")
 		setenv("CAMLI_PICASA_API_KEY", c.picasaAPIKey)
 	}
+	if c.plaidAPIKey != "" {
+		setenv("CAMLI_PLAID_ENABLED", "true")
+		setenv("CAMLI_PLAID_API_KEY", c.plaidAPIKey)
+	}
 	if c.twitterAPIKey != "" {
 		setenv("CAMLI_TWITTER_ENABLED", "true")
 		setenv("CAMLI_TWITTER_API_KEY", c.twitterAPIKey)
@@ -393,14 +401,14 @@ func (c *serverCmd) setFullClosure() error {
 				oldsvn, err)
 		}
 		log.Println("Updating closure library...")
-		args := []string{"run", "third_party/closure/updatelibrary.go", "-verbose"}
+		args := []string{"run", "vendor/embed/closure/updatelibrary.go", "-verbose"}
 		cmd := exec.Command("go", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("Could not run updatelibrary.go: %v", err)
 		}
-		c.env.Set("CAMLI_DEV_CLOSURE_DIR", "third_party/closure/lib/closure")
+		c.env.Set("CAMLI_DEV_CLOSURE_DIR", "vendor/embed/closure/lib/closure")
 	}
 	return nil
 }
@@ -498,6 +506,7 @@ func (c *serverCmd) RunCommand(args []string) error {
 		if c.publish {
 			targets = append(targets, filepath.Join("app", "publisher"))
 		}
+		targets = append(targets, filepath.Join("app", "scanningcabinet"))
 		for _, name := range targets {
 			err := build(name)
 			if err != nil {

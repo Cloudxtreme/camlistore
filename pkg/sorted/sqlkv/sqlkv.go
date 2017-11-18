@@ -15,14 +15,13 @@ limitations under the License.
 */
 
 // Package sqlkv implements the sorted.KeyValue interface using an *sql.DB.
-package sqlkv
+package sqlkv // import "camlistore.org/pkg/sorted/sqlkv"
 
 import (
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 	"sync"
 
@@ -106,11 +105,7 @@ func (b *batchTx) Set(key, value string) {
 		return
 	}
 	if err := sorted.CheckSizes(key, value); err != nil {
-		if err == sorted.ErrKeyTooLarge {
-			b.err = fmt.Errorf("%v: %v", err, key)
-		} else {
-			b.err = fmt.Errorf("%v: %v", err, value)
-		}
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
 		return
 	}
 	if b.kv.BatchSetFunc != nil {
@@ -151,6 +146,9 @@ func (kv *KeyValue) CommitBatch(b sorted.BatchMutation) error {
 		return fmt.Errorf("wrong BatchMutation type %T", b)
 	}
 	if bt.err != nil {
+		if err := bt.tx.Rollback(); err != nil {
+			log.Printf("Transaction rollback error: %v", err)
+		}
 		return bt.err
 	}
 	return bt.tx.Commit()
@@ -170,7 +168,8 @@ func (kv *KeyValue) Get(key string) (value string, err error) {
 
 func (kv *KeyValue) Set(key, value string) error {
 	if err := sorted.CheckSizes(key, value); err != nil {
-		return err
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
+		return nil
 	}
 	if kv.Gate != nil {
 		kv.Gate.Start()
@@ -191,6 +190,9 @@ func (kv *KeyValue) Delete(key string) error {
 	_, err := kv.DB.Exec(kv.sql("DELETE FROM /*TPRE*/rows WHERE k=?"), key)
 	return err
 }
+
+// TODO(mpl): implement Wipe for each of the SQLs, as it's done for MySQL, and
+// remove this one below.
 
 func (kv *KeyValue) Wipe() error {
 	if kv.Gate != nil {
@@ -230,13 +232,10 @@ func (kv *KeyValue) Find(start, end string) sorted.Iterator {
 	return it
 }
 
-var wordThenPunct = regexp.MustCompile(`^\w+\W$`)
-
 // iter is a iterator over sorted key/value pairs in rows.
 type iter struct {
 	kv  *KeyValue
-	end string // optional end bound
-	err error  // accumulated error, returned at Close
+	err error // accumulated error, returned at Close
 
 	closeCheck  *leak.Checker
 	releaseGate func() // if non-nil, called on Close

@@ -17,19 +17,21 @@ limitations under the License.
 package sorted
 
 import (
-	"bytes"
 	"errors"
+	"log"
 	"sync"
 
-	"camlistore.org/third_party/code.google.com/p/leveldb-go/leveldb/db"
-	"camlistore.org/third_party/code.google.com/p/leveldb-go/leveldb/memdb"
+	"github.com/syndtr/goleveldb/leveldb/comparer"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/memdb"
+	"github.com/syndtr/goleveldb/leveldb/util"
 	"go4.org/jsonconfig"
 )
 
 // NewMemoryKeyValue returns a KeyValue implementation that's backed only
 // by memory. It's mostly useful for tests and development.
 func NewMemoryKeyValue() KeyValue {
-	db := memdb.New(nil)
+	db := memdb.New(comparer.DefaultComparer, 128)
 	return &memKeys{db: db}
 }
 
@@ -37,37 +39,25 @@ func NewMemoryKeyValue() KeyValue {
 // purposes only.
 type memKeys struct {
 	mu sync.Mutex // guards db
-	db db.DB
+	db *memdb.DB
 }
 
-// memIter converts from leveldb's db.Iterator interface, which
+// memIter converts from leveldb's iterator.Iterator interface, which
 // operates on []byte, to Camlistore's index.Iterator, which operates
 // on string.
 type memIter struct {
-	lit  db.Iterator // underlying leveldb iterator
-	k, v *string     // if nil, not stringified yet
-	end  []byte      // if len(end) > 0, the upper bound
+	lit  iterator.Iterator // underlying leveldb iterator
+	k, v *string           // if nil, not stringified yet
 }
 
 func (t *memIter) Next() bool {
 	t.k, t.v = nil, nil
-	if !t.lit.Next() {
-		return false
-	}
-	if len(t.end) > 0 && bytes.Compare(t.KeyBytes(), t.end) >= 0 {
-		return false
-	}
-	return true
+	return t.lit.Next()
 }
 
 func (s *memIter) Close() error {
-	if s.lit == nil {
-		// Already closed.
-		return nil
-	}
-	err := s.lit.Close()
-	*s = memIter{} // to cause crashes on future access
-	return err
+	s.lit.Release()
+	return s.lit.Error()
 }
 
 func (s *memIter) KeyBytes() []byte {
@@ -99,8 +89,8 @@ func (s *memIter) Value() string {
 func (mk *memKeys) Get(key string) (string, error) {
 	mk.mu.Lock()
 	defer mk.mu.Unlock()
-	k, err := mk.db.Get([]byte(key), nil)
-	if err == db.ErrNotFound {
+	k, err := mk.db.Get([]byte(key))
+	if err == memdb.ErrNotFound {
 		return "", ErrNotFound
 	}
 	return string(k), err
@@ -109,28 +99,32 @@ func (mk *memKeys) Get(key string) (string, error) {
 func (mk *memKeys) Find(start, end string) Iterator {
 	mk.mu.Lock()
 	defer mk.mu.Unlock()
-	lit := mk.db.Find([]byte(start), nil)
-	it := &memIter{lit: lit}
-	if end != "" {
-		it.end = []byte(end)
+	var startB, endB []byte
+	if start != "" {
+		startB = []byte(start)
 	}
-	return it
+	if end != "" {
+		endB = []byte(end)
+	}
+	lit := mk.db.NewIterator(&util.Range{Start: startB, Limit: endB})
+	return &memIter{lit: lit}
 }
 
 func (mk *memKeys) Set(key, value string) error {
 	if err := CheckSizes(key, value); err != nil {
-		return err
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
+		return nil
 	}
 	mk.mu.Lock()
 	defer mk.mu.Unlock()
-	return mk.db.Set([]byte(key), []byte(value), nil)
+	return mk.db.Put([]byte(key), []byte(value))
 }
 
 func (mk *memKeys) Delete(key string) error {
 	mk.mu.Lock()
 	defer mk.mu.Unlock()
-	err := mk.db.Delete([]byte(key), nil)
-	if err == db.ErrNotFound {
+	err := mk.db.Delete([]byte(key))
+	if err == memdb.ErrNotFound {
 		return nil
 	}
 	return err
@@ -149,14 +143,17 @@ func (mk *memKeys) CommitBatch(bm BatchMutation) error {
 	defer mk.mu.Unlock()
 	for _, m := range b.Mutations() {
 		if m.IsDelete() {
-			if err := mk.db.Delete([]byte(m.Key()), nil); err != nil {
+			if err := mk.db.Delete([]byte(m.Key())); err != nil && err != memdb.ErrNotFound {
 				return err
 			}
 		} else {
+			// TODO(mpl): we need to force a reindex when we have a proper solution
+			// for storing these too large attributes, if ever.
 			if err := CheckSizes(m.Key(), m.Value()); err != nil {
-				return err
+				log.Printf("Skipping storing (%q:%q): %v", m.Key(), m.Value(), err)
+				continue
 			}
-			if err := mk.db.Set([]byte(m.Key()), []byte(m.Value()), nil); err != nil {
+			if err := mk.db.Put([]byte(m.Key()), []byte(m.Value())); err != nil {
 				return err
 			}
 		}

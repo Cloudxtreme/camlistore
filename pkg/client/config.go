@@ -96,7 +96,7 @@ func (c *Client) parseConfig() {
 		}
 		log.Fatal(errMsg)
 	}
-	// TODO: instead of using jsonconfig, we could read the file, and unmarshall into the structs that we now have in pkg/types/clientconfig. But we'll have to add the old fields (before the name changes, and before the multi-servers change) to the structs as well for our gracefull conversion/error messages to work.
+	// TODO: instead of using jsonconfig, we could read the file, and unmarshall into the structs that we now have in pkg/types/clientconfig. But we'll have to add the old fields (before the name changes, and before the multi-servers change) to the structs as well for our graceful conversion/error messages to work.
 	conf, err := osutil.NewJSONConfigParser().ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err.Error())
@@ -207,7 +207,7 @@ func printConfigChangeHelp(conf jsonconfig.Obj) {
 		}
 	}
 	if oldConfig {
-		configChangedMsg += "Please see http://camlistore.org/docs/client-config, or use camput init to recreate a default one."
+		configChangedMsg += "Please see https://camlistore.org/doc/client-config, or use camput init to recreate a default one."
 		log.Print(configChangedMsg)
 	}
 }
@@ -285,14 +285,6 @@ func defaultServer() string {
 		}
 	}
 	return ""
-}
-
-func (c *Client) serverOrDefault() string {
-	configOnce.Do(parseConfig)
-	if c.server != "" {
-		return cleanServer(c.server)
-	}
-	return defaultServer()
 }
 
 func (c *Client) useTLS() bool {

@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package cmdmain contains the shared implementation for camget,
 // camput, camtool, and other Camlistore command-line tools.
-package cmdmain
+package cmdmain // import "camlistore.org/pkg/cmdmain"
 
 import (
 	"flag"
@@ -25,7 +25,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 
 	"camlistore.org/pkg/buildinfo"
@@ -44,18 +43,15 @@ var (
 	// ExtraFlagRegistration allows to add more flags from
 	// other packages (with AddFlags) when Main starts.
 	ExtraFlagRegistration = func() {}
+	// PostFlag runs code that needs to happen after flags were parsed, but
+	// before the subcommand is run.
+	PostFlag = func() {}
 	// PreExit runs after the subcommand, but before Main terminates
 	// with either success or the error from the subcommand.
 	PreExit = func() {}
 	// ExitWithFailure determines whether the command exits
 	// with a non-zero exit status.
 	ExitWithFailure bool
-	// CheckCwd checks the current working directory, and possibly
-	// changes it, or aborts the run if needed.
-	CheckCwd = func() {}
-	// CheckModtime provides a way to check if the currently running binary
-	// is out of date. If it returns an error, the run is aborted.
-	CheckModtime = func() error { return nil }
 )
 
 var ErrUsage = UsageError("invalid command")
@@ -82,6 +78,8 @@ var (
 	// Only use fs.Stat, fs.Open, where vs is an interface type.
 	// TODO: switch from using the global flag FlagSet and use our own. right now
 	// running "go test -v" dumps the flag usage data to the global stderr.
+
+	logger = log.New(Stderr, "", log.LstdFlags)
 )
 
 func realExit(code int) {
@@ -118,52 +116,12 @@ func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunne
 	modeCommand[mode] = makeCmd(flags)
 }
 
-type namedMode struct {
-	Name    string
-	Command CommandRunner
-}
-
-// TODO(mpl): do we actually need this? I changed usage
-// to simply iterate over all of modeCommand and it seems
-// fine.
-func allModes(startModes []string) <-chan namedMode {
-	ch := make(chan namedMode)
-	go func() {
-		defer close(ch)
-		done := map[string]bool{}
-		for _, name := range startModes {
-			done[name] = true
-			cmd := modeCommand[name]
-			if cmd == nil {
-				panic("bogus mode: " + name)
-			}
-			ch <- namedMode{name, cmd}
-		}
-		var rest []string
-		for name := range modeCommand {
-			if !done[name] {
-				rest = append(rest, name)
-			}
-		}
-		sort.Strings(rest)
-		for _, name := range rest {
-			ch <- namedMode{name, modeCommand[name]}
-		}
-	}()
-	return ch
-}
-
 func hasFlags(flags *flag.FlagSet) bool {
 	any := false
 	flags.VisitAll(func(*flag.Flag) {
 		any = true
 	})
 	return any
-}
-
-// Errorf prints to Stderr
-func Errorf(format string, args ...interface{}) {
-	fmt.Fprintf(Stderr, format, args...)
 }
 
 func usage(msg string) {
@@ -248,12 +206,11 @@ func Main() {
 	if setCommandLineOutput != nil {
 		setCommandLineOutput(Stderr)
 	}
-	flag.Parse()
-	CheckCwd()
-	if err := CheckModtime(); err != nil {
-		log.Print(err)
-		Exit(1)
+	flag.Usage = func() {
+		usage("")
 	}
+	flag.Parse()
+	PostFlag()
 
 	args := flag.Args()
 	if *FlagVersion {
@@ -311,4 +268,24 @@ func Main() {
 		}
 		Exit(2)
 	}
+}
+
+// Errorf prints to Stderr, regardless of FlagVerbose.
+func Errorf(format string, args ...interface{}) {
+	fmt.Fprintf(Stderr, format, args...)
+}
+
+// Printf prints to Stderr if FlagVerbose, and is silent otherwise.
+func Printf(format string, args ...interface{}) {
+	if *FlagVerbose {
+		fmt.Fprintf(Stderr, format, args...)
+	}
+}
+
+// Logf logs to Stderr if FlagVerbose, and is silent otherwise.
+func Logf(format string, v ...interface{}) {
+	if !*FlagVerbose {
+		return
+	}
+	logger.Printf(format, v...)
 }

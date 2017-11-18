@@ -34,7 +34,7 @@
 package grpc
 
 import (
-	"errors"
+	"bytes"
 	"io"
 	"sync"
 	"time"
@@ -43,15 +43,18 @@ import (
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/transport"
 )
 
-type streamHandler func(srv interface{}, stream ServerStream) error
+// StreamHandler defines the handler called by gRPC server to complete the
+// execution of a streaming RPC.
+type StreamHandler func(srv interface{}, stream ServerStream) error
 
 // StreamDesc represents a streaming RPC service's method specification.
 type StreamDesc struct {
 	StreamName string
-	Handler    streamHandler
+	Handler    StreamHandler
 
 	// At least one of these is true.
 	ServerStreams bool
@@ -66,26 +69,24 @@ type Stream interface {
 	// breaks.
 	// On error, it aborts the stream and returns an RPC status on client
 	// side. On server side, it simply returns the error to the caller.
-	// SendMsg is called by generated code.
+	// SendMsg is called by generated code. Also Users can call SendMsg
+	// directly when it is really needed in their use cases.
 	SendMsg(m interface{}) error
 	// RecvMsg blocks until it receives a message or the stream is
 	// done. On client side, it returns io.EOF when the stream is done. On
-	// any other error, it aborts the streama nd returns an RPC status. On
+	// any other error, it aborts the stream and returns an RPC status. On
 	// server side, it simply returns the error to the caller.
 	RecvMsg(m interface{}) error
 }
 
-// ClientStream defines the interface a client stream has to satify.
+// ClientStream defines the interface a client stream has to satisfy.
 type ClientStream interface {
-	// Header returns the header metedata received from the server if there
+	// Header returns the header metadata received from the server if there
 	// is any. It blocks if the metadata is not ready to read.
 	Header() (metadata.MD, error)
-	// Trailer returns the trailer metadata from the server. It must be called
-	// after stream.Recv() returns non-nil error (including io.EOF) for
-	// bi-directional streaming and server streaming or stream.CloseAndRecv()
-	// returns for client streaming in order to receive trailer metadata if
-	// present. Otherwise, it could returns an empty MD even though trailer
-	// is present.
+	// Trailer returns the trailer metadata from the server, if there is any.
+	// It must only be called after stream.CloseAndRecv has returned, or
+	// stream.Recv has returned a non-nil error (including io.EOF).
 	Trailer() metadata.MD
 	// CloseSend closes the send direction of the stream. It closes the stream
 	// when non-nil error is met.
@@ -96,203 +97,160 @@ type ClientStream interface {
 // NewClientStream creates a new Stream for the client side. This is called
 // by generated code.
 func NewClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, method string, opts ...CallOption) (ClientStream, error) {
-	var (
-		t   transport.ClientTransport
-		err error
-	)
-	t, err = cc.dopts.picker.Pick(ctx)
-	if err != nil {
-		return nil, toRPCErr(err)
+	return newClientStream(ctx, desc, cc, method, opts...)
+}
+
+func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, method string, opts ...CallOption) (_ ClientStream, err error) {
+	var cancel context.CancelFunc
+
+	c := defaultCallInfo
+	if mc, ok := cc.getMethodConfig(method); ok {
+		c.failFast = !mc.WaitForReady
+		if mc.Timeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, mc.Timeout)
+		}
 	}
-	// TODO(zhaoq): CallOption is omitted. Add support when it is needed.
-	callHdr := &transport.CallHdr{
-		Host:   cc.authority,
-		Method: method,
+	_ = cancel
+	for _, o := range opts {
+		if err := o.before(&c); err != nil {
+			return nil, toRPCErr(err)
+		}
 	}
-	cs := &clientStream{
-		desc:    desc,
-		codec:   cc.dopts.codec,
-		tracing: EnableTracing,
+	panic("TODO(bradfitz)")
+	flush := desc.ServerStreams && desc.ClientStreams
+	_ = flush
+
+	var compressAlg string
+	if cc.opts.cp != nil {
+		compressAlg = cc.opts.cp.Type()
 	}
-	if cs.tracing {
-		cs.trInfo.tr = trace.New("grpc.Sent."+methodFamily(method), method)
-		cs.trInfo.firstLine.client = true
+	_ = compressAlg
+	var trInfo traceInfo
+	if EnableTracing {
+		trInfo.tr = trace.New("grpc.Sent."+methodFamily(method), method)
+		trInfo.firstLine.client = true
 		if deadline, ok := ctx.Deadline(); ok {
-			cs.trInfo.firstLine.deadline = deadline.Sub(time.Now())
+			trInfo.firstLine.deadline = deadline.Sub(time.Now())
 		}
-		cs.trInfo.tr.LazyLog(&cs.trInfo.firstLine, false)
-		ctx = trace.NewContext(ctx, cs.trInfo.tr)
+		trInfo.tr.LazyLog(&trInfo.firstLine, false)
+		ctx = trace.NewContext(ctx, trInfo.tr)
+		defer func() {
+			if err != nil {
+				// Need to call tr.finish() if error is returned.
+				// Because tr will not be returned to caller.
+				trInfo.tr.LazyPrintf("RPC: [%v]", err)
+				trInfo.tr.SetError()
+				trInfo.tr.Finish()
+			}
+		}()
 	}
-	s, err := t.NewStream(ctx, callHdr)
-	if err != nil {
-		return nil, toRPCErr(err)
-	}
-	cs.t = t
-	cs.s = s
-	cs.p = &parser{s: s}
-	// Listen on ctx.Done() to detect cancellation when there is no pending
-	// I/O operations on this stream.
-	go func() {
-		<-s.Context().Done()
-		cs.closeTransportStream(transport.ContextErr(s.Context().Err()))
-	}()
-	return cs, nil
-}
-
-// clientStream implements a client side Stream.
-type clientStream struct {
-	t     transport.ClientTransport
-	s     *transport.Stream
-	p     *parser
-	desc  *StreamDesc
-	codec Codec
-
-	tracing bool // set to EnableTracing when the clientStream is created.
-
-	mu     sync.Mutex
-	closed bool
-	// trInfo.tr is set when the clientStream is created (if EnableTracing is true),
-	// and is set to nil when the clientStream's finish method is called.
-	trInfo traceInfo
-}
-
-func (cs *clientStream) Context() context.Context {
-	return cs.s.Context()
-}
-
-func (cs *clientStream) Header() (metadata.MD, error) {
-	m, err := cs.s.Header()
-	if err != nil {
-		if _, ok := err.(transport.ConnectionError); !ok {
-			cs.closeTransportStream(err)
+	sh := cc.opts.statsHandler
+	if sh != nil {
+		ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: method})
+		begin := &stats.Begin{
+			Client:    true,
+			BeginTime: time.Now(),
+			FailFast:  c.failFast,
 		}
-	}
-	return m, err
-}
-
-func (cs *clientStream) Trailer() metadata.MD {
-	return cs.s.Trailer()
-}
-
-func (cs *clientStream) SendMsg(m interface{}) (err error) {
-	if cs.tracing {
-		cs.mu.Lock()
-		if cs.trInfo.tr != nil {
-			cs.trInfo.tr.LazyLog(&payload{sent: true, msg: m}, true)
-		}
-		cs.mu.Unlock()
+		sh.HandleRPC(ctx, begin)
 	}
 	defer func() {
-		if err == nil || err == io.EOF {
-			return
+		if err != nil && sh != nil {
+			// Only handle end stats if err != nil.
+			end := &stats.End{
+				Client: true,
+				Error:  err,
+			}
+			sh.HandleRPC(ctx, end)
 		}
-		if _, ok := err.(transport.ConnectionError); !ok {
-			cs.closeTransportStream(err)
-		}
-		err = toRPCErr(err)
 	}()
-	out, err := encode(cs.codec, m, compressionNone)
-	if err != nil {
-		return transport.StreamErrorf(codes.Internal, "grpc: %v", err)
-	}
-	return cs.t.Write(cs.s, out, &transport.Options{Last: false})
-}
-
-func (cs *clientStream) RecvMsg(m interface{}) (err error) {
-	err = recv(cs.p, cs.codec, m)
-	defer func() {
-		// err != nil indicates the termination of the stream.
+	for {
+		//t, put, err = cc.getTransport(ctx)
+		panic("TODO")
 		if err != nil {
-			cs.finish(err)
-		}
-	}()
-	if err == nil {
-		if cs.tracing {
-			cs.mu.Lock()
-			if cs.trInfo.tr != nil {
-				cs.trInfo.tr.LazyLog(&payload{sent: false, msg: m}, true)
+			// TODO(zhaoq): Probably revisit the error handling.
+			if _, ok := err.(*rpcError); ok {
+				return nil, err
 			}
-			cs.mu.Unlock()
-		}
-		if !cs.desc.ClientStreams || cs.desc.ServerStreams {
-			return
-		}
-		// Special handling for client streaming rpc.
-		err = recv(cs.p, cs.codec, m)
-		cs.closeTransportStream(err)
-		if err == nil {
-			return toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
-		}
-		if err == io.EOF {
-			if cs.s.StatusCode() == codes.OK {
-				return nil
+			if false { // err == errConnClosing || err == errConnUnavailable {
+				if c.failFast {
+					return nil, Errorf(codes.Unavailable, "%v", err)
+				}
+				continue
 			}
-			return Errorf(cs.s.StatusCode(), cs.s.StatusDesc())
+			// All the other errors are treated as Internal errors.
+			return nil, Errorf(codes.Internal, "%v", err)
 		}
-		return toRPCErr(err)
+
+		panic("TODO")
 	}
-	if _, ok := err.(transport.ConnectionError); !ok {
-		cs.closeTransportStream(err)
-	}
-	if err == io.EOF {
-		if cs.s.StatusCode() == codes.OK {
-			// Returns io.EOF to indicate the end of the stream.
-			return
+	/*
+		cs := &clientStream{
+			opts:   opts,
+			c:      c,
+			desc:   desc,
+			codec:  cc.opts.codec,
+			cp:     cc.opts.cp,
+			dc:     cc.opts.dc,
+			cancel: cancel,
+
+			put: put,
+			t:   t,
+			s:   s,
+			p:   &parser{r: s},
+
+			tracing: EnableTracing,
+			trInfo:  trInfo,
+
+			statsCtx:     ctx,
+			statsHandler: cc.opts.copts.StatsHandler,
 		}
-		return Errorf(cs.s.StatusCode(), cs.s.StatusDesc())
-	}
-	return toRPCErr(err)
-}
-
-func (cs *clientStream) CloseSend() (err error) {
-	err = cs.t.Write(cs.s, nil, &transport.Options{Last: true})
-	if err == nil || err == io.EOF {
-		return
-	}
-	if _, ok := err.(transport.ConnectionError); !ok {
-		cs.closeTransportStream(err)
-	}
-	err = toRPCErr(err)
-	return
-}
-
-func (cs *clientStream) closeTransportStream(err error) {
-	cs.mu.Lock()
-	if cs.closed {
-		cs.mu.Unlock()
-		return
-	}
-	cs.closed = true
-	cs.mu.Unlock()
-	cs.t.CloseStream(cs.s, err)
-}
-
-func (cs *clientStream) finish(err error) {
-	if !cs.tracing {
-		return
-	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if cs.trInfo.tr != nil {
-		if err == nil || err == io.EOF {
-			cs.trInfo.tr.LazyPrintf("RPC: [OK]")
-		} else {
-			cs.trInfo.tr.LazyPrintf("RPC: [%v]", err)
-			cs.trInfo.tr.SetError()
+		if cc.opts.cp != nil {
+			cs.cbuf = new(bytes.Buffer)
 		}
-		cs.trInfo.tr.Finish()
-		cs.trInfo.tr = nil
-	}
+		// Listen on ctx.Done() to detect cancellation and s.Done() to detect normal termination
+		// when there is no pending I/O operations on this stream.
+		go func() {
+			select {
+			case <-t.Error():
+				// Incur transport error, simply exit.
+			case <-s.Done():
+				// TODO: The trace of the RPC is terminated here when there is no pending
+				// I/O, which is probably not the optimal solution.
+				if s.StatusCode() == codes.OK {
+					cs.finish(nil)
+				} else {
+					cs.finish(Errorf(s.StatusCode(), "%s", s.StatusDesc()))
+				}
+				cs.closeTransportStream(nil)
+			case <-s.GoAway():
+				cs.finish(errConnDrain)
+				cs.closeTransportStream(errConnDrain)
+			case <-s.Context().Done():
+				err := s.Context().Err()
+				cs.finish(err)
+				cs.closeTransportStream(transport.ContextErr(err))
+			}
+		}()
+		return cs, nil
+	*/
 }
 
 // ServerStream defines the interface a server stream has to satisfy.
 type ServerStream interface {
-	// SendHeader sends the header metadata. It should not be called
-	// after SendProto. It fails if called multiple times or if
-	// called after SendProto.
+	// SetHeader sets the header metadata. It may be called multiple times.
+	// When call multiple times, all the provided metadata will be merged.
+	// All the metadata will be sent out when one of the following happens:
+	//  - ServerStream.SendHeader() is called;
+	//  - The first response is sent out;
+	//  - An RPC status is sent out (error or success).
+	SetHeader(metadata.MD) error
+	// SendHeader sends the header metadata.
+	// The provided md and headers set by SetHeader() will be sent.
+	// It fails if called multiple times.
 	SendHeader(metadata.MD) error
-	// SetTrailer sets the trailer metadata which will be sent with the
-	// RPC status.
+	// SetTrailer sets the trailer metadata which will be sent with the RPC status.
+	// When called more than once, all the provided metadata will be merged.
 	SetTrailer(metadata.MD)
 	Stream
 }
@@ -303,15 +261,28 @@ type serverStream struct {
 	s          *transport.Stream
 	p          *parser
 	codec      Codec
+	cp         Compressor
+	dc         Decompressor
+	cbuf       *bytes.Buffer
+	maxMsgSize int
 	statusCode codes.Code
 	statusDesc string
 	trInfo     *traceInfo
+
+	statsHandler stats.Handler
 
 	mu sync.Mutex // protects trInfo.tr after the service handler runs.
 }
 
 func (ss *serverStream) Context() context.Context {
 	return ss.s.Context()
+}
+
+func (ss *serverStream) SetHeader(md metadata.MD) error {
+	if md.Len() == 0 {
+		return nil
+	}
+	return ss.s.SetHeader(md)
 }
 
 func (ss *serverStream) SendHeader(md metadata.MD) error {
@@ -341,12 +312,28 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 			ss.mu.Unlock()
 		}
 	}()
-	out, err := encode(ss.codec, m, compressionNone)
+	var outPayload *stats.OutPayload
+	if ss.statsHandler != nil {
+		outPayload = &stats.OutPayload{}
+	}
+	out, err := encode(ss.codec, m, ss.cp, ss.cbuf, outPayload)
+	defer func() {
+		if ss.cbuf != nil {
+			ss.cbuf.Reset()
+		}
+	}()
 	if err != nil {
-		err = transport.StreamErrorf(codes.Internal, "grpc: %v", err)
+		err = Errorf(codes.Internal, "grpc: %v", err)
 		return err
 	}
-	return ss.t.Write(ss.s, out, &transport.Options{Last: false})
+	if err := ss.t.Write(ss.s, out, &transport.Options{Last: false}); err != nil {
+		return toRPCErr(err)
+	}
+	if outPayload != nil {
+		outPayload.SentTime = time.Now()
+		ss.statsHandler.HandleRPC(ss.s.Context(), outPayload)
+	}
+	return nil
 }
 
 func (ss *serverStream) RecvMsg(m interface{}) (err error) {
@@ -364,5 +351,21 @@ func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 			ss.mu.Unlock()
 		}
 	}()
-	return recv(ss.p, ss.codec, m)
+	var inPayload *stats.InPayload
+	if ss.statsHandler != nil {
+		inPayload = &stats.InPayload{}
+	}
+	if err := recv(ss.p, ss.codec, ss.s, ss.dc, m, ss.maxMsgSize, inPayload); err != nil {
+		if err == io.EOF {
+			return err
+		}
+		if err == io.ErrUnexpectedEOF {
+			err = Errorf(codes.Internal, io.ErrUnexpectedEOF.Error())
+		}
+		return toRPCErr(err)
+	}
+	if inPayload != nil {
+		ss.statsHandler.HandleRPC(ss.s.Context(), inPayload)
+	}
+	return nil
 }

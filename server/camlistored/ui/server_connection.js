@@ -26,6 +26,9 @@ goog.require('cam.blob');
 goog.require('cam.ServerType');
 goog.require('cam.WorkerMessageRouter');
 
+// TODO(mpl): directly get it from the auth pkg if we use gopherjs.
+var OMIT_AUTH_TOKEN = "OmitAuthToken";
+
 // @fileoverview Connection to the blob server and API for the RPCs it provides. All blob index UI code should use this connection to contact the server.
 // @param {cam.ServerType.DiscoveryDocument} config Discovery document for the current server.
 // @param {Function=} opt_sendXhr Function for sending XHRs for testing.
@@ -74,7 +77,7 @@ cam.ServerConnection.prototype.getPermanodeWithContent = function(contentRef, su
 		}
 		success(result.blobs[0].blob);
 	}
-	this.search(query, null, null, null, callback);
+	this.search(query, null, callback);
 };
 
 // If child is a camliMember of parent success is called with 'true', otherrwise 'false'
@@ -105,7 +108,7 @@ cam.ServerConnection.prototype.isCamliMember = function(child, parent, success) 
 		}
 		success(true);
 	}
-	this.search(query, null, null, null, callback);
+	this.search(query, null, callback);
 };
 
 cam.ServerConnection.prototype.getWorker_ = function() {
@@ -205,9 +208,10 @@ cam.ServerConnection.prototype.permanodeOfSignerAttrValue = function(signer, att
 	);
 };
 
+
 // @param {string|object} query If string, will be sent as 'expression', otherwise will be sent as 'constraint'.
-// @param {?object} opt_describe The describe property to send for the query
-cam.ServerConnection.prototype.buildQuery = function(callerQuery, opt_describe, opt_limit, opt_continuationToken, opt_around) {
+// @param {?object} opts query parameters: describe, sort, limit, around, continuationToken.
+cam.ServerConnection.prototype.buildQuery = function(callerQuery, opts) {
 	var query = {
 		// TODO(mpl): it'd be better to not ask for a sort when none is needed (less work for server),
 		// e.g. for a plain BlobRefPrefix query.
@@ -220,28 +224,34 @@ cam.ServerConnection.prototype.buildQuery = function(callerQuery, opt_describe, 
 		query.constraint = callerQuery;
 	}
 
-	if (opt_describe) {
-		query.describe = opt_describe;
+	if (!opts) {
+		return query;
 	}
-	if (opt_limit) {
-		query.limit = opt_limit;
+	if (opts.sort) {
+		query.sort = opts.sort;
 	}
-	if (opt_around) {
-		query.around = opt_around;
-	} else if (opt_continuationToken) {
-		query.continue = opt_continuationToken;
+	if (opts.describe) {
+		query.describe = opts.describe;
+	}
+	if (opts.limit) {
+		query.limit = opts.limit;
+	}
+	if (opts.around) {
+		query.around = opts.around;
+	} else if (opts.continuationToken) {
+		query.continue = opts.continuationToken;
 	}
 
 	return query;
 }
 
 // @param {string|object} query If string, will be sent as 'expression', otherwise will be sent as 'constraint'.
-// @param {?object} opt_describe The describe property to send for the query
-cam.ServerConnection.prototype.search = function(query, opt_describe, opt_limit, opt_continuationToken, callback) {
+// @param {?object} opts The query parameters: describe, sort, limit, around, continuationToken.
+cam.ServerConnection.prototype.search = function(query, opts, callback) {
 	var path = goog.uri.utils.appendPath(this.config_.searchRoot, 'camli/search/query');
 	this.sendXhr_(path,
 		goog.bind(this.handleXhrResponseJson_, this, {success: callback}),
-		"POST", JSON.stringify(this.buildQuery(query, opt_describe, opt_limit, opt_continuationToken)));
+		"POST", JSON.stringify(this.buildQuery(query, opts)));
 };
 
 // Where is the target accessed via? (paths it's at)
@@ -288,6 +298,12 @@ cam.ServerConnection.prototype.sign_ = function(clearObj, success, opt_fail) {
 		this.failOrLog_(opt_fail, "Missing Camli.config.authToken");
 		return;
 	}
+	if (authToken != OMIT_AUTH_TOKEN) {
+		var header = {"Content-Type": "application/x-www-form-urlencoded",
+			"Authorization": "Token "+authToken};
+	} else {
+		var header = {"Content-Type": "application/x-www-form-urlencoded"};
+	}
 
 	clearObj.camliSigner = sigConf.publicKeyBlobRef;
 	var camVersion = clearObj.camliVersion;
@@ -304,10 +320,7 @@ cam.ServerConnection.prototype.sign_ = function(clearObj, success, opt_fail) {
 			{success: success, fail: opt_fail}),
 		"POST",
 		"json=" + encodeURIComponent(clearText),
-		{"Content-Type": "application/x-www-form-urlencoded",
-			"Authorization": "Token "+authToken},
-		0, // opt_timeoutInterval, default is 0 anyway.
-		true // opt_withCredentials
+		header
 	);
 };
 
@@ -329,16 +342,19 @@ cam.ServerConnection.prototype.verify_ = function(signed, success, opt_fail) {
 		this.failOrLog_(opt_fail, "Missing Camli.config.authToken");
 		return;
 	}
+	if (authToken != OMIT_AUTH_TOKEN) {
+		var header = {"Content-Type": "application/x-www-form-urlencoded",
+			"Authorization": "Token "+authToken};
+	} else {
+		var header = {"Content-Type": "application/x-www-form-urlencoded"};
+	}
 	this.sendXhr_(
 		sigConf.verifyHandler,
 		goog.bind(this.handleXhrResponseText_, this,
 			{success: success, fail: opt_fail}),
 		"POST",
 		"sjson=" + encodeURIComponent(signed),
-		{"Content-Type": "application/x-www-form-urlencoded",
-			"Authorization": "Token "+authToken},
-		0, // opt_timeoutInterval, default is 0 anyway.
-		true // opt_withCredentials
+		header
 	);
 };
 
@@ -373,6 +389,9 @@ cam.ServerConnection.prototype.uploadString_ = function(s, success, opt_fail) {
 		this.failOrLog_(opt_fail, "Missing Camli.config.authToken");
 		return;
 	}
+	if (authToken != OMIT_AUTH_TOKEN) {
+		var header = {"Authorization": "Token "+authToken};
+	}
 	var blobref = cam.blob.refFromString(s);
 	var bb = new Blob([s]);
 	var fd = new FormData();
@@ -396,10 +415,9 @@ cam.ServerConnection.prototype.uploadString_ = function(s, success, opt_fail) {
 		),
 		"POST",
 		fd,
-		{"Authorization": "Token "+authToken},
-		0, // opt_timeoutInterval, default is 0 anyway.
-		true // opt_withCredentials
+		header
 	);
+
 };
 
 // @param {string} blobref Uploaded blobRef.
@@ -569,6 +587,9 @@ cam.ServerConnection.prototype.camliUploadFileHelper_ = function(file, contentsB
 		this.failOrLog_(opt_fail, "Missing Camli.config.authToken");
 		return;
 	}
+	if (authToken != OMIT_AUTH_TOKEN) {
+		var header = {"Authorization": "Token "+authToken};
+	}
 	var doUpload = goog.bind(function() {
 		var fd = new FormData();
 		fd.append("modtime", dateToRfc3339String(file.lastModifiedDate));
@@ -580,9 +601,7 @@ cam.ServerConnection.prototype.camliUploadFileHelper_ = function(file, contentsB
 			),
 			"POST",
 			fd,
-			{"Authorization": "Token "+authToken},
-			0, // opt_timeoutInterval, default is 0 anyway.
-			true // opt_withCredentials
+			header
 		);
 	}, this);
 

@@ -17,16 +17,17 @@ limitations under the License.
 package blobpacked
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -39,15 +40,12 @@ import (
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/test"
-	"camlistore.org/third_party/go/pkg/archive/zip"
 	"golang.org/x/net/context"
 
 	"go4.org/syncutil"
 )
 
 const debug = false
-
-var brokenTests = flag.Bool("broken", false, "also test known-broken tests")
 
 func TestStorage(t *testing.T) {
 	storagetest.Test(t, func(t *testing.T) (sto blobserver.Storage, cleanup func()) {
@@ -140,13 +138,17 @@ func okayWithoutMeta(refStr string) func(*packTest) {
 	}
 }
 
-func randBytes(n int) []byte {
-	r := rand.New(rand.NewSource(42))
+func randBytesSrc(n int, src int64) []byte {
+	r := rand.New(rand.NewSource(src))
 	s := make([]byte, n)
 	for i := range s {
 		s[i] = byte(r.Int63())
 	}
 	return s
+}
+
+func randBytes(n int) []byte {
+	return randBytesSrc(n, 42)
 }
 
 func TestPackNormal(t *testing.T) {
@@ -206,13 +208,8 @@ func TestPackLarge(t *testing.T) {
 		wantNumSmallBlobs(0),
 	)
 
-	// Verify we wrote the correct "w:*" meta rows.
+	// Gather the "w:*" meta rows we wrote.
 	got := map[string]string{}
-	want := map[string]string{
-		"w:" + wholeRef.String():        "17825792 2",
-		"w:" + wholeRef.String() + ":0": "sha1-9b4a3d114c059988075c87293c86ee7cbc6f4af5 37 0 16709479",
-		"w:" + wholeRef.String() + ":1": "sha1-fe6326ac6b389ffe302623e4a501bfc8c6272e8e 37 16709479 1116313",
-	}
 	if err := sorted.Foreach(pt.sto.meta, func(key, value string) error {
 		if strings.HasPrefix(key, "b:") {
 			return nil
@@ -222,12 +219,174 @@ func TestPackLarge(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("'w:*' meta rows = %v; want %v", got, want)
+
+	// Verify the two zips are correctly described.
+
+	// There should be one row to say that we have two zip, and
+	// that the overall file is 17MB:
+	keyBase := "w:" + wholeRef.String()
+	if g, w := got[keyBase], "17825792 2"; g != w {
+		t.Fatalf("meta row for key %q = %q; want %q", keyBase, g, w)
+	}
+
+	// ... (and a little helper) ...
+	parseMeta := func(n int) (zipOff, dataOff, dataLen int64) {
+		key := keyBase + ":" + strconv.Itoa(n)
+		v := got[key]
+		f := strings.Fields(v)
+		if len(f) != 4 {
+			t.Fatalf("meta for key %q = %q; expected 4 space-separated fields", key, v)
+		}
+		i64 := func(n int) int64 {
+			i, err := strconv.ParseInt(f[n], 10, 64)
+			if err != nil {
+				t.Fatalf("error parsing int64 %q in field index %d of meta key %q (value %q): %v", f[n], n, key, v, err)
+			}
+			return i
+		}
+		zipOff, dataOff, dataLen = i64(1), i64(2), i64(3)
+		return
+	}
+
+	// And then verify if we have the two "w:<wholeref>:0" and
+	// "w:<wholeref>:1" rows and that they're consistent.
+	z0, d0, l0 := parseMeta(0)
+	z1, d1, l1 := parseMeta(1)
+	if z0 != z1 {
+		t.Errorf("expected zip offset in zip0 and zip1 to match. got %d and %d", z0, z0)
+	}
+	if d0 != 0 {
+		t.Errorf("zip0's data offset = %d; want 0", d0)
+	}
+	if d1 != l0 {
+		t.Errorf("zip1 data offset %d != zip0 data length %d", d1, l0)
+	}
+	if d1+l1 != fileSize {
+		t.Errorf("zip1's offset %d + length %d = %d; want %d (fileSize)", d1, l1, d1+l1, fileSize)
 	}
 
 	// And verify we can read it back out.
 	pt.testOpenWholeRef(t, wholeRef, fileSize)
+}
+
+func countSortedRows(t *testing.T, meta sorted.KeyValue) int {
+	rows := 0
+	if err := sorted.Foreach(meta, func(key, value string) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func TestReindex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	type file struct {
+		size     int64
+		name     string
+		contents []byte
+	}
+	files := []file{
+		{17 << 20, "foo.dat", randBytesSrc(17<<20, 42)},
+		{10 << 20, "bar.dat", randBytesSrc(10<<20, 43)},
+		{5 << 20, "baz.dat", randBytesSrc(5<<20, 44)},
+	}
+
+	pt := testPack(t,
+		func(sto blobserver.Storage) error {
+			for _, f := range files {
+				if _, err := schema.WriteFileFromReader(sto, f.name, bytes.NewReader(f.contents)); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		wantNumLargeBlobs(4),
+		wantNumSmallBlobs(0),
+	)
+
+	// backup the meta that is supposed to be lost/erased.
+	// pt.sto.reindex allocates a new pt.sto.meta, so meta != pt.sto.meta after it is called.
+	meta := pt.sto.meta
+
+	// and build new meta index
+	if err := pt.sto.reindex(context.TODO(), func() (sorted.KeyValue, error) {
+		return sorted.NewMemoryKeyValue(), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	validBlobKey := func(key, value string) error {
+		if !strings.HasPrefix(key, "b:") {
+			return errors.New("not a blob meta key")
+		}
+		wantRef, ok := blob.Parse(key[2:])
+		if !ok {
+			return errors.New("bogus blobref in key")
+		}
+		m, err := parseMetaRow([]byte(value))
+		if err != nil {
+			return err
+		}
+		rc, err := pt.large.SubFetch(m.largeRef, int64(m.largeOff), int64(m.size))
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		h := wantRef.Hash()
+		n, err := io.Copy(h, rc)
+		if err != nil {
+			return err
+		}
+
+		if !wantRef.HashMatches(h) {
+			return errors.New("content doesn't match")
+		}
+		if n != int64(m.size) {
+			return errors.New("size doesn't match")
+		}
+		return nil
+	}
+
+	// check that new meta is identical to "lost" one
+	newRows := 0
+	if err := sorted.Foreach(pt.sto.meta, func(key, newValue string) error {
+		oldValue, err := meta.Get(key)
+		if err != nil {
+			t.Fatalf("Could not get value for %v in old meta: %v", key, err)
+		}
+		newRows++
+		// Exact match is fine.
+		if oldValue == newValue {
+			return nil
+		}
+		// If it differs, it should at least be correct. (blob metadata
+		// can now point to different packed zips, depending on sorting)
+		err = validBlobKey(key, newValue)
+		if err == nil {
+			return nil
+		}
+		t.Errorf("Reindexing error: for key %v: %v\n got: %q\nwant: %q", key, err, newValue, oldValue)
+		return nil // keep enumerating, regardless of errors
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// make sure they have the same number of entries too, to be sure that the reindexing
+	// did not miss entries that the old meta had.
+	oldRows := countSortedRows(t, meta)
+	if oldRows != newRows {
+		t.Fatalf("index number of entries mismatch: got %d entries in new index, wanted %d (as in index before reindexing)", newRows, oldRows)
+	}
+
+	// And verify we can read one of the files back out.
+	hash := blob.NewHash()
+	hash.Write(files[0].contents)
+	pt.testOpenWholeRef(t, blob.RefFromHash(hash), files[0].size)
 }
 
 func (pt *packTest) testOpenWholeRef(t *testing.T, wholeRef blob.Ref, wantSize int64) {

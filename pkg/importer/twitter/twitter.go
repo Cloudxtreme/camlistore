@@ -15,17 +15,20 @@ limitations under the License.
 */
 
 // Package twitter implements a twitter.com importer.
-package twitter
+package twitter // import "camlistore.org/pkg/importer/twitter"
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -40,7 +43,7 @@ import (
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/schema/nodeattr"
 
-	"camlistore.org/third_party/github.com/garyburd/go-oauth/oauth"
+	"github.com/garyburd/go-oauth/oauth"
 
 	"go4.org/ctxutil"
 	"go4.org/syncutil"
@@ -60,7 +63,7 @@ const (
 	// complete run.  Otherwise, if the importer runs to
 	// completion, this version number is recorded on the account
 	// permanode and subsequent importers can stop early.
-	runCompleteVersion = "4"
+	runCompleteVersion = "5"
 
 	// acctAttrTweetZip specifies an optional attribte for the account permanode.
 	// If set, it should be of a "file" schema blob referencing the tweets.zip
@@ -240,6 +243,64 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 	return nil
 }
 
+var _ importer.LongPoller = (*imp)(nil)
+
+func (im *imp) LongPoll(rctx *importer.RunContext) error {
+	clientId, secret, err := rctx.Credentials()
+	if err != nil {
+		return err
+	}
+
+	acctNode := rctx.AccountNode()
+	accessToken := acctNode.Attr(importer.AcctAttrAccessToken)
+	accessSecret := acctNode.Attr(importer.AcctAttrAccessTokenSecret)
+	if accessToken == "" || accessSecret == "" {
+		return errors.New("access credentials not found")
+	}
+	oauthClient := &oauth.Client{
+		TemporaryCredentialRequestURI: temporaryCredentialRequestURL,
+		ResourceOwnerAuthorizationURI: resourceOwnerAuthorizationURL,
+		TokenRequestURI:               tokenRequestURL,
+		Credentials: oauth.Credentials{
+			Token:  clientId,
+			Secret: secret,
+		},
+	}
+	accessCreds := &oauth.Credentials{
+		Token:  accessToken,
+		Secret: accessSecret,
+	}
+
+	form := url.Values{"with": {"user"}}
+	req, _ := http.NewRequest("GET", "https://userstream.twitter.com/1.1/user.json", nil)
+	req.Header.Set("Authorization", oauthClient.AuthorizationHeader(accessCreds, "GET", req.URL, form))
+	req.URL.RawQuery = form.Encode()
+	req.Cancel = rctx.Context().Done()
+
+	log.Printf("Beginning twitter long poll...")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return errors.New(res.Status)
+	}
+	bs := bufio.NewScanner(res.Body)
+	for bs.Scan() {
+		line := strings.TrimSpace(bs.Text())
+		if line == "" || strings.HasPrefix(line, `{"friends`) {
+			continue
+		}
+		log.Printf("Twitter long poll saw a tweet: %s", line)
+		return nil
+	}
+	if err := bs.Err(); err != nil {
+		return err
+	}
+	return errors.New("got EOF without a tweet.")
+}
+
 func (r *run) errorf(format string, args ...interface{}) {
 	log.Printf(format, args...)
 	r.mu.Lock()
@@ -249,7 +310,7 @@ func (r *run) errorf(format string, args ...interface{}) {
 
 func (r *run) doAPI(result interface{}, apiPath string, keyval ...string) error {
 	return importer.OAuthContext{
-		r.Context,
+		r.Context(),
 		r.oauthClient,
 		r.accessCreds}.PopulateJSONFromURL(result, apiURL+apiPath, keyval...)
 }
@@ -274,9 +335,9 @@ func (r *run) importTweets(userID string) error {
 	}
 	for continueRequests {
 		select {
-		case <-r.Done():
+		case <-r.Context().Done():
 			r.errorf("Twitter importer: interrupted")
-			return r.Err()
+			return r.Context().Err()
 		default:
 		}
 
@@ -417,9 +478,9 @@ func timeParseFirstFormat(timeStr string, format ...string) (t time.Time, err er
 // viaAPI is true if it came via the REST API, or false if it came via a zip file.
 func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool) (dup bool, err error) {
 	select {
-	case <-r.Done():
+	case <-r.Context().Done():
 		r.errorf("Twitter importer: interrupted")
-		return false, r.Err()
+		return false, r.Context().Err()
 	default:
 	}
 	id := tweet.ID()
@@ -476,7 +537,7 @@ func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool)
 		tried, gotMedia := 0, false
 		for _, mediaURL := range m.URLs() {
 			tried++
-			res, err := ctxutil.Client(r).Get(mediaURL)
+			res, err := ctxutil.Client(r.Context()).Get(mediaURL)
 			if err != nil {
 				return false, fmt.Errorf("Error fetching %s for tweet %s : %v", mediaURL, url, err)
 			}
@@ -696,8 +757,8 @@ func (t *zipTweetItem) ID() string {
 func (t *apiTweetItem) CreatedAt() string { return t.CreatedAtStr }
 func (t *zipTweetItem) CreatedAt() string { return t.CreatedAtStr }
 
-func (t *apiTweetItem) Text() string { return t.TextStr }
-func (t *zipTweetItem) Text() string { return t.TextStr }
+func (t *apiTweetItem) Text() string { return html.UnescapeString(t.TextStr) }
+func (t *zipTweetItem) Text() string { return html.UnescapeString(t.TextStr) }
 
 func (t *apiTweetItem) LatLong() (lat, long float64, ok bool) {
 	return latLong(t.Geo, t.Coordinates)
@@ -769,10 +830,7 @@ type urlEntity struct {
 	DisplayURL  string `json:"display_url"`
 }
 
-var (
-	twitpicRx = regexp.MustCompile(`\btwitpic\.com/(\w\w\w+)`)
-	imgurRx   = regexp.MustCompile(`\bimgur\.com/(\w\w\w+)`)
-)
+var imgurRx = regexp.MustCompile(`\bimgur\.com/(\w\w\w+)`)
 
 func getImagesFromURLs(urls []*urlEntity) (ret []tweetMedia) {
 	// TODO: extract these regexps from tweet text too. Happens in

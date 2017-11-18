@@ -24,7 +24,8 @@ import (
 	"camlistore.org/pkg/env"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/types/serverconfig"
-	"google.golang.org/cloud/compute/metadata"
+
+	"cloud.google.com/go/compute/metadata"
 )
 
 // DefaultEnvConfig returns the default configuration when running on a known
@@ -57,26 +58,28 @@ func DefaultEnvConfig() (*Config, error) {
 		return nil, err
 	}
 
-	ipOrHost, _ := metadata.ExternalIP()
-	host, _ := metadata.InstanceAttributeValue("camlistore-hostname")
-	if host != "" && host != "localhost" {
-		ipOrHost = host
-	}
-
 	highConf := &serverconfig.Config{
 		Auth:               auth,
-		BaseURL:            fmt.Sprintf("https://%s", ipOrHost),
 		HTTPS:              true,
-		Listen:             "0.0.0.0:443",
 		Identity:           keyId,
 		IdentitySecretRing: secRing,
 		GoogleCloudStorage: ":" + strings.TrimPrefix(blobBucket, "gs://"),
 		DBNames:            map[string]string{},
 		PackRelated:        true,
+		ShareHandler:       true,
+	}
 
-		// SourceRoot is where we look for the UI js/css/html files, and the Closure resources.
-		// Must be in sync with misc/docker/server/Dockerfile.
-		SourceRoot: "/camlistore",
+	externalIP, _ := metadata.ExternalIP()
+	hostName, _ := metadata.InstanceAttributeValue("camlistore-hostname")
+	// If they specified a hostname (probably with camdeploy), then:
+	// if it looks like an FQDN, camlistored is going to rely on Let's
+	// Encrypt, else camlistored is going to generate some self-signed for that
+	// hostname.
+	if hostName != "" {
+		highConf.BaseURL = fmt.Sprintf("https://%s", hostName)
+		highConf.Listen = "0.0.0.0:443"
+	} else {
+		highConf.CamliNetIP = externalIP
 	}
 
 	// Detect a linked Docker MySQL container. It must have alias "mysqldb".

@@ -17,7 +17,7 @@ limitations under the License.
 // Package dir implements the blobserver Storage interface for a directory,
 // detecting whether the directory is file-per-blob (localdisk) or diskpacked.
 // If neither, it initializes diskpacked.
-package dir
+package dir // import "camlistore.org/pkg/blobserver/dir"
 
 import (
 	"camlistore.org/pkg/blobserver"
@@ -26,7 +26,7 @@ import (
 )
 
 // New returns a new blobserver Storage implementation, storing blobs in the provided dir.
-// If dir has an index.kv file, a diskpacked implementation is returnd.
+// If dir has an index.kv file, a diskpacked implementation is returned.
 func New(dir string) (blobserver.Storage, error) {
 	if v, err := diskpacked.IsDir(dir); err != nil {
 		return nil, err

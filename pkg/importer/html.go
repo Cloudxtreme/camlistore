@@ -124,12 +124,15 @@ var tmpl = template.Must(template.New("root").Funcs(map[string]interface{}{
 </ul>
 
 {{if .Importer.ShowClientAuthEditForm}}
+	{{if .Importer.InsecureForm}}
+	<h1 style="color:red;">This page is not served securely (no https). Proceed at your own risk.</h1>
+	{{end}}
     <h1>Client ID &amp; Client Secret</h1>
     <form method='post'>
       <input type='hidden' name="mode" value="saveclientidsecret">
       <table border=0 cellpadding=3>
       <tr><td align=right>Client ID</td><td><input name="clientID" size=50 value="{{.Importer.ClientID}}"></td></tr>
-      <tr><td align=right>Client Secret</td><td><input name="clientSecret" size=50 value="{{.Importer.ClientSecret}}"></td></tr>
+      <tr><td align=right>Client Secret</td><td><input name="clientSecret" type=password size=50 value="{{.Importer.ClientSecret}}"></td></tr>
       <tr><td align=right></td><td><input type='submit' value="Save"></td></tr>
       </table>
     </form>

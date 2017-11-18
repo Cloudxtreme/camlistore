@@ -19,7 +19,7 @@ limitations under the License.
 // Among other things, it can throttle its connections, inherit its
 // listening socket from a file descriptor in the environment, and
 // log all activity.
-package webserver
+package webserver // import "camlistore.org/pkg/webserver"
 
 import (
 	"bufio"
@@ -36,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/third_party/github.com/bradfitz/runsit/listen"
+	"github.com/bradfitz/runsit/listen"
 
 	"go4.org/net/throttle"
 	"go4.org/wkfs"
@@ -53,8 +53,12 @@ type Server struct {
 	// H2Server is the HTTP/2 server config.
 	H2Server http2.Server
 
-	enableTLS               bool
+	// enableTLS sets the Server up for listening to HTTPS connections.
+	enableTLS bool
+	// tlsCertFile (tlsKeyFile) is the path to the HTTPS certificate (key) file.
 	tlsCertFile, tlsKeyFile string
+	// certManager is set as GetCertificate in the tls.Config of the listener. But tlsCertFile takes precedence.
+	certManager func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	mu   sync.Mutex
 	reqs int64
@@ -84,10 +88,21 @@ func (s *Server) fatalf(format string, v ...interface{}) {
 	log.Fatalf(format, v...)
 }
 
-func (s *Server) SetTLS(certFile, keyFile string) {
+// TLSSetup specifies how the server gets its TLS certificate.
+type TLSSetup struct {
+	// Certfile is the path to the TLS certificate file. It takes precedence over CertManager.
+	CertFile string
+	// KeyFile is the path to the TLS key file.
+	KeyFile string
+	// CertManager is the tls.GetCertificate of the tls Config. But CertFile takes precedence.
+	CertManager func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error)
+}
+
+func (s *Server) SetTLS(setup TLSSetup) {
 	s.enableTLS = true
-	s.tlsCertFile = certFile
-	s.tlsKeyFile = keyFile
+	s.certManager = setup.CertManager
+	s.tlsCertFile = setup.CertFile
+	s.tlsKeyFile = setup.KeyFile
 }
 
 func (s *Server) ListenURL() string {
@@ -171,19 +186,31 @@ func (s *Server) Listen(addr string) error {
 		s.printf("Starting to listen on %s\n", base)
 	}
 
-	if s.enableTLS {
+	doEnableTLS := func() error {
 		config := &tls.Config{
 			Rand:       rand.Reader,
 			Time:       time.Now,
 			NextProtos: []string{http2.NextProtoTLS, "http/1.1"},
+			MinVersion: tls.VersionTLS12,
 		}
-		config.Certificates = make([]tls.Certificate, 1)
+		if s.tlsCertFile == "" && s.certManager != nil {
+			config.GetCertificate = s.certManager
+			s.listener = tls.NewListener(s.listener, config)
+			return nil
+		}
 
+		config.Certificates = make([]tls.Certificate, 1)
 		config.Certificates[0], err = loadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
 		if err != nil {
 			return fmt.Errorf("Failed to load TLS cert: %v", err)
 		}
 		s.listener = tls.NewListener(s.listener, config)
+		return nil
+	}
+	if s.enableTLS {
+		if err := doEnableTLS(); err != nil {
+			return err
+		}
 	}
 
 	if doLog && strings.HasSuffix(base, ":0") {

@@ -35,7 +35,7 @@ import (
 	_ "camlistore.org/pkg/sorted/sqlite"
 	"go4.org/jsonconfig"
 
-	_ "camlistore.org/third_party/github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
@@ -165,7 +165,7 @@ func TestFDLeak(t *testing.T) {
 	defer clean()
 
 	bm := s.BeginBatch()
-	const numRows = 150 // 3x the batchSize of 50 in sqlindex.go; to gaurantee we do multiple batches
+	const numRows = 150 // 3x the batchSize of 50 in sqlindex.go; to guarantee we do multiple batches
 	for i := 0; i < numRows; i++ {
 		bm.Set(fmt.Sprintf("key:%05d", i), fmt.Sprint(i))
 	}

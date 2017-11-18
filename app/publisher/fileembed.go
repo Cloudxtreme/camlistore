@@ -19,9 +19,9 @@ The publisher application serves and renders items published by Camlistore.
 That is, items that are children, through a (direct or not) camliPath relation,
 of a camliRoot node (a permanode with a camliRoot attribute set).
 
-#fileembed pattern .+\.(js|css|html|png|svg)$
+#fileembed pattern .+\.(js|css|html|png|svg|js.map)$
 */
-package main
+package main // import "camlistore.org/app/publisher"
 
 import (
 	"camlistore.org/pkg/fileembed"

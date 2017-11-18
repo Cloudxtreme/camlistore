@@ -22,24 +22,29 @@ import (
 	"log"
 	"os"
 
-	"camlistore.org/third_party/bazil.org/fuse"
-	fusefs "camlistore.org/third_party/bazil.org/fuse/fs"
+	"bazil.org/fuse"
+	fusefs "bazil.org/fuse/fs"
+	"golang.org/x/net/context"
 )
 
 type atDir struct {
-	noXattr
 	fs *CamliFileSystem
 }
 
-func (n *atDir) Attr() fuse.Attr {
-	return fuse.Attr{
-		Mode: os.ModeDir | 0500,
-		Uid:  uint32(os.Getuid()),
-		Gid:  uint32(os.Getgid()),
-	}
+var (
+	_ fusefs.Node               = (*atDir)(nil)
+	_ fusefs.HandleReadDirAller = (*atDir)(nil)
+	_ fusefs.NodeStringLookuper = (*atDir)(nil)
+)
+
+func (n *atDir) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = os.ModeDir | 0500
+	a.Uid = uint32(os.Getuid())
+	a.Gid = uint32(os.Getgid())
+	return nil
 }
 
-func (n *atDir) ReadDir(intr fusefs.Intr) ([]fuse.Dirent, fuse.Error) {
+func (n *atDir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	return []fuse.Dirent{
 		{Name: "README.txt"},
 	}, nil
@@ -82,7 +87,7 @@ With Second Granularity
 * 2012-08-28T21:24:35Z - RFC3339
 * 2012-08-28T21:24:35-08:00 - RFC3339 with numeric timezone
 * Tue, 28 Aug 2012 21:24:35 +0000 - RFC1123 + numeric timezone
-* Tue, 28 Aug 2012 21:24:35 UTC RFC1123
+* Tue, 28 Aug 2012 21:24:35 UTC - RFC1123
 * Tue Aug 28 21:24:35 UTC 2012 - Unix date
 * Tue Aug 28 21:24:35 2012 - ansi C timestamp
 * Tue Aug 28 21:24:35 +0000 2012 - ruby datestamp
@@ -96,7 +101,7 @@ With More Coarse Granularities
 * 2012             (This will be considered the same as 2012-01-01T00:00:00Z)
 `
 
-func (n *atDir) Lookup(name string, intr fusefs.Intr) (fusefs.Node, fuse.Error) {
+func (n *atDir) Lookup(ctx context.Context, name string) (fusefs.Node, error) {
 	log.Printf("fs.atDir: Lookup(%q)", name)
 
 	if name == "README.txt" {

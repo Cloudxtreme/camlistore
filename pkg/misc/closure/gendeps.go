@@ -70,6 +70,10 @@ func GenDepsWithPath(pathPrefix string, root http.FileSystem) ([]byte, error) {
 			// Emacs noise.
 			continue
 		}
+		if strings.HasPrefix(name, "goui.js") {
+			// because it is too large for bufio.Scanner
+			continue
+		}
 		f, err := root.Open(name)
 		if err != nil {
 			return nil, fmt.Errorf("Could not open %v: %v", name, err)
@@ -150,7 +154,7 @@ func (s jsList) String() string {
 // the provider: m[1] == "asserts/asserts.js"
 // the provided namespaces: m[2] == "'goog.asserts', 'goog.asserts.AssertionError'"
 // the required namespaces: m[5] == "'goog.debug.Error', 'goog.string'"
-var depsRx = regexp.MustCompile(`^goog.addDependency\(['"]([^/]+[a-zA-Z0-9\-\_/\.]*\.js)['"], \[((['"][\w\.]+['"])+(, ['"][\w\.]+['"])*)\], \[((['"][\w\.]+['"])+(, ['"][\w\.]+['"])*)?\]\);`)
+var depsRx = regexp.MustCompile(`^goog.addDependency\(['"]([^/]+[a-zA-Z0-9\-\_/\.]*\.js)['"], \[((['"][\w\.]+['"])+(, ['"][\w\.]+['"])*)\], \[((['"][\w\.]+['"])+(, ['"][\w\.]+['"])*)?\](, {((['"][\w]+['"]: ['"][\w]+['"])+(, ['"][\w]+['"]: ['"][\w]+['"])*)?})?\);`)
 
 // ParseDeps reads closure namespace dependency lines and
 // returns a map giving the js file provider for each namespace,

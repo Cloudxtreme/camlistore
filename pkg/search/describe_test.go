@@ -17,12 +17,17 @@ limitations under the License.
 package search_test
 
 import (
+	"fmt"
 	"testing"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/index"
+	"camlistore.org/pkg/index/indextest"
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/test"
+	"camlistore.org/pkg/types/camtypes"
+
+	"golang.org/x/net/context"
 )
 
 func addPermanode(fi *test.FakeIndex, pnStr string, attrs ...string) {
@@ -33,6 +38,12 @@ func addPermanode(fi *test.FakeIndex, pnStr string, attrs ...string) {
 		attrs = attrs[2:]
 		fi.AddClaim(owner, pn, "add-attribute", k, v)
 	}
+}
+
+func addFileWithLocation(fi *test.FakeIndex, fileStr string, lat, long float64) {
+	fileRef := blob.MustParse(fileStr)
+	fi.AddFileLocation(fileRef, camtypes.Location{Latitude: lat, Longitude: long})
+	fi.AddMeta(fileRef, "file", 123)
 }
 
 func searchDescribeSetup(fi *test.FakeIndex) index.Interface {
@@ -64,6 +75,8 @@ func searchDescribeSetup(fi *test.FakeIndex) index.Interface {
 	addPermanode(fi, "fourvenue-123",
 		"camliNodeType", "foursquare.com:venue",
 		"camliPath:photos", "venuepicset-123",
+		"latitude", "12",
+		"longitude", "34",
 	)
 	addPermanode(fi, "venuepicset-123",
 		"camliPath:1.jpg", "venuepic-1",
@@ -94,6 +107,38 @@ func searchDescribeSetup(fi *test.FakeIndex) index.Interface {
 	addPermanode(fi, "set-0",
 		"camliMember", "venuepic-1",
 		"camliMember", "venuepic-2",
+	)
+
+	addFileWithLocation(fi, "filewithloc-0", 45, 56)
+	addPermanode(fi, "location-0",
+		"camliContent", "filewithloc-0",
+	)
+
+	addPermanode(fi, "locationpriority-1",
+		"latitude", "67",
+		"longitude", "78",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", "fourvenue-123",
+		"camliContent", "filewithloc-0",
+	)
+
+	addPermanode(fi, "locationpriority-2",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", "fourvenue-123",
+		"camliContent", "filewithloc-0",
+	)
+
+	addPermanode(fi, "locationoverride-1",
+		"latitude", "67",
+		"longitude", "78",
+		"camliContent", "filewithloc-0",
+	)
+
+	addPermanode(fi, "locationoverride-2",
+		"latitude", "67",
+		"longitude", "78",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", "fourvenue-123",
 	)
 
 	return fi
@@ -249,5 +294,148 @@ func TestSearchDescribe(t *testing.T) {
 			ht.query = "describe"
 		}
 		ht.test(t)
+	}
+}
+
+// should be run with -race
+func TestDescribeRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	idx := index.NewMemoryIndex()
+	idxd := indextest.NewIndexDeps(idx)
+	idxd.Fataler = t
+	corpus, err := idxd.Index.KeepInMemory()
+	if err != nil {
+		t.Fatalf("error slurping index to memory: %v", err)
+	}
+	h := search.NewHandler(idx, idxd.SignerBlobRef)
+	h.SetCorpus(corpus)
+	donec := make(chan struct{})
+	headstart := 500
+	blobrefs := make([]blob.Ref, headstart)
+	headstartc := make(chan struct{})
+	go func() {
+		for i := 0; i < headstart*2; i++ {
+			nth := fmt.Sprintf("%d", i)
+			// No need to lock the index here. It is already done within NewPlannedPermanode,
+			// because it calls idxd.Index.ReceiveBlob.
+			pn := idxd.NewPlannedPermanode(nth)
+			idxd.SetAttribute(pn, "tag", nth)
+			if i > headstart {
+				continue
+			}
+			if i == headstart {
+				headstartc <- struct{}{}
+				continue
+			}
+			blobrefs[i] = pn
+		}
+	}()
+	<-headstartc
+	ctx := context.Background()
+	go func() {
+		for i := 0; i < headstart; i++ {
+			br := blobrefs[i]
+			res, err := h.Describe(ctx, &search.DescribeRequest{
+				BlobRef: br,
+				Depth:   1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, ok := res.Meta[br.String()]
+			if !ok {
+				t.Errorf("permanode %v wasn't in Describe response", br)
+			}
+		}
+		donec <- struct{}{}
+	}()
+	<-donec
+}
+
+func TestDescribeLocation(t *testing.T) {
+	tests := []struct {
+		ref       string
+		lat, long float64
+		hasNoLoc  bool
+	}{
+		{ref: "filewithloc-0", lat: 45, long: 56},
+		{ref: "location-0", lat: 45, long: 56},
+		{ref: "locationpriority-1", lat: 67, long: 78},
+		{ref: "locationpriority-2", lat: 12, long: 34},
+		{ref: "locationoverride-1", lat: 67, long: 78},
+		{ref: "locationoverride-2", lat: 67, long: 78},
+		{ref: "homedir-0", hasNoLoc: true},
+	}
+
+	ix := searchDescribeSetup(test.NewFakeIndex())
+	ctx := context.Background()
+	h := search.NewHandler(ix, owner)
+
+	ix.RLock()
+	defer ix.RUnlock()
+
+	for _, tt := range tests {
+		var err error
+		br := blob.MustParse(tt.ref)
+		res, err := h.Describe(ctx, &search.DescribeRequest{
+			BlobRef: br,
+			Depth:   1,
+		})
+		if err != nil {
+			t.Errorf("Describe for %v failed: %v", br, err)
+			continue
+		}
+		db := res.Meta[br.String()]
+		if db == nil {
+			t.Errorf("Describe result for %v is missing", br)
+			continue
+		}
+		loc := db.Location
+		if tt.hasNoLoc {
+			if loc != nil {
+				t.Errorf("got location for %v, should have no location", br)
+			}
+		} else {
+			if loc == nil {
+				t.Errorf("no location in result for %v", br)
+				continue
+			}
+			if loc.Latitude != tt.lat || loc.Longitude != tt.long {
+				t.Errorf("location for %v invalid, got %f,%f want %f,%f",
+					tt.ref, loc.Latitude, loc.Longitude, tt.lat, tt.long)
+			}
+		}
+	}
+}
+
+// To make sure we don't regress into issue 881: i.e. a permanode with no attr
+// should not lead us to call index.claimsIntfAttrValue with a nil claims argument.
+func TestDescribePermNoAttr(t *testing.T) {
+	ix := index.NewMemoryIndex()
+	ctx := context.Background()
+	h := search.NewHandler(ix, owner)
+	corpus, err := ix.KeepInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetCorpus(corpus)
+	id := indextest.NewIndexDeps(ix)
+	br := id.NewPlannedPermanode("noattr-0")
+
+	ix.RLock()
+	defer ix.RUnlock()
+
+	res, err := h.Describe(ctx, &search.DescribeRequest{
+		BlobRef: br,
+		Depth:   1,
+	})
+	if err != nil {
+		t.Fatalf("Describe for %v failed: %v", br, err)
+	}
+	db := res.Meta[br.String()]
+	if db == nil {
+		t.Fatalf("Describe result for %v is missing", br)
 	}
 }

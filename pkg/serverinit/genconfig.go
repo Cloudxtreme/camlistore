@@ -25,7 +25,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -45,6 +44,7 @@ var (
 )
 
 type tlsOpts struct {
+	autoCert  bool // use Camlistore's Let's Encrypt cache. but httpsCert takes precedence, if set.
 	httpsCert string
 	httpsKey  string
 }
@@ -102,13 +102,12 @@ func (b *lowBuilder) dbName(of string) string {
 		}
 		username := osutil.Username()
 		if username == "" {
-			envVar := "USER"
-			if runtime.GOOS == "windows" {
-				envVar += "NAME"
-			}
 			return "camlistore_index"
 		}
 		return "camli" + username
+	}
+	if of == "blobpacked_index" {
+		return of
 	}
 	return ""
 }
@@ -131,20 +130,44 @@ func (b *lowBuilder) searchOwner() (br blob.Ref, err error) {
 	return blob.SHA1FromString(armoredPublicKey), nil
 }
 
+func addAppConfig(config map[string]interface{}, appConfig *serverconfig.App, low jsonconfig.Obj) {
+	if appConfig.Listen != "" {
+		config["listen"] = appConfig.Listen
+	}
+	if appConfig.APIHost != "" {
+		config["apiHost"] = appConfig.APIHost
+	}
+	if appConfig.BackendURL != "" {
+		config["backendURL"] = appConfig.BackendURL
+	}
+	if low["listen"] != nil && low["listen"].(string) != "" {
+		config["serverListen"] = low["listen"].(string)
+	}
+	if low["baseURL"] != nil && low["baseURL"].(string) != "" {
+		config["serverBaseURL"] = low["baseURL"].(string)
+	}
+}
+
 func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 	published := b.high.Publish
 	for k, v := range published {
+		// trick in case all of the fields of v.App were omitted, which would leave v.App nil.
+		if v.App == nil {
+			v.App = &serverconfig.App{}
+		}
 		if v.CamliRoot == "" {
 			return fmt.Errorf("Missing \"camliRoot\" key in configuration for %s.", k)
 		}
 		if v.GoTemplate == "" {
 			return fmt.Errorf("Missing \"goTemplate\" key in configuration for %s.", k)
 		}
-
 		appConfig := map[string]interface{}{
 			"camliRoot":  v.CamliRoot,
 			"cacheRoot":  v.CacheRoot,
 			"goTemplate": v.GoTemplate,
+		}
+		if v.SourceRoot != "" {
+			appConfig["sourceRoot"] = v.SourceRoot
 		}
 		if v.HTTPSCert != "" && v.HTTPSKey != "" {
 			// user can specify these directly in the publish section
@@ -153,25 +176,94 @@ func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 		} else {
 			// default to Camlistore parameters, if any
 			if tlsO != nil {
-				appConfig["httpsCert"] = tlsO.httpsCert
-				appConfig["httpsKey"] = tlsO.httpsKey
+				if tlsO.autoCert {
+					appConfig["certManager"] = tlsO.autoCert
+				}
+				if tlsO.httpsCert != "" {
+					appConfig["httpsCert"] = tlsO.httpsCert
+				}
+				if tlsO.httpsKey != "" {
+					appConfig["httpsKey"] = tlsO.httpsKey
+				}
 			}
-		}
-		a := args{
-			"program":   v.Program,
-			"appConfig": appConfig,
-		}
-		if v.BaseURL != "" {
-			a["baseURL"] = v.BaseURL
 		}
 		program := "publisher"
 		if v.Program != "" {
 			program = v.Program
 		}
-		a["program"] = program
+		a := args{
+			"prefix":    k,
+			"program":   program,
+			"appConfig": appConfig,
+		}
+		addAppConfig(a, v.App, b.low)
 		b.addPrefix(k, "app", a)
 	}
 	return nil
+}
+
+func (b *lowBuilder) addScanCabConfig(tlsO *tlsOpts) error {
+	if b.high.ScanCab == nil {
+		return nil
+	}
+	scancab := b.high.ScanCab
+	if scancab.App == nil {
+		scancab.App = &serverconfig.App{}
+	}
+	if scancab.Prefix == "" {
+		return errors.New("Missing \"prefix\" key in configuration for scanning cabinet.")
+	}
+
+	program := "scanningcabinet"
+	if scancab.Program != "" {
+		program = scancab.Program
+	}
+
+	auth := scancab.Auth
+	if auth == "" {
+		auth = b.high.Auth
+	}
+	appConfig := map[string]interface{}{
+		"auth": auth,
+	}
+	if scancab.HTTPSCert != "" && scancab.HTTPSKey != "" {
+		appConfig["httpsCert"] = scancab.HTTPSCert
+		appConfig["httpsKey"] = scancab.HTTPSKey
+	} else {
+		// default to Camlistore parameters, if any
+		if tlsO != nil {
+			appConfig["httpsCert"] = tlsO.httpsCert
+			appConfig["httpsKey"] = tlsO.httpsKey
+		}
+	}
+	a := args{
+		"prefix":    scancab.Prefix,
+		"program":   program,
+		"appConfig": appConfig,
+	}
+	addAppConfig(a, scancab.App, b.low)
+	b.addPrefix(scancab.Prefix, "app", a)
+	return nil
+}
+
+func (b *lowBuilder) sortedName() string {
+	switch {
+	case b.high.MySQL != "":
+		return "MySQL"
+	case b.high.PostgreSQL != "":
+		return "PostgreSQL"
+	case b.high.Mongo != "":
+		return "MongoDB"
+	case b.high.MemoryIndex:
+		return "in memory LevelDB"
+	case b.high.SQLite != "":
+		return "SQLite"
+	case b.high.KVFile != "":
+		return "cznic/kv"
+	case b.high.LevelDB != "":
+		return "LevelDB"
+	}
+	panic("internal error: sortedName didn't find a sorted implementation")
 }
 
 // kvFileType returns the file based sorted type defined for index storage, if
@@ -306,7 +398,7 @@ func (b *lowBuilder) sortedStorageAt(sortedType, filePrefix string) (map[string]
 		}, nil
 	}
 	if sortedType != "index" && filePrefix == "" {
-		return nil, fmt.Errorf("internal error: use of sortedStorageAt with a non-index type and no file location for non-database sorted implementation")
+		return nil, fmt.Errorf("internal error: use of sortedStorageAt with a non-index type (%v) and no file location for non-database sorted implementation", sortedType)
 	}
 	// dbFile returns path directly if sortedType == "index", else it returns filePrefix+"."+ext.
 	dbFile := func(path, ext string) string {
@@ -409,22 +501,91 @@ func (b *lowBuilder) addS3Config(s3 string) error {
 	b.addPrefix("/bs-loose/", "storage-s3", packedS3Args(path.Join(bucket, "loose")))
 	b.addPrefix("/bs-packed/", "storage-s3", packedS3Args(path.Join(bucket, "packed")))
 
-	// TODO(mpl): I think that should be the job of sortedStorageAt, shouldn't
-	// it? It could use its sortedType argument to create a file path if the
-	// filePrefix argument is empty.
-	var packIndexDir string
-	if b.high.SQLite != "" {
-		packIndexDir = b.high.SQLite
-	} else if b.high.KVFile != "" {
-		packIndexDir = b.high.KVFile
-	} else if b.high.LevelDB != "" {
-		packIndexDir = b.high.LevelDB
-	}
-	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(filepath.Dir(packIndexDir), "packindex"))
+	// If index is DBMS, then blobPackedIndex is in DBMS too, with
+	// whatever dbname is defined for "blobpacked_index", or defaulting
+	// to "blobpacked_index". Otherwise blobPackedIndex is same
+	// file-based DB as the index, in same dir, but named
+	// packindex.dbtype.
+	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
 	if err != nil {
 		return err
 	}
 	b.addPrefix(s3Prefix, "storage-blobpacked", args{
+		"smallBlobs": "/bs-loose/",
+		"largeBlobs": "/bs-packed/",
+		"metaIndex":  blobPackedIndex,
+	})
+
+	return nil
+}
+
+func (b *lowBuilder) addB2Config(b2 string) error {
+	f := strings.SplitN(b2, ":", 3)
+	if len(f) < 3 {
+		return errors.New(`genconfig: expected "b2" field to be of form "account_id:application_key:bucket[/optional/dir]"`)
+	}
+	account, key, bucket := f[0], f[1], f[2]
+	isReplica := b.hasPrefix("/bs/")
+	b2Prefix := ""
+	b2Auth := map[string]interface{}{
+		"account_id":      account,
+		"application_key": key,
+	}
+	b2Args := args{
+		"auth":   b2Auth,
+		"bucket": bucket,
+	}
+	if isReplica {
+		b2Prefix = "/sto-b2/"
+		b.addPrefix(b2Prefix, "storage-b2", b2Args)
+		if b.high.BlobPath == "" && !b.high.MemoryStorage {
+			panic("unexpected empty blobpath with sync-to-b2")
+		}
+		b.addPrefix("/sync-to-b2/", "sync", args{
+			"from": "/bs/",
+			"to":   b2Prefix,
+			"queue": b.thatQueueUnlessMemory(
+				map[string]interface{}{
+					"type": b.kvFileType(),
+					"file": filepath.Join(b.high.BlobPath, "sync-to-b2-queue."+b.kvFileType()),
+				}),
+		})
+		return nil
+	}
+
+	b.addPrefix("/cache/", "storage-filesystem", args{
+		"path": filepath.Join(tempDir(), "camli-cache"),
+	})
+
+	b2Prefix = "/bs/"
+	if !b.high.PackRelated {
+		b.addPrefix(b2Prefix, "storage-b2", b2Args)
+		return nil
+	}
+	packedB2Args := func(bucket string) args {
+		a := args{
+			"bucket": bucket,
+			"auth": map[string]interface{}{
+				"account_id":      account,
+				"application_key": key,
+			},
+		}
+		return a
+	}
+
+	b.addPrefix("/bs-loose/", "storage-b2", packedB2Args(path.Join(bucket, "loose")))
+	b.addPrefix("/bs-packed/", "storage-b2", packedB2Args(path.Join(bucket, "packed")))
+
+	// If index is DBMS, then blobPackedIndex is in DBMS too, with
+	// whatever dbname is defined for "blobpacked_index", or defaulting
+	// to "blobpacked_index". Otherwise blobPackedIndex is same
+	// file-based DB as the index, in same dir, but named
+	// packindex.dbtype.
+	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
+	if err != nil {
+		return err
+	}
+	b.addPrefix(b2Prefix, "storage-blobpacked", args{
 		"smallBlobs": "/bs-loose/",
 		"largeBlobs": "/bs-packed/",
 		"metaIndex":  blobPackedIndex,
@@ -541,7 +702,12 @@ func (b *lowBuilder) addGoogleCloudStorageConfig(v string) error {
 				"refresh_token": refreshToken,
 			},
 		})
-		blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", "")
+		// If index is DBMS, then blobPackedIndex is in DBMS too, with
+		// whatever dbname is defined for "blobpacked_index", or defaulting
+		// to "blobpacked_index". Otherwise blobPackedIndex is same
+		// file-based DB as the index, in same dir, but named
+		// packindex.dbtype.
+		blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
 		if err != nil {
 			return err
 		}
@@ -639,6 +805,13 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 	if b.runIndex() {
 		rootArgs["searchRoot"] = "/my-search/"
 	}
+	if path := b.high.ShareHandlerPath; path != "" {
+		rootArgs["shareRoot"] = path
+		b.addPrefix(path, "share", args{
+			"blobRoot": "/bs/",
+			"index":    "/index/",
+		})
+	}
 	b.addPrefix("/", "root", rootArgs)
 	b.addPrefix("/setup/", "setup", nil)
 	b.addPrefix("/status/", "status", nil)
@@ -657,12 +830,6 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 	}
 	if b.runIndex() {
 		b.addPrefix("/importer/", "importer", importerArgs)
-	}
-
-	if path := b.high.ShareHandlerPath; path != "" {
-		b.addPrefix(path, "share", args{
-			"blobRoot": "/bs/",
-		})
 	}
 
 	b.addPrefix("/sighelper/", "jsonsign", args{
@@ -763,6 +930,15 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 
 func (b *lowBuilder) build() (*Config, error) {
 	conf, low := b.high, b.low
+	if conf.CamliNetIP != "" {
+		if !conf.HTTPS {
+			return nil, errors.New("CamliNetIP requires HTTPS")
+		}
+		if conf.HTTPSCert != "" || conf.HTTPSKey != "" || conf.Listen != "" || conf.BaseURL != "" {
+			return nil, errors.New("CamliNetIP is mutually exclusive with HTTPSCert, HTTPSKey, Listen, and BaseURL.")
+		}
+		low["camliNetIP"] = conf.CamliNetIP
+	}
 	if conf.HTTPS {
 		if (conf.HTTPSCert != "") != (conf.HTTPSKey != "") {
 			return nil, errors.New("Must set both httpsCert and httpsKey (or neither to generate a self-signed cert)")
@@ -770,9 +946,6 @@ func (b *lowBuilder) build() (*Config, error) {
 		if conf.HTTPSCert != "" {
 			low["httpsCert"] = conf.HTTPSCert
 			low["httpsKey"] = conf.HTTPSKey
-		} else {
-			low["httpsCert"] = osutil.DefaultTLSCert()
-			low["httpsKey"] = osutil.DefaultTLSKey()
 		}
 	}
 
@@ -804,7 +977,7 @@ func (b *lowBuilder) build() (*Config, error) {
 	case b.runIndex() && numIndexers != 1:
 		return nil, fmt.Errorf("With runIndex set true, you can only pick exactly one indexer (mongo, mysql, postgres, sqlite, kvIndexFile, leveldb, memoryIndex).")
 	case !b.runIndex() && numIndexers != 0:
-		return nil, fmt.Errorf("With runIndex disabled, you can't specify any of mongo, mysql, postgres, sqlite.")
+		log.Printf("Indexer disabled, but %v will be used for other indexes, queues, caches, etc.", b.sortedName())
 	}
 
 	if conf.Identity == "" {
@@ -813,11 +986,14 @@ func (b *lowBuilder) build() (*Config, error) {
 
 	noLocalDisk := conf.BlobPath == ""
 	if noLocalDisk {
-		if !conf.MemoryStorage && conf.S3 == "" && conf.GoogleCloudStorage == "" {
-			return nil, errors.New("Unless memoryStorage is set, you must specify at least one storage option for your blobserver (blobPath (for localdisk), s3, googlecloudstorage).")
+		if !conf.MemoryStorage && conf.S3 == "" && conf.B2 == "" && conf.GoogleCloudStorage == "" {
+			return nil, errors.New("Unless memoryStorage is set, you must specify at least one storage option for your blobserver (blobPath (for localdisk), s3, b2, googlecloudstorage).")
 		}
 		if !conf.MemoryStorage && conf.S3 != "" && conf.GoogleCloudStorage != "" {
 			return nil, errors.New("Using S3 as a primary storage and Google Cloud Storage as a mirror is not supported for now.")
+		}
+		if !conf.MemoryStorage && conf.B2 != "" && conf.GoogleCloudStorage != "" {
+			return nil, errors.New("Using B2 as a primary storage and Google Cloud Storage as a mirror is not supported for now.")
 		}
 	}
 	if conf.ShareHandler && conf.ShareHandlerPath == "" {
@@ -865,9 +1041,31 @@ func (b *lowBuilder) build() (*Config, error) {
 				httpsCert: httpsCert,
 				httpsKey:  httpsKey,
 			}
+		} else if conf.HTTPS {
+			tlsO = &tlsOpts{
+				autoCert: true,
+			}
 		}
 		if err := b.addPublishedConfig(tlsO); err != nil {
 			return nil, fmt.Errorf("Could not generate config for published: %v", err)
+		}
+	}
+
+	if conf.ScanCab != nil {
+		if !b.runIndex() {
+			return nil, fmt.Errorf("scanning cabinet requires an index")
+		}
+		var tlsO *tlsOpts
+		httpsCert, ok1 := low["httpsCert"].(string)
+		httpsKey, ok2 := low["httpsKey"].(string)
+		if ok1 && ok2 {
+			tlsO = &tlsOpts{
+				httpsCert: httpsCert,
+				httpsKey:  httpsKey,
+			}
+		}
+		if err := b.addScanCabConfig(tlsO); err != nil {
+			return nil, fmt.Errorf("Could not generate config for scanning cabinet: %v", err)
 		}
 	}
 
@@ -885,6 +1083,11 @@ func (b *lowBuilder) build() (*Config, error) {
 
 	if conf.S3 != "" {
 		if err := b.addS3Config(conf.S3); err != nil {
+			return nil, err
+		}
+	}
+	if conf.B2 != "" {
+		if err := b.addB2Config(conf.B2); err != nil {
 			return nil, err
 		}
 	}

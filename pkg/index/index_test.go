@@ -34,6 +34,7 @@ import (
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/test"
 	"camlistore.org/pkg/types/camtypes"
+	"golang.org/x/net/context"
 )
 
 func TestReverseTimeString(t *testing.T) {
@@ -78,6 +79,7 @@ var (
 		"export_test.go",
 		"index_test.go",
 		"keys_test.go",
+		"util_test.go",
 	}
 	// A map is used in hasAllRequiredTests to note which required
 	// tests have been found in a package, by setting the corresponding
@@ -207,6 +209,18 @@ var (
   {"blobRef": "%s", "size": 3}
 ]}`, chunk1ref, chunk2ref, chunk3ref)}
 	fileBlobRef = fileBlob.BlobRef()
+
+	staticSetBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
+"camliType": "static-set",
+"members": [
+  "%s"
+]}`, fileBlobRef)}
+
+	dirBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
+"camliType": "directory",
+"fileName": "someDir",
+"entries": "%s"
+}`, staticSetBlob.BlobRef())}
 )
 
 func TestInitNeededMaps(t *testing.T) {
@@ -217,10 +231,17 @@ func TestInitNeededMaps(t *testing.T) {
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk1ref), "1")
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk2ref), "1")
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk3ref), "1")
+	// Add fileBlob to the blobSource, so the out-of-order indexing can
+	// succeed when the chunk3ref is finally added to the index. We technically
+	// don't need to do that for this unit test, but that's one less log
+	// message to deal with (the ooo indexing failing) if we do.
+	bs := new(test.Fetcher)
+	bs.AddBlob(fileBlob)
 	ix, err := index.New(s)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ix.InitBlobSource(bs)
 	{
 		needs, neededBy, _ := ix.NeededMapsForTest()
 		needsWant := map[blob.Ref][]blob.Ref{
@@ -298,6 +319,9 @@ func TestInitNeededMaps(t *testing.T) {
 			t.Error("fileBlobRef not ready")
 		}
 	}
+	// We also technically don't need to wait for the ooo indexing goroutine
+	// to finish for this unit test, but it's cleaner.
+	ix.Exp_AwaitAsyncIndexing(t)
 	dumpSorted(t, s)
 }
 
@@ -317,7 +341,14 @@ func foreachSorted(t *testing.T, s sorted.KeyValue, fn func(string, string)) {
 	}
 }
 
-func TestOutOfOrderIndexing(t *testing.T) {
+type testSequence struct {
+	add        []*test.Blob // chunks to add
+	dependency blob.Ref     // for checking against a "missing" line
+	dependee   blob.Ref     // for checking against a "missing" line
+	wait       bool         // whether to wait for async reindexing
+}
+
+func testOutOfOrderIndexing(t *testing.T, sequence []testSequence) {
 	tf := new(test.Fetcher)
 	s := sorted.NewMemoryKeyValue()
 
@@ -327,9 +358,6 @@ func TestOutOfOrderIndexing(t *testing.T) {
 	}
 	ix.InitBlobSource(tf)
 
-	t.Logf("file ref = %v", fileBlobRef)
-	t.Logf("missing data chunks = %v, %v, %v", chunk1ref, chunk2ref, chunk3ref)
-
 	add := func(b *test.Blob) {
 		tf.AddBlob(b)
 		if _, err := ix.ReceiveBlob(b.BlobRef(), b.Reader()); err != nil {
@@ -337,35 +365,66 @@ func TestOutOfOrderIndexing(t *testing.T) {
 		}
 	}
 
-	add(fileBlob)
-
-	{
-		key := fmt.Sprintf("missing|%s|%s", fileBlobRef, chunk1ref)
-		if got, err := s.Get(key); got == "" || err != nil {
-			t.Errorf("key %q missing (err: %v); want 1", key, err)
+	for _, seq := range sequence {
+		for _, b := range seq.add {
+			add(b)
+		}
+		if seq.wait {
+			ix.Exp_AwaitAsyncIndexing(t)
+		}
+		if seq.dependee.Valid() && seq.dependency.Valid() {
+			{
+				key := fmt.Sprintf("missing|%s|%s", seq.dependee, seq.dependency)
+				if got, err := s.Get(key); got == "" || err != nil {
+					t.Errorf("key %q missing (err: %v); want 1", key, err)
+				}
+			}
 		}
 	}
-
-	add(chunk1)
-	add(chunk2)
-
-	ix.Exp_AwaitReindexing(t)
-
-	{
-		key := fmt.Sprintf("missing|%s|%s", fileBlobRef, chunk3ref)
-		if got, err := s.Get(key); got == "" || err != nil {
-			t.Errorf("key %q missing (err: %v); want 1", key, err)
-		}
-	}
-
-	add(chunk3)
-
-	ix.Exp_AwaitReindexing(t)
 
 	foreachSorted(t, s, func(k, v string) {
 		if strings.HasPrefix(k, "missing|") {
 			t.Errorf("Shouldn't have missing key: %q", k)
 		}
+	})
+
+}
+
+func TestOutOfOrderIndexingFile(t *testing.T) {
+	t.Logf("file ref = %v", fileBlobRef)
+	t.Logf("missing data chunks = %v, %v, %v", chunk1ref, chunk2ref, chunk3ref)
+	testOutOfOrderIndexing(t, []testSequence{
+		{
+			add:        []*test.Blob{fileBlob},
+			wait:       false,
+			dependee:   fileBlobRef,
+			dependency: chunk1ref,
+		},
+		{
+			add:        []*test.Blob{chunk1, chunk2},
+			wait:       true,
+			dependee:   fileBlobRef,
+			dependency: chunk3ref,
+		},
+		{
+			add:  []*test.Blob{chunk3},
+			wait: true,
+		},
+	})
+}
+
+func TestOutOfOrderIndexingDirectory(t *testing.T) {
+	testOutOfOrderIndexing(t, []testSequence{
+		{
+			add:        []*test.Blob{chunk1, chunk2, chunk3, fileBlob, dirBlob},
+			wait:       true,
+			dependee:   dirBlob.BlobRef(),
+			dependency: staticSetBlob.BlobRef(),
+		},
+		{
+			add:  []*test.Blob{staticSetBlob},
+			wait: true,
+		},
 	})
 }
 
@@ -412,7 +471,7 @@ func TestIndexingClaimMissingPubkey(t *testing.T) {
 		t.Errorf("Error uploading public key to indexer: %v", err)
 	}
 
-	idx.Exp_AwaitReindexing(t)
+	idx.Exp_AwaitAsyncIndexing(t)
 
 	// Verify that populateClaim noted the missing public key blob:
 	{
@@ -436,6 +495,7 @@ func copyBlob(br blob.Ref, dst blobserver.BlobReceiver, src blob.Fetcher) error 
 // tests that we add the missing wholeRef entries in FileInfo rows when going from
 // a version 4 to a version 5 index.
 func TestFixMissingWholeref(t *testing.T) {
+	ctx := context.Background()
 	tf := new(test.Fetcher)
 	s := sorted.NewMemoryKeyValue()
 
@@ -490,7 +550,7 @@ func TestFixMissingWholeref(t *testing.T) {
 		t.Fatal(err)
 	}
 	// and check that the value is now actually fixed
-	fi, err := ix.GetFileInfo(fileBlobRef)
+	fi, err := ix.GetFileInfo(ctx, fileBlobRef)
 	if err != nil {
 		t.Fatal(err)
 	}

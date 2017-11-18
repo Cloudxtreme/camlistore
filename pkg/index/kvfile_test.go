@@ -57,8 +57,10 @@ func indexTest(t *testing.T,
 	sortedGenfn func(t *testing.T) (sorted.KeyValue, func()),
 	tfn func(*testing.T, func() *index.Index)) {
 	defer test.TLog(t)()
-	var mu sync.Mutex // guards cleanups
-	var cleanups []func()
+	var (
+		mu       sync.Mutex // guards cleanups
+		cleanups []func()
+	)
 	defer func() {
 		mu.Lock() // never unlocked
 		for _, fn := range cleanups {
@@ -97,6 +99,10 @@ func TestDelete_Kvfile(t *testing.T) {
 
 func TestReindex_Kvfile(t *testing.T) {
 	indexTest(t, newKvfileSorted, indextest.Reindex)
+}
+
+func TestShowReindexRace_Kvfile(t *testing.T) {
+	indexTest(t, newKvfileSorted, indextest.ShowReindexRace)
 }
 
 func TestEnumStat_Kvfile(t *testing.T) {

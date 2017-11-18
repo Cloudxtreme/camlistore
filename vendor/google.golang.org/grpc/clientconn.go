@@ -34,136 +34,132 @@
 package grpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"net"
-	"strings"
-	"sync"
-	"time"
+	"net/http"
 
-	"golang.org/x/net/context"
-	"golang.org/x/net/trace"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/grpclog"
-	"google.golang.org/grpc/transport"
+	"google.golang.org/grpc/stats"
 )
 
 var (
-	// ErrUnspecTarget indicates that the target address is unspecified.
-	ErrUnspecTarget = errors.New("grpc: target is unspecified")
-	// ErrNoTransportSecurity indicates that there is no transport security
-	// being set for ClientConn. Users should either set one or explicityly
-	// call WithInsecure DialOption to disable security.
-	ErrNoTransportSecurity = errors.New("grpc: no transport security set (use grpc.WithInsecure() explicitly or set credentials)")
-	// ErrCredentialsMisuse indicates that users want to transmit security infomation
-	// (e.g., oauth2 token) which requires secure connection on an insecure
-	// connection.
-	ErrCredentialsMisuse = errors.New("grpc: the credentials require transport level security (use grpc.WithTransportAuthenticator() to set)")
 	// ErrClientConnClosing indicates that the operation is illegal because
-	// the session is closing.
+	// the ClientConn is closing.
 	ErrClientConnClosing = errors.New("grpc: the client connection is closing")
-	// ErrClientConnTimeout indicates that the connection could not be
-	// established or re-established within the specified timeout.
-	ErrClientConnTimeout = errors.New("grpc: timed out trying to connect")
-	// minimum time to give a connection to complete
-	minConnectTimeout = 20 * time.Second
+	// ErrClientConnTimeout indicates that the ClientConn cannot establish the
+	// underlying connections within the specified timeout.
+	// DEPRECATED: Please use context.DeadlineExceeded instead. This error will be
+	// removed in Q1 2017.
+	ErrClientConnTimeout = errors.New("grpc: timed out when dialing")
+
+	// errNoTransportSecurity indicates that there is no transport security
+	// being set for ClientConn. Users should either set one or explicitly
+	// call WithInsecure DialOption to disable security.
+	errNoTransportSecurity = errors.New("grpc: no transport security set (use grpc.WithInsecure() explicitly or set credentials)")
+	// errTransportCredentialsMissing indicates that users want to transmit security
+	// information (e.g., oauth2 token) which requires secure connection on an insecure
+	// connection.
+	errTransportCredentialsMissing = errors.New("grpc: the credentials require transport level security (use grpc.WithTransportCredentials() to set)")
+	// errCredentialsConflict indicates that grpc.WithTransportCredentials()
+	// and grpc.WithInsecure() are both called for a connection.
+	errCredentialsConflict = errors.New("grpc: transport credentials are set for an insecure connection (grpc.WithTransportCredentials() and grpc.WithInsecure() are both called)")
 )
 
-// dialOptions configure a Dial call. dialOptions are set by the DialOption
-// values passed to Dial.
-type dialOptions struct {
-	codec    Codec
-	picker   Picker
-	block    bool
-	insecure bool
-	copts    transport.ConnectOptions
+type clientOptions struct {
+	codec Codec
+	cp    Compressor
+	dc    Decompressor
+
+	// All may be zero:
+	perRPCCreds    []credentials.PerRPCCredentials
+	userAgent      string
+	statsHandler   stats.Handler
+	transportCreds credentials.TransportCredentials // only checked for non-nil for now
+	insecure       bool                             // not TLS
 }
 
-// DialOption configures how we set up the connection.
-type DialOption func(*dialOptions)
+// DialOption is a client option.
+//
+// Despite its name, it does not necessarily have anything to do with
+// dialing.
+//
+// TODO: rename this.
+type DialOption func(*clientOptions)
 
 // WithCodec returns a DialOption which sets a codec for message marshaling and unmarshaling.
 func WithCodec(c Codec) DialOption {
-	return func(o *dialOptions) {
+	return func(o *clientOptions) {
 		o.codec = c
 	}
 }
 
-// WithBlock returns a DialOption which makes caller of Dial blocks until the underlying
-// connection is up. Without this, Dial returns immediately and connecting the server
-// happens in background.
-func WithBlock() DialOption {
-	return func(o *dialOptions) {
-		o.block = true
+// WithCompressor returns a DialOption which sets a CompressorGenerator for generating message
+// compressor.
+func WithCompressor(cp Compressor) DialOption {
+	return func(o *clientOptions) {
+		o.cp = cp
 	}
 }
 
-func WithInsecure() DialOption {
-	return func(o *dialOptions) {
-		o.insecure = true
+// WithDecompressor returns a DialOption which sets a DecompressorGenerator for generating
+// message decompressor.
+func WithDecompressor(dc Decompressor) DialOption {
+	return func(o *clientOptions) {
+		o.dc = dc
 	}
 }
 
-// WithTransportCredentials returns a DialOption which configures a
-// connection level security credentials (e.g., TLS/SSL).
-func WithTransportCredentials(creds credentials.TransportAuthenticator) DialOption {
-	return func(o *dialOptions) {
-		o.copts.AuthOptions = append(o.copts.AuthOptions, creds)
-	}
-}
-
-// WithPerRPCCredentials returns a DialOption which sets
+// WithPerRPCCredentials returns an option which sets
 // credentials which will place auth state on each outbound RPC.
-func WithPerRPCCredentials(creds credentials.Credentials) DialOption {
-	return func(o *dialOptions) {
-		o.copts.AuthOptions = append(o.copts.AuthOptions, creds)
+func WithPerRPCCredentials(creds credentials.PerRPCCredentials) DialOption {
+	return func(o *clientOptions) {
+		o.perRPCCreds = append(o.perRPCCreds, creds)
 	}
 }
 
-// WithTimeout returns a DialOption that configures a timeout for dialing a client connection.
-func WithTimeout(d time.Duration) DialOption {
-	return func(o *dialOptions) {
-		o.copts.Timeout = d
-	}
-}
-
-// WithDialer returns a DialOption that specifies a function to use for dialing network addresses.
-func WithDialer(f func(addr string, timeout time.Duration) (net.Conn, error)) DialOption {
-	return func(o *dialOptions) {
-		o.copts.Dialer = f
+// WithStatsHandler returns a DialOption that specifies the stats handler
+// for all the RPCs and underlying network connections in this ClientConn.
+func WithStatsHandler(h stats.Handler) DialOption {
+	return func(o *clientOptions) {
+		o.statsHandler = h
 	}
 }
 
 // WithUserAgent returns a DialOption that specifies a user agent string for all the RPCs.
 func WithUserAgent(s string) DialOption {
-	return func(o *dialOptions) {
-		o.copts.UserAgent = s
+	return func(o *clientOptions) {
+		o.userAgent = s
 	}
 }
 
-// Dial creates a client connection the given target.
-func Dial(target string, opts ...DialOption) (*ClientConn, error) {
+// NewClient returns a new gRPC client for the provided target server.
+// If the provided HTTP client is nil, http.DefaultClient is used.
+// The target should be a URL scheme and authority, without a path.
+// For example, "https://api.example.com" for TLS or "http://10.0.5.3:5000"
+// for unencrypted HTTP/2.
+//
+// The returned type is named "ClientConn" for legacy reasons. It does
+// not necessarily represent one actual connection. (It might be zero
+// or multiple.)
+func NewClient(hc *http.Client, target string, opts ...DialOption) (*ClientConn, error) {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	if target == "" {
+		return nil, errors.New("NewClientConn: missing required target parameter")
+	}
 	cc := &ClientConn{
+		hc:     hc,
 		target: target,
 	}
 	for _, opt := range opts {
-		opt(&cc.dopts)
+		opt(&cc.opts)
 	}
-	if cc.dopts.codec == nil {
-		// Set the default codec.
-		cc.dopts.codec = protoCodec{}
+	// Set defaults.
+	if cc.opts.codec == nil {
+		cc.opts.codec = protoCodec{}
 	}
-	if cc.dopts.picker == nil {
-		cc.dopts.picker = &unicastPicker{}
-	}
-	if err := cc.dopts.picker.Init(cc); err != nil {
-		return nil, err
-	}
-	colonPos := strings.LastIndex(target, ":")
-	if colonPos == -1 {
-		colonPos = len(target)
-	}
-	cc.authority = target[:colonPos]
 	return cc, nil
 }
 
@@ -200,326 +196,85 @@ func (s ConnectivityState) String() string {
 	}
 }
 
-// ClientConn represents a client connection to an RPC service.
+// ClientConn is a gRPC client.
+//
+// Despite its name, it is not necessarily a single
+// connection. Depending on its underlying transport, it could be
+// using zero or multiple TCP or other connections, and changing over
+// time.
 type ClientConn struct {
-	target    string
-	authority string
-	dopts     dialOptions
+	target string // server URL prefix (scheme + authority, optional port), without path ("https://api.example.com"); use http:// for h2c
+	opts   clientOptions
+	hc     *http.Client
+
+	sc *ServiceConfig // TODO(bradfitz): support; may be nil for now
 }
 
-// State returns the connectivity state of cc.
-// This is EXPERIMENTAL API.
-func (cc *ClientConn) State() ConnectivityState {
-	return cc.dopts.picker.State()
+func (cc *ClientConn) getMethodConfig(method string) (m MethodConfig, ok bool) {
+	if cc.sc == nil {
+		return
+	}
+	m, ok = cc.sc.Methods[method]
+	return
 }
 
-// WaitForStateChange blocks until the state changes to something other than the sourceState
-// or timeout fires on cc. It returns false if timeout fires, and true otherwise.
-// This is EXPERIMENTAL API.
-func (cc *ClientConn) WaitForStateChange(timeout time.Duration, sourceState ConnectivityState) bool {
-	return cc.dopts.picker.WaitForStateChange(timeout, sourceState)
-}
-
-// Close starts to tear down the ClientConn.
+// Close tears down the ClientConn and all underlying connections.
 func (cc *ClientConn) Close() error {
-	return cc.dopts.picker.Close()
-}
-
-// Conn is a client connection to a single destination.
-type Conn struct {
-	target       string
-	dopts        dialOptions
-	shutdownChan chan struct{}
-	events       trace.EventLog
-
-	mu      sync.Mutex
-	state   ConnectivityState
-	stateCV *sync.Cond
-	// ready is closed and becomes nil when a new transport is up or failed
-	// due to timeout.
-	ready     chan struct{}
-	transport transport.ClientTransport
-}
-
-// NewConn creates a Conn.
-func NewConn(cc *ClientConn) (*Conn, error) {
-	if cc.target == "" {
-		return nil, ErrUnspecTarget
-	}
-	c := &Conn{
-		target:       cc.target,
-		dopts:        cc.dopts,
-		shutdownChan: make(chan struct{}),
-	}
-	if EnableTracing {
-		c.events = trace.NewEventLog("grpc.ClientConn", c.target)
-	}
-	if !c.dopts.insecure {
-		var ok bool
-		for _, cd := range c.dopts.copts.AuthOptions {
-			if _, ok := cd.(credentials.TransportAuthenticator); !ok {
-				continue
-			}
-			ok = true
-		}
-		if !ok {
-			return nil, ErrNoTransportSecurity
-		}
-	} else {
-		for _, cd := range c.dopts.copts.AuthOptions {
-			if cd.RequireTransportSecurity() {
-				return nil, ErrCredentialsMisuse
-			}
-		}
-	}
-	c.stateCV = sync.NewCond(&c.mu)
-	if c.dopts.block {
-		if err := c.resetTransport(false); err != nil {
-			c.Close()
-			return nil, err
-		}
-		// Start to monitor the error status of transport.
-		go c.transportMonitor()
-	} else {
-		// Start a goroutine connecting to the server asynchronously.
-		go func() {
-			if err := c.resetTransport(false); err != nil {
-				grpclog.Printf("Failed to dial %s: %v; please retry.", c.target, err)
-				c.Close()
-				return
-			}
-			c.transportMonitor()
-		}()
-	}
-	return c, nil
-}
-
-// printf records an event in cc's event log, unless cc has been closed.
-// REQUIRES cc.mu is held.
-func (cc *Conn) printf(format string, a ...interface{}) {
-	if cc.events != nil {
-		cc.events.Printf(format, a...)
-	}
-}
-
-// errorf records an error in cc's event log, unless cc has been closed.
-// REQUIRES cc.mu is held.
-func (cc *Conn) errorf(format string, a ...interface{}) {
-	if cc.events != nil {
-		cc.events.Errorf(format, a...)
-	}
-}
-
-// State returns the connectivity state of the Conn
-func (cc *Conn) State() ConnectivityState {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	return cc.state
-}
-
-// WaitForStateChange blocks until the state changes to something other than the sourceState
-// or timeout fires. It returns false if timeout fires and true otherwise.
-// TODO(zhaoq): Rewrite for complex Picker.
-func (cc *Conn) WaitForStateChange(timeout time.Duration, sourceState ConnectivityState) bool {
-	start := time.Now()
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	if sourceState != cc.state {
-		return true
-	}
-	expired := timeout <= time.Since(start)
-	if expired {
-		return false
-	}
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-time.After(timeout - time.Since(start)):
-			cc.mu.Lock()
-			expired = true
-			cc.stateCV.Broadcast()
-			cc.mu.Unlock()
-		case <-done:
-		}
-	}()
-	defer close(done)
-	for sourceState == cc.state {
-		cc.stateCV.Wait()
-		if expired {
-			return false
-		}
-	}
-	return true
-}
-
-func (cc *Conn) resetTransport(closeTransport bool) error {
-	var retries int
-	start := time.Now()
-	for {
-		cc.mu.Lock()
-		cc.printf("connecting")
-		if cc.state == Shutdown {
-			cc.mu.Unlock()
-			return ErrClientConnClosing
-		}
-		cc.state = Connecting
-		cc.stateCV.Broadcast()
-		cc.mu.Unlock()
-		if closeTransport {
-			cc.transport.Close()
-		}
-		// Adjust timeout for the current try.
-		copts := cc.dopts.copts
-		if copts.Timeout < 0 {
-			cc.Close()
-			return ErrClientConnTimeout
-		}
-		if copts.Timeout > 0 {
-			copts.Timeout -= time.Since(start)
-			if copts.Timeout <= 0 {
-				cc.Close()
-				return ErrClientConnTimeout
-			}
-		}
-		sleepTime := backoff(retries)
-		timeout := sleepTime
-		if timeout < minConnectTimeout {
-			timeout = minConnectTimeout
-		}
-		if copts.Timeout == 0 || copts.Timeout > timeout {
-			copts.Timeout = timeout
-		}
-		connectTime := time.Now()
-		newTransport, err := transport.NewClientTransport(cc.target, &copts)
-		if err != nil {
-			cc.mu.Lock()
-			cc.errorf("transient failure: %v", err)
-			cc.state = TransientFailure
-			cc.stateCV.Broadcast()
-			if cc.ready != nil {
-				close(cc.ready)
-				cc.ready = nil
-			}
-			cc.mu.Unlock()
-			sleepTime -= time.Since(connectTime)
-			if sleepTime < 0 {
-				sleepTime = 0
-			}
-			// Fail early before falling into sleep.
-			if cc.dopts.copts.Timeout > 0 && cc.dopts.copts.Timeout < sleepTime+time.Since(start) {
-				cc.mu.Lock()
-				cc.errorf("connection timeout")
-				cc.mu.Unlock()
-				cc.Close()
-				return ErrClientConnTimeout
-			}
-			closeTransport = false
-			time.Sleep(sleepTime)
-			retries++
-			grpclog.Printf("grpc: ClientConn.resetTransport failed to create client transport: %v; Reconnecting to %q", err, cc.target)
-			continue
-		}
-		cc.mu.Lock()
-		cc.printf("ready")
-		if cc.state == Shutdown {
-			// cc.Close() has been invoked.
-			cc.mu.Unlock()
-			newTransport.Close()
-			return ErrClientConnClosing
-		}
-		cc.state = Ready
-		cc.stateCV.Broadcast()
-		cc.transport = newTransport
-		if cc.ready != nil {
-			close(cc.ready)
-			cc.ready = nil
-		}
-		cc.mu.Unlock()
-		return nil
-	}
-}
-
-// Run in a goroutine to track the error in transport and create the
-// new transport if an error happens. It returns when the channel is closing.
-func (cc *Conn) transportMonitor() {
-	for {
-		select {
-		// shutdownChan is needed to detect the teardown when
-		// the ClientConn is idle (i.e., no RPC in flight).
-		case <-cc.shutdownChan:
-			return
-		case <-cc.transport.Error():
-			cc.mu.Lock()
-			cc.state = TransientFailure
-			cc.stateCV.Broadcast()
-			cc.mu.Unlock()
-			if err := cc.resetTransport(true); err != nil {
-				// The ClientConn is closing.
-				cc.mu.Lock()
-				cc.printf("transport exiting: %v", err)
-				cc.mu.Unlock()
-				grpclog.Printf("grpc: ClientConn.transportMonitor exits due to: %v", err)
-				return
-			}
-			continue
-		}
-	}
-}
-
-// Wait blocks until i) the new transport is up or ii) ctx is done or iii) cc is closed.
-func (cc *Conn) Wait(ctx context.Context) (transport.ClientTransport, error) {
-	for {
-		cc.mu.Lock()
-		switch {
-		case cc.state == Shutdown:
-			cc.mu.Unlock()
-			return nil, ErrClientConnClosing
-		case cc.state == Ready:
-			cc.mu.Unlock()
-			return cc.transport, nil
-		default:
-			ready := cc.ready
-			if ready == nil {
-				ready = make(chan struct{})
-				cc.ready = ready
-			}
-			cc.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return nil, transport.ContextErr(ctx.Err())
-			// Wait until the new transport is ready or failed.
-			case <-ready:
-			}
-		}
-	}
-}
-
-// Close starts to tear down the Conn. Returns ErrClientConnClosing if
-// it has been closed (mostly due to dial time-out).
-// TODO(zhaoq): Make this synchronous to avoid unbounded memory consumption in
-// some edge cases (e.g., the caller opens and closes many ClientConn's in a
-// tight loop.
-func (cc *Conn) Close() error {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	if cc.state == Shutdown {
-		return ErrClientConnClosing
-	}
-	cc.state = Shutdown
-	cc.stateCV.Broadcast()
-	if cc.events != nil {
-		cc.events.Finish()
-		cc.events = nil
-	}
-	if cc.ready != nil {
-		close(cc.ready)
-		cc.ready = nil
-	}
-	if cc.transport != nil {
-		cc.transport.Close()
-	}
-	if cc.shutdownChan != nil {
-		close(cc.shutdownChan)
-	}
+	// TODO(bradfitz): something? maybe just close some cancel
+	// chan that we then merge into all http Request's context
+	// with some new context.Context impl? And then do some
+	// http.Transport.CloseIdleConnections? But first research
+	// what callers of this actually expect. It's unclear.
 	return nil
+}
+
+// WithTransportCredentials is controls whether to use TLS or not for connections.
+//
+// Deprecated: this is only respected in a minimal form to let
+// existing code in the wild work. Uew NewClient instead.
+func WithTransportCredentials(creds credentials.TransportCredentials) DialOption {
+	return func(o *clientOptions) {
+		o.transportCreds = creds
+	}
+}
+
+// WithInsecure returns a DialOption which disables transport security for this ClientConn.
+// WithInsecure is mutually exclusive with use of WithTransportCredentials or https
+// endpoints.
+func WithInsecure() DialOption {
+	return func(o *clientOptions) { o.insecure = true }
+}
+
+// DialContext is the old way to create a gRPC client.
+//
+// Deprecated: use NewClient instead.
+func DialContext(ctx context.Context, target string, opts ...DialOption) (*ClientConn, error) {
+	var o clientOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if (o.transportCreds != nil) == o.insecure {
+		return nil, fmt.Errorf("only one of TransportCredentials or Insecure may be used")
+	}
+	if o.transportCreds != nil {
+		if o.transportCreds.Info().SecurityProtocol == "tls" {
+			target = "https://" + target
+			// TODO(bradfitz): care about the rest? use the interface?
+			// Not today. Prefer to delete the interace.
+		} else {
+			return nil, fmt.Errorf("unsupported TransportCredentials %+v", o.transportCreds.Info())
+		}
+	}
+	if o.insecure {
+		panic("TODO: implement insecure http2.Transport dialing")
+	}
+	return NewClient(nil, target, opts...)
+}
+
+// Dial is the old way to create a gRPC client.
+//
+// Deprecated: use NewClient instead. This only exists to let existing code
+// in the wild work.
+func Dial(target string, opts ...DialOption) (*ClientConn, error) {
+	return DialContext(context.Background(), target, opts...)
 }

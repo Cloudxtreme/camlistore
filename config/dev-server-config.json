@@ -15,6 +15,7 @@
 				"helpRoot": "/help/",
 				"statusRoot": "/status/",
 				"searchRoot": "/my-search/",
+				"shareRoot": "/share/",
 				"stealth": false
 			}
 		},
@@ -23,9 +24,24 @@
 			"handler": "app",
 			"enabled": ["_env", "${CAMLI_HELLO_ENABLED}"],
 			"handlerArgs": {
+				"prefix": "/hello/",
+				"serverListen": "localhost:3179",
 				"program": "hello",
 				"appConfig": {
 					"word": "world"
+				}
+			}
+		},
+
+		"/scancab/": {
+			"handler": "app",
+			"enabled": true,
+			"handlerArgs": {
+				"prefix": "/scancab/",
+				"serverListen": "localhost:3179",
+				"program": "scanningcabinet",
+				"appConfig": {
+					"sourceRoot": ["_env", "${CAMLI_DEV_CAMLI_ROOT}/app/scanningcabinet/ui", ""]
 				}
 			}
 		},
@@ -35,9 +51,12 @@
 			"enabled": ["_env", "${CAMLI_PUBLISH_ENABLED}"],
 			"handlerArgs": {
 				"program": "publisher",
+				"prefix": "/pics/",
+				"serverListen": "localhost:3179",
+				"serverBaseURL": ["_env", "${CAMLI_BASEURL}"],
 				"appConfig": {
 					"camliRoot": "dev-pics-root",
-					"sourceRoot": ["_env", "${CAMLI_DEV_CAMLI_ROOT}", ""],
+					"sourceRoot": ["_env", "${CAMLI_DEV_CAMLI_ROOT}/app/publisher", ""],
 					"cacheRoot": ["_env", "${CAMLI_ROOT_CACHE}"],
 					"goTemplate": "gallery.html"
 				}
@@ -57,8 +76,8 @@
 				"sourceRoot": ["_env", "${CAMLI_DEV_CAMLI_ROOT}", ""],
 				"cache": "/cache/",
 				"scaledImage": {
-					"type": "kv",
-					"file": ["_env", "${CAMLI_ROOT_CACHE}/thumbnails.kv", ""]
+					"type": "leveldb",
+					"file": ["_env", "${CAMLI_ROOT_CACHE}/thumbnails.leveldb", ""]
 				}
 			}
 		},
@@ -127,9 +146,9 @@
 				"smallBlobs": "/bs-loose/",
 				"largeBlobs": "/bs-packed/",
 				"metaIndex": {
-					"type": "kv",
-					"file": ["_env", "${CAMLI_ROOT}/packindex.kv"]
-                                }
+					"type": "leveldb",
+					"file": ["_env", "${CAMLI_ROOT}/packindex.leveldb"]
+				}
 			}
 		},
 
@@ -345,6 +364,9 @@
 				"picasa": {
 					"clientSecret": ["_env", "${CAMLI_PICASA_API_KEY}", ""]
 				},
+				"plaid": {
+					"clientSecret": ["_env", "${CAMLI_PLAID_API_KEY}", ""]
+				},
 				"twitter": {
 					"clientSecret": ["_env", "${CAMLI_TWITTER_API_KEY}", ""]
 				}
@@ -354,7 +376,8 @@
 		"/share/": {
 			"handler": "share",
 			"handlerArgs": {
-				"blobRoot": "/bs/"
+				"blobRoot": "/bs/",
+				"index": ["_env", "${CAMLI_INDEXER_PATH}"]
 			}
 		}
 	}

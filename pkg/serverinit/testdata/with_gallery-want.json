@@ -7,9 +7,10 @@
 			"handler": "root",
 			"handlerArgs": {
 				"blobRoot": "/bs-and-maybe-also-index/",
-				"jsonSignRoot": "/sighelper/",
 				"helpRoot": "/help/",
+				"jsonSignRoot": "/sighelper/",
 				"searchRoot": "/my-search/",
+				"shareRoot": "/share/",
 				"statusRoot": "/status/",
 				"stealth": false
 			}
@@ -74,15 +75,17 @@
 		"/pics/": {
 			"handler": "app",
 			"handlerArgs": {
-				"program": "publisher",
-				"baseURL": "http://localhost:3178/",
 				"appConfig": {
-					"httpsCert": "/tls.crt",
-					"httpsKey": "/tls.key",
+					"cacheRoot": "/tmp/blobs/cache",
 					"camliRoot": "picsRoot",
 					"goTemplate": "gallery.html",
-					"cacheRoot": "/tmp/blobs/cache"
-				}
+					"httpsCert": "/tls.crt",
+					"httpsKey": "/tls.key"
+				},
+				"backendURL": "http://localhost:3178/",
+				"prefix": "/pics/",
+				"program": "publisher",
+				"serverListen": "localhost:3179"
 			}
 		},
 		"/setup/": {
@@ -91,7 +94,8 @@
 		"/share/": {
 			"handler": "share",
 			"handlerArgs": {
-				"blobRoot": "/bs/"
+				"blobRoot": "/bs/",
+				"index": "/index/"
 			}
 		},
 		"/sighelper/": {

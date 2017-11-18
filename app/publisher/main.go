@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The publisher command is a server application to publish items from a
+// Camlistore server. See also https://camlistore.org/doc/publishing
 package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,28 +35,35 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"camlistore.org/pkg/app"
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/localdisk"
 	"camlistore.org/pkg/buildinfo"
+	"camlistore.org/pkg/cacher"
 	"camlistore.org/pkg/constants"
 	"camlistore.org/pkg/fileembed"
 	"camlistore.org/pkg/httputil"
+	"camlistore.org/pkg/magic"
+	"camlistore.org/pkg/netutil"
+	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/publish"
 	"camlistore.org/pkg/search"
 	"camlistore.org/pkg/server"
 	"camlistore.org/pkg/sorted"
+	_ "camlistore.org/pkg/sorted/kvfile"
 	"camlistore.org/pkg/types/camtypes"
 	"camlistore.org/pkg/webserver"
 
 	"go4.org/syncutil"
-
-	_ "camlistore.org/pkg/sorted/kvfile"
+	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -70,6 +80,7 @@ var (
 type config struct {
 	HTTPSCert      string `json:"httpsCert,omitempty"`      // Path to the HTTPS certificate file.
 	HTTPSKey       string `json:"httpsKey,omitempty"`       // Path to the HTTPS key file.
+	CertManager    bool   `json:"certManager,omitempty"`    // Use Camlistore's Let's Encrypt cache to get a certificate.
 	RootName       string `json:"camliRoot"`                // Publish root name (i.e. value of the camliRoot attribute on the root permanode).
 	MaxResizeBytes int64  `json:"maxResizeBytes,omitempty"` // See constants.DefaultMaxResizeMem
 	SourceRoot     string `json:"sourceRoot,omitempty"`     // Path to the app's resources dir, such as html and css files.
@@ -77,20 +88,181 @@ type config struct {
 	CacheRoot      string `json:"cacheRoot,omitempty"`      // Root path for the caching blobserver. No caching if empty.
 }
 
-func appConfig() *config {
+// appConfig keeps on trying to fetch the extra config from the app handler. If
+// it doesn't succed after an hour has passed, the program exits.
+func appConfig() (*config, error) {
 	configURL := os.Getenv("CAMLI_APP_CONFIG_URL")
 	if configURL == "" {
-		logger.Fatalf("Publisher application needs a CAMLI_APP_CONFIG_URL env var")
+		return nil, fmt.Errorf("Publisher application needs a CAMLI_APP_CONFIG_URL env var")
 	}
 	cl, err := app.Client()
 	if err != nil {
-		logger.Fatalf("could not get a client to fetch extra config: %v", err)
+		return nil, fmt.Errorf("could not get a client to fetch extra config: %v", err)
 	}
 	conf := &config{}
-	if err := cl.GetJSON(configURL, conf); err != nil {
-		logger.Fatalf("could not get app config at %v: %v", configURL, err)
+	pause := time.Second
+	giveupTime := time.Now().Add(time.Hour)
+	for {
+		err := cl.GetJSON(configURL, conf)
+		if err == nil {
+			break
+		}
+		if time.Now().After(giveupTime) {
+			logger.Fatalf("Giving up on starting: could not get app config at %v: %v", configURL, err)
+		}
+		logger.Printf("could not get app config at %v: %v. Will retry in a while.", configURL, err)
+		time.Sleep(pause)
+		pause *= 2
 	}
-	return conf
+	return conf, nil
+}
+
+// setMasterQuery registers with the app handler a master query that includes
+// topNode and all its descendants as the search response.
+func (ph *publishHandler) setMasterQuery(topNode blob.Ref) error {
+	query := &search.SearchQuery{
+		Sort:  search.CreatedDesc,
+		Limit: -1,
+		Constraint: &search.Constraint{
+			Permanode: &search.PermanodeConstraint{
+				Relation: &search.RelationConstraint{
+					Relation: "parent",
+					Any: &search.Constraint{
+						BlobRefPrefix: topNode.String(),
+					},
+				},
+			},
+		},
+		Describe: &search.DescribeRequest{
+			Depth: 1,
+			Rules: []*search.DescribeRule{
+				{Attrs: []string{"camliContent", "camliContentImage", "camliMember", "camliPath:*"}},
+			},
+		},
+	}
+	data, err := json.Marshal(query)
+	if err != nil {
+		return err
+	}
+	// TODO(mpl): we should use app.Client instead, but a *client.Client
+	// Post method doesn't let us get the body.
+	req, err := http.NewRequest("POST", ph.masterQueryURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	if err := addAuth(req); err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if string(body) != "OK" {
+		return fmt.Errorf("error setting master query on app handler: %v", string(body))
+	}
+	return nil
+}
+
+func (ph *publishHandler) refreshMasterQuery() error {
+	// TODO(mpl): we should use app.Client instead, but a *client.Client
+	// Post method doesn't let us get the body.
+	req, err := http.NewRequest("POST", ph.masterQueryURL+"?refresh=1", nil)
+	if err != nil {
+		return err
+	}
+	if err := addAuth(req); err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// request suppression. let's not consider it an error.
+		return nil
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if string(body) != "OK" {
+		return fmt.Errorf("error refreshing master query: %v", string(body))
+	}
+	return nil
+}
+
+func addAuth(r *http.Request) error {
+	am, err := app.Auth()
+	if err != nil {
+		return err
+	}
+	am.AddAuthHeader(r)
+	return nil
+}
+
+func setupTLS(ws *webserver.Server, conf *config) error {
+	if conf.HTTPSCert != "" && conf.HTTPSKey != "" {
+		ws.SetTLS(webserver.TLSSetup{
+			CertFile: conf.HTTPSCert,
+			KeyFile:  conf.HTTPSKey,
+		})
+		return nil
+	}
+	if !conf.CertManager {
+		return nil
+	}
+
+	// As all requests to the publisher are proxied through Camlistore's app
+	// handler, it makes sense to assume that both Camlistore and the publisher
+	// are behind the same domain name. Therefore, it follows that
+	// camlistored's autocert is the one actually getting a cert (and answering
+	// the challenge) for the both of them. Plus, if they run on the same host
+	// (default setup), they can't both listen on 443 to answer the TLS-SNI
+	// challenge.
+	// TODO(mpl): however, camlistored and publisher could be running on
+	// different hosts, in which case we need to find a way for camlistored to
+	// share its autocert cache with publisher. But I think that can wait a
+	// later CL.
+	hostname := os.Getenv("CAMLI_API_HOST")
+	hostname = strings.TrimPrefix(hostname, "https://")
+	hostname = strings.SplitN(hostname, "/", 2)[0]
+	hostname = strings.SplitN(hostname, ":", 2)[0]
+	if !netutil.IsFQDN(hostname) {
+		return fmt.Errorf("cannot ask Let's Encrypt for a cert because %v is not a fully qualified domain name", hostname)
+	}
+	logger.Print("TLS enabled, with Let's Encrypt")
+
+	// TODO(mpl): we only want publisher to use the same cache as
+	// camlistored, and we don't actually need an autocert.Manager.
+	// So we could just instantiate an autocert.DirCache, and generate
+	// from there a *tls.Certificate, but it looks like it would mean
+	// extracting quite a bit of code from the autocert pkg to do it properly.
+	// Instead, I've opted for using an autocert.Manager (even though it's
+	// never going to reply to any challenge), but with NOOP for Put and
+	// Delete, just to be on the safe side. It's simple enough, but there's
+	// still a catch: there's no ServerName in the clientHello we get, so we
+	// reinject one so we can simply use the autocert.Manager.GetCertificate
+	// method as the way to get the certificate from the cache. Is that OK?
+	m := autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(hostname),
+		Cache:      roCertCacheDir(osutil.DefaultLetsEncryptCache()),
+	}
+	ws.SetTLS(webserver.TLSSetup{
+		CertManager: func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if clientHello.ServerName == "" {
+				clientHello.ServerName = hostname
+			}
+			return m.GetCertificate(clientHello)
+		},
+	})
+	return nil
 }
 
 func main() {
@@ -109,17 +281,29 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Listen address: %v", err)
 	}
-	conf := appConfig()
+	conf, err := appConfig()
+	if err != nil {
+		logger.Fatalf("no app config: %v", err)
+	}
 	ph := newPublishHandler(conf)
+	masterQueryURL := os.Getenv("CAMLI_APP_MASTERQUERY_URL")
+	if masterQueryURL == "" {
+		logger.Fatalf("Publisher application needs a CAMLI_APP_MASTERQUERY_URL env var")
+	}
+	ph.masterQueryURL = masterQueryURL
 	if err := ph.initRootNode(); err != nil {
 		logf("%v", err)
+	} else {
+		if err := ph.setMasterQuery(ph.rootNode); err != nil {
+			logf("%v", err)
+		}
 	}
 	ws := webserver.New()
 	ws.Logger = logger
-	ws.Handle("/", ph)
-	if conf.HTTPSCert != "" && conf.HTTPSKey != "" {
-		ws.SetTLS(conf.HTTPSCert, conf.HTTPSKey)
+	if err := setupTLS(ws, conf); err != nil {
+		logger.Fatal("could not setup TLS: %v", err)
 	}
+	ws.Handle("/", ph)
 	if err := ws.Listen(listenAddr); err != nil {
 		logger.Fatalf("Listen: %v", err)
 	}
@@ -138,15 +322,14 @@ func newPublishHandler(conf *config) *publishHandler {
 	if maxResizeBytes == 0 {
 		maxResizeBytes = constants.DefaultMaxResizeMem
 	}
-	var CSSFiles []string
+	var CSSFiles, JSDeps []string
 	if conf.SourceRoot != "" {
-		appRoot := filepath.Join(conf.SourceRoot, "app", "publisher")
 		Files = &fileembed.Files{
-			DirFallback: appRoot,
+			DirFallback: conf.SourceRoot,
 		}
 		// TODO(mpl): Can I readdir by listing with "/" on Files, even with DirFallBack?
 		// Apparently not, but retry later.
-		dir, err := os.Open(appRoot)
+		dir, err := os.Open(conf.SourceRoot)
 		if err != nil {
 			logger.Fatal(err)
 		}
@@ -158,8 +341,17 @@ func newPublishHandler(conf *config) *publishHandler {
 		for _, v := range names {
 			if strings.HasSuffix(v, ".css") {
 				CSSFiles = append(CSSFiles, v)
+				continue
+			}
+			// TODO(mpl): document or fix (use a map?) the ordering
+			// problem: i.e. jquery.js must be sourced before
+			// publisher.js. For now, just cheat by sorting the
+			// slice.
+			if strings.HasSuffix(v, ".js") {
+				JSDeps = append(JSDeps, v)
 			}
 		}
+		sort.Strings(JSDeps)
 	} else {
 		Files.Listable = true
 		dir, err := Files.Open("/")
@@ -175,8 +367,13 @@ func newPublishHandler(conf *config) *publishHandler {
 			name := v.Name()
 			if strings.HasSuffix(name, ".css") {
 				CSSFiles = append(CSSFiles, name)
+				continue
+			}
+			if strings.HasSuffix(name, ".js") {
+				JSDeps = append(JSDeps, name)
 			}
 		}
+		sort.Strings(JSDeps)
 	}
 	// TODO(mpl): add all htmls found in Files to the template if none specified?
 	if conf.GoTemplate == "" {
@@ -186,10 +383,7 @@ func newPublishHandler(conf *config) *publishHandler {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	serverURL := os.Getenv("CAMLI_API_HOST")
-	if serverURL == "" {
-		logger.Fatal("CAMLI_API_HOST var not set")
-	}
+
 	var cache blobserver.Storage
 	var thumbMeta *server.ThumbMeta
 	if conf.CacheRoot != "" {
@@ -218,6 +412,7 @@ func newPublishHandler(conf *config) *publishHandler {
 		staticFiles:    Files,
 		goTemplate:     goTemplate,
 		CSSFiles:       CSSFiles,
+		JSDeps:         JSDeps,
 		describedCache: make(map[string]*search.DescribedBlob),
 		cache:          cache,
 		thumbMeta:      thumbMeta,
@@ -252,11 +447,16 @@ type publishHandler struct {
 	rootNodeMu sync.Mutex
 	rootNode   blob.Ref // Root permanode, origin of all camliPaths for this publish handler.
 
+	masterQueryURL  string // not guarded by mutex below, because set on startup.
+	masterQueryMu   sync.Mutex
+	masterQueryDone bool // master query has been registered with the app handler
+
 	cl client // Used for searching, and remote storage.
 
 	staticFiles *fileembed.Files   // For static resources.
 	goTemplate  *template.Template // For publishing/rendering.
 	CSSFiles    []string
+	JSDeps      []string
 	resizeSem   *syncutil.Sem // Limit peak RAM used by concurrent image thumbnail calls.
 
 	describedCacheMu sync.RWMutex
@@ -279,6 +479,16 @@ func (ph *publishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ph.rootNodeMu.Unlock()
+	ph.masterQueryMu.Lock()
+	if !ph.masterQueryDone {
+		if err := ph.setMasterQuery(ph.rootNode); err != nil {
+			httputil.ServeError(w, r, fmt.Errorf("master query not set: %v", err))
+			ph.masterQueryMu.Unlock()
+			return
+		}
+		ph.masterQueryDone = true
+	}
+	ph.masterQueryMu.Unlock()
 
 	preq, err := ph.NewRequest(w, r)
 	if err != nil {
@@ -398,12 +608,17 @@ func (ph *publishHandler) describe(br blob.Ref) (*search.DescribedBlob, error) {
 		return des, nil
 	}
 	ph.describedCacheMu.RUnlock()
-	res, err := ph.cl.Describe(&search.DescribeRequest{
+	ctx := context.TODO()
+	res, err := ph.cl.Describe(ctx, &search.DescribeRequest{
 		BlobRef: br,
 		Depth:   1,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Could not describe %v: %v", br, err)
+	}
+	// TODO(mpl): check why Describe is not giving us an error when br is invalid.
+	if res == nil || res.Meta == nil || res.Meta[br.String()] == nil {
+		return nil, fmt.Errorf("Could not describe %v", br)
 	}
 	return res.Meta[br.String()], nil
 }
@@ -444,12 +659,14 @@ type publishRequest struct {
 	subject              blob.Ref
 	inSubjectChain       map[string]bool // blobref -> true
 	subjectBasePath      string
+	publishedRoot        blob.Ref // on camliRoot, camliPath:somePath = publishedRoot
 }
 
-func (ph *publishHandler) NewRequest(rw http.ResponseWriter, req *http.Request) (*publishRequest, error) {
+func (ph *publishHandler) NewRequest(w http.ResponseWriter, r *http.Request) (*publishRequest, error) {
 	// splits a path request into its suffix and subresource parts.
 	// e.g. /blog/foo/camli/res/file/xxx -> ("foo", "file/xxx")
-	suffix, res := httputil.PathSuffix(req), ""
+	base := app.PathPrefix(r)
+	suffix, res := strings.TrimPrefix(r.URL.Path, base), ""
 	if strings.HasPrefix(suffix, "-/") {
 		suffix, res = "", suffix[2:]
 	} else if s := strings.SplitN(suffix, "/-/", 2); len(s) == 2 {
@@ -458,10 +675,10 @@ func (ph *publishHandler) NewRequest(rw http.ResponseWriter, req *http.Request) 
 
 	return &publishRequest{
 		ph:              ph,
-		rw:              rw,
-		req:             req,
-		suffix:          suffix,
-		base:            httputil.PathBase(req),
+		rw:              w,
+		req:             r,
+		suffix:          strings.TrimSuffix(suffix, "/"),
+		base:            base,
 		subres:          res,
 		rootpn:          ph.rootNode,
 		inSubjectChain:  make(map[string]bool),
@@ -471,7 +688,13 @@ func (ph *publishHandler) NewRequest(rw http.ResponseWriter, req *http.Request) 
 
 func (pr *publishRequest) serveHTTP() {
 	if !pr.rootpn.Valid() {
-		pr.rw.WriteHeader(404)
+		http.NotFound(pr.rw, pr.req)
+		return
+	}
+
+	if pr.suffix == "" {
+		// Do not show everything at the root.
+		http.Error(pr.rw, "403 forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -483,7 +706,7 @@ func (pr *publishRequest) serveHTTP() {
 
 	if err := pr.findSubject(); err != nil {
 		if err == os.ErrNotExist {
-			pr.rw.WriteHeader(404)
+			http.NotFound(pr.rw, pr.req)
 			return
 		}
 		logf("Error looking up %s/%q: %v", pr.rootpn, pr.suffix, err)
@@ -498,6 +721,16 @@ func (pr *publishRequest) serveHTTP() {
 
 	switch pr.subresourceType() {
 	case "":
+		// This should not happen too often as now that we have the
+		// javascript code we're not hitting that code path often anymore
+		// in a typical navigation. And the app handler is doing
+		// request suppression anyway.
+		// If needed, we can always do it in a narrower case later.
+		if err := pr.ph.refreshMasterQuery(); err != nil {
+			logf("Error refreshing master query: %v", err)
+			pr.rw.WriteHeader(500)
+			return
+		}
 		pr.serveSubjectTemplate()
 	case "b":
 		// TODO: download a raw blob
@@ -537,6 +770,7 @@ func (pr *publishRequest) findSubject() error {
 	if err != nil {
 		return err
 	}
+	pr.publishedRoot = subject
 	if strings.HasPrefix(pr.subres, "=z/") {
 		// this happens when we are at the root of the published path,
 		// e.g /base/suffix/-/=z/foo.zip
@@ -693,16 +927,20 @@ func (pr *publishRequest) serveFileDownload(des *search.DescribedBlob) {
 		logf("Didn't get file schema from described blob %q", des.BlobRef)
 		return
 	}
-	mime := ""
-	if fileinfo != nil && fileinfo.IsImage() {
-		mime = fileinfo.MIMEType
+	mimeType := ""
+	if fileinfo != nil {
+		if fileinfo.IsImage() || fileinfo.IsText() {
+			mimeType = fileinfo.MIMEType
+			if mimeType == "" {
+				mimeType = magic.MIMETypeByExtension(filepath.Ext(fileinfo.FileName))
+			}
+		}
 	}
 	dh := &server.DownloadHandler{
-		Fetcher:   pr.ph.cl,
-		Cache:     pr.ph.cache,
-		ForceMIME: mime,
+		Fetcher:   cacher.NewCachingFetcher(pr.ph.cache, pr.ph.cl),
+		ForceMIME: mimeType,
 	}
-	dh.ServeHTTP(pr.rw, pr.req, fileref)
+	dh.ServeFile(pr.rw, pr.req, fileref)
 }
 
 // Given a described blob, optionally follows a camliContent and
@@ -739,13 +977,14 @@ func (pr *publishRequest) fileSchemaRefFromBlob(des *search.DescribedBlob) (file
 func (pr *publishRequest) subjectHeader(described map[string]*search.DescribedBlob) *publish.PageHeader {
 	subdes := described[pr.subject.String()]
 	header := &publish.PageHeader{
-		Title:    html.EscapeString(getTitle(subdes.BlobRef, described)),
-		CSSFiles: pr.cssFiles(),
-		Meta: func() string {
-			jsonRes, _ := json.MarshalIndent(described, "", "  ")
-			return string(jsonRes)
-		}(),
-		Subject: pr.subject.String(),
+		Title:           html.EscapeString(getTitle(subdes.BlobRef, described)),
+		CSSFiles:        pr.cssFiles(),
+		JSDeps:          pr.jsDeps(),
+		Subject:         pr.subject,
+		Host:            pr.req.Host,
+		SubjectBasePath: pr.subjectBasePath,
+		PathPrefix:      pr.base,
+		PublishedRoot:   pr.publishedRoot,
 	}
 	return header
 }
@@ -753,6 +992,14 @@ func (pr *publishRequest) subjectHeader(described map[string]*search.DescribedBl
 func (pr *publishRequest) cssFiles() []string {
 	files := []string{}
 	for _, filename := range pr.ph.CSSFiles {
+		files = append(files, pr.staticPath(filename))
+	}
+	return files
+}
+
+func (pr *publishRequest) jsDeps() []string {
+	files := []string{}
+	for _, filename := range pr.ph.JSDeps {
 		files = append(files, pr.staticPath(filename))
 	}
 	return files
@@ -1006,4 +1253,19 @@ func (pr *publishRequest) serveZip() {
 		filename: filename,
 	}
 	zh.ServeHTTP(pr.rw, pr.req)
+}
+
+// roCertCacheDir is a read-only implementation of autocert.Cache.
+type roCertCacheDir string
+
+func (d roCertCacheDir) Get(ctx context.Context, key string) ([]byte, error) {
+	return autocert.DirCache(d).Get(ctx, key)
+}
+
+func (d roCertCacheDir) Put(ctx context.Context, key string, data []byte) error {
+	return nil
+}
+
+func (d roCertCacheDir) Delete(ctx context.Context, key string) error {
+	return nil
 }

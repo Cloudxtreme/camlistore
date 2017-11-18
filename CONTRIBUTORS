@@ -3,8 +3,7 @@
 # lists people.  For example, Google employees are listed here
 # but not in AUTHORS, because Google holds the copyright.
 #
-# http://code.google.com/legal/individual-cla-v1.0.html (electronic submission)
-# http://code.google.com/legal/corporate-cla-v1.0.html (requires FAX)
+# https://cla.developers.google.com/
 #
 # Note that the CLA isn't a copyright _assignment_ but rather a
 # copyright _license_.  You retain the copyright on your
@@ -36,6 +35,7 @@ Dan Kortschak <dan.kortschak@adelaide.edu.au>
 Daniel Coonce <danielcoonce@gmail.com>
 Daniel Dermott Bryan <danbryan@gmail.com>
 Daniel Erat <dan@erat.org>
+Daniel Heath <daniel@heath.cc>
 Daniel Pupius <dan.pupius@gmail.com>
 Dean Landolt <dean@deanlandolt.com>
 Dustin Sallings <dsallings@gmail.com>
@@ -68,6 +68,7 @@ Mathieu Lonjaret <mathieu.lonjaret@gmail.com>
 Matthieu Rakotojaona Rainimangavelo <matthieu.rakotojaona@gmail.com>
 Matt Jibson <matt.jibson@gmail.com>
 Maxime Lavigne <duguigne@gmail.com>
+Michael Morrissey <jersey@gmail.com>
 Michael Vincent Zuffoletti <mikezuff@gmail.com>
 Nick O'Neill <nick.oneill@gmail.com>
 Nico Weber <thakis@chromium.org>
@@ -85,10 +86,13 @@ Robert Obryk <robryk@gmail.com>
 Ryan Barrett <camlistore@ryanb.org>
 Salman Aljammaz <s@0x65.net>
 Sarath Lakshman <sarathlakshman@slynux.com>
+Stephen Searles <stephen.searles@gmail.com>
 Steve Phillips <elimisteve@gmail.com>
 Steven L. Speek <slspeek@gmail.com>
 Tamás Gulácsi <tgulacsi78@gmail.com>
+Tilman Dilo <tilman.dilo@gmail.com>
 Timo Truyts <alkaloid.btx@gmail.com>
 Tony Chang <tony@ponderer.org>
 Tony Scelfo <scelfo@tonyscelfo.com>
 Ulf Holm Nielsen <doktor@dyregod.dk>
+Will Norris <willnorris@google.com>

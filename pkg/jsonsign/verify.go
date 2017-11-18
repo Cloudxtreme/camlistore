@@ -28,8 +28,9 @@ import (
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/camerrors"
-	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/armor"
-	"camlistore.org/third_party/code.google.com/p/go.crypto/openpgp/packet"
+
+	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/packet"
 )
 
 const sigSeparator = `,"camliSig":"`

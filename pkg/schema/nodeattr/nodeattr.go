@@ -20,7 +20,7 @@ limitations under the License.
 // treats the special timezone offset -00:01 (one minute west of UTC)
 // as meaning that the local time was known, but the location or
 // timezone was not. Usually this is from EXIF files.
-package nodeattr
+package nodeattr // import "camlistore.org/pkg/schema/nodeattr"
 
 const (
 	// Type is the Camlistore permanode type ("camliNodeType").
@@ -53,6 +53,12 @@ const (
 	// 3339 format.
 	DatePublished = "datePublished"
 
+	// TODO(mpl): ask Brad what he wants. The original DueDate from the .py code (which is not in schema.org), or that.
+
+	// PaymentDueDate is http://schema.org/paymentDueDate in RFC
+	// 3339 format.
+	PaymentDueDate = "paymentDueDate"
+
 	// Title is http://schema.org/title
 	Title = "title"
 
@@ -71,6 +77,7 @@ const (
 	// as a city name, or a full postal address.
 	LocationText = "locationText"
 
+	Altitude  = "altitude"
 	Latitude  = "latitude"
 	Longitude = "longitude"
 
@@ -93,6 +100,12 @@ const (
 	// AddressCountry is http://schema.org/addressCountry
 	AddressCountry = "addressCountry"
 
+	// GivenName is http://schema.org/givenName
+	GivenName = "givenName"
+
+	// FamilyName is http://schema.org/familyName
+	FamilyName = "familyName"
+
 	// CamliPathOrderColon is the prefix "camliPathOrder:".
 	// The attribute key should be followed by a uint64. The attribute value
 	// is an existing value of a camliPath element.
@@ -103,4 +116,7 @@ const (
 	// DefaultVisibility is "camliDefVis", which affects the default
 	// visibility of the concerned permanode in the web UI.
 	DefaultVisibility = "camliDefVis"
+
+	// Version is http://schema.org/version
+	Version = "version"
 )

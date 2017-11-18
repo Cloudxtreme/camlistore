@@ -16,22 +16,23 @@ limitations under the License.
 
 // Package mongo provides an implementation of sorted.KeyValue
 // using MongoDB.
-package mongo
+package mongo // import "camlistore.org/pkg/sorted/mongo"
 
 import (
 	"bytes"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
 	"camlistore.org/pkg/sorted"
 	"go4.org/jsonconfig"
 
-	"camlistore.org/third_party/labix.org/v2/mgo"
-	"camlistore.org/third_party/labix.org/v2/mgo/bson"
+	"labix.org/v2/mgo"
+	"labix.org/v2/mgo/bson"
 )
 
-// We explicitely separate the key and the value in a document,
+// We explicitly separate the key and the value in a document,
 // instead of simply storing as key:value, to avoid problems
 // such as "." being an illegal char in a key name. Also because
 // there is no way to do partial matching for key names (one can
@@ -146,7 +147,8 @@ func (kv *keyValue) Find(start, end string) sorted.Iterator {
 
 func (kv *keyValue) Set(key, value string) error {
 	if err := sorted.CheckSizes(key, value); err != nil {
-		return err
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
+		return nil
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -191,12 +193,13 @@ func (kv *keyValue) CommitBatch(bm sorted.BatchMutation) error {
 	defer kv.mu.Unlock()
 	for _, m := range b.Mutations() {
 		if m.IsDelete() {
-			if err := kv.db.Remove(bson.M{mgoKey: m.Key()}); err != nil {
+			if err := kv.db.Remove(bson.M{mgoKey: m.Key()}); err != nil && err != mgo.ErrNotFound {
 				return err
 			}
 		} else {
 			if err := sorted.CheckSizes(m.Key(), m.Value()); err != nil {
-				return err
+				log.Printf("Skipping storing (%q:%q): %v", m.Key(), m.Value(), err)
+				continue
 			}
 			if _, err := kv.db.Upsert(&bson.M{mgoKey: m.Key()}, &bson.M{mgoKey: m.Key(), mgoValue: m.Value()}); err != nil {
 				return err

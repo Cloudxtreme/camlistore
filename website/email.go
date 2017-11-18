@@ -29,8 +29,8 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/datastore"
 	"golang.org/x/net/context"
-	"google.golang.org/cloud/datastore"
 
 	"camlistore.org/pkg/osutil"
 )
@@ -74,7 +74,7 @@ var knownCommit = map[string]bool{} // commit -> true
 var diffMarker = []byte("diff --git a/")
 
 func emailCommit(dir, hash string) (err error) {
-	cmd := execGit(dir, "show", hash)
+	cmd := execGit(dir, "show", nil, "show", hash)
 	body, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Error runnning git show: %v\n%s", err, body)
@@ -84,7 +84,7 @@ func emailCommit(dir, hash string) (err error) {
 		return nil
 	}
 
-	cmd = execGit(dir, "show", "--pretty=oneline", hash)
+	cmd = execGit(dir, "show_pretty", nil, "show", "--pretty=oneline", hash)
 	out, err := cmd.Output()
 	if err != nil {
 		return
@@ -97,8 +97,12 @@ func emailCommit(dir, hash string) (err error) {
 		subj = subj[:80]
 	}
 
+	if *smtpServer == "" {
+		return nil
+	}
 	cl, err := smtp.Dial(*smtpServer)
 	if err != nil {
+		log.Printf("Error connecting to SMTP server for sending commit e-mail: %v", err)
 		return
 	}
 	defer cl.Quit()
@@ -172,21 +176,30 @@ func commitEmailLoop() error {
 	}
 }
 
-func execGit(dir string, gitArgs ...string) *exec.Cmd {
+// execGit runs the git command with gitArgs. All the other arguments are only
+// relevant if *gitContainer, in which case we run in a docker container.
+func execGit(workdir string, containerName string, mounts map[string]string, gitArgs ...string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if *gitContainer {
-		args := append([]string{
+		removeContainer(containerName)
+		args := []string{
 			"run",
 			"--rm",
-			"-v", dir + ":" + dir,
-			"--workdir=" + dir,
+			"--name=" + containerName,
+		}
+		for host, container := range mounts {
+			args = append(args, "-v", host+":"+container+":ro")
+		}
+		args = append(args, []string{
+			"-v", workdir + ":" + workdir,
+			"--workdir=" + workdir,
 			"camlistore/git",
-			"git",
-		}, gitArgs...)
+			"git"}...)
+		args = append(args, gitArgs...)
 		cmd = exec.Command("docker", args...)
 	} else {
 		cmd = exec.Command("git", gitArgs...)
-		cmd.Dir = dir
+		cmd.Dir = workdir
 	}
 	return cmd
 }
@@ -198,13 +211,13 @@ type GitCommit struct {
 }
 
 func pollCommits(dir string) {
-	cmd := execGit(dir, "fetch", "origin")
+	cmd := execGit(dir, "pull_origin", nil, "pull", "origin")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Error running git fetch origin master in %s: %v\n%s", dir, err, out)
+		log.Printf("Error running git pull origin master in %s: %v\n%s", dir, err, out)
 		return
 	}
-	log.Printf("Ran git fetch.")
+	log.Printf("Ran git pull.")
 	// TODO: see if .git/refs/remotes/origin/master
 	// changed. (quicker than running recentCommits each time)
 
@@ -241,10 +254,15 @@ func pollCommits(dir string) {
 			}
 		}
 	}
+	if githubSSHKey != "" {
+		if err := syncToGithub(dir, hashes[0]); err != nil {
+			log.Printf("Failed to push commit %v to github: %v", hashes[0], err)
+		}
+	}
 }
 
 func recentCommits(dir string) (hashes []string, err error) {
-	cmd := execGit(dir, "log", "--since=1 month ago", "--pretty=oneline", "origin/master")
+	cmd := execGit(dir, "log_origin_master", nil, "log", "--since=1 month ago", "--pretty=oneline", "origin/master")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("Error running git log in %s: %v\n%s", dir, err, out)

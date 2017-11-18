@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"camlistore.org/pkg/blob"
@@ -32,6 +33,7 @@ import (
 	"camlistore.org/pkg/blobserver/localdisk"
 	"camlistore.org/pkg/client"
 	"camlistore.org/pkg/cmdmain"
+	"go4.org/syncutil"
 	"golang.org/x/net/context"
 )
 
@@ -42,15 +44,14 @@ type syncCmd struct {
 	srcKeyID  string // GPG public key ID of the source server, if supported.
 	destKeyID string // GPG public key ID of the destination server, if supported.
 
-	loop        bool
-	verbose     bool
-	all         bool
-	removeSrc   bool
-	wipe        bool
-	insecureTLS bool
-	oneIsDisk   bool // Whether one of src or dest is a local disk.
-
-	logger *log.Logger
+	loop           bool
+	all            bool
+	removeSrc      bool
+	wipe           bool
+	insecureTLS    bool
+	oneIsDisk      bool // Whether one of src or dest is a local disk.
+	concurrency    int  // max blobs to be copying at once
+	dumpConfigFlag bool
 }
 
 func init() {
@@ -61,14 +62,15 @@ func init() {
 		flags.StringVar(&cmd.third, "thirdleg", "", "Copy blobs present in source but missing from destination to this 'third leg' blob store, instead of the destination. (same format as src)")
 
 		flags.BoolVar(&cmd.loop, "loop", false, "Create an associate a new permanode for the uploaded file or directory.")
-		flags.BoolVar(&cmd.verbose, "verbose", false, "Be verbose.")
 		flags.BoolVar(&cmd.wipe, "wipe", false, "If dest is an index, drop it and repopulate it from scratch. NOOP for now.")
 		flags.BoolVar(&cmd.all, "all", false, "Discover all sync destinations configured on the source server and run them.")
+		flags.BoolVar(&cmd.dumpConfigFlag, "dump-config", false, "Discover all sync destinations configured on the source server and list them, but do nothing else.")
 		flags.BoolVar(&cmd.removeSrc, "removesrc", false, "Remove each blob from the source after syncing to the destination; for queue processing.")
 		// TODO(mpl): maybe move this flag up to the client pkg as an AddFlag, as it can be used by all commands.
 		if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); debug {
 			flags.BoolVar(&cmd.insecureTLS, "insecure", false, "If set, when using TLS, the server's certificates verification is disabled, and they are not checked against the trustedCerts in the client configuration either.")
 		}
+		flags.IntVar(&cmd.concurrency, "j", 10, "max number of blobs to be copying at once")
 
 		return cmd
 	})
@@ -93,8 +95,12 @@ func (c *syncCmd) RunCommand(args []string) error {
 	if c.loop && !c.removeSrc {
 		return cmdmain.UsageError("Can't use --loop without --removesrc")
 	}
-	if c.verbose {
-		c.logger = log.New(cmdmain.Stderr, "", 0) // else nil
+	if c.dumpConfigFlag {
+		err := c.dumpConfig()
+		if err != nil {
+			return fmt.Errorf("dumb-config failed: %v", err)
+		}
+		return nil
 	}
 	if c.all {
 		err := c.syncAll()
@@ -130,9 +136,7 @@ func (c *syncCmd) RunCommand(args []string) error {
 	for {
 		passNum++
 		stats, err := c.doPass(ss, ds, ts)
-		if c.verbose {
-			log.Printf("sync stats - pass: %d, blobs: %d, bytes %d\n", passNum, stats.BlobsCopied, stats.BytesCopied)
-		}
+		cmdmain.Logf("sync stats - pass: %d, blobs: %d, bytes %d\n", passNum, stats.BlobsCopied, stats.BytesCopied)
 		if err != nil {
 			return fmt.Errorf("sync failed: %v", err)
 		}
@@ -162,7 +166,6 @@ func (c *syncCmd) storageFromParam(which storageType, val string) (blobserver.St
 			return nil, nil
 		case storageSource:
 			discl := c.discoClient()
-			discl.SetLogger(c.logger)
 			src, err := discl.BlobRoot()
 			if err != nil {
 				return nil, fmt.Errorf("Failed to discover source server's blob path: %v", err)
@@ -192,7 +195,8 @@ func (c *syncCmd) storageFromParam(which storageType, val string) (blobserver.St
 	if err := cl.SetupAuth(); err != nil {
 		return nil, fmt.Errorf("could not setup auth for connecting to %v: %v", val, err)
 	}
-	cl.SetLogger(c.logger)
+	cl.Verbose = *cmdmain.FlagVerbose
+	cl.Logger = log.New(cmdmain.Stderr, "", log.LstdFlags)
 	serverKeyID, err := cl.ServerKeyID()
 	if err != nil && err != client.ErrNoSigning {
 		fmt.Fprintf(cmdmain.Stderr, "Failed to discover keyId for server %v: %v", val, err)
@@ -217,6 +221,29 @@ type SyncStats struct {
 	ErrorCount  int
 }
 
+func (c *syncCmd) dumpConfig() error {
+	if c.loop {
+		return cmdmain.UsageError("--dump-config can't be used with --loop")
+	}
+	if c.third != "" {
+		return cmdmain.UsageError("--dump-config can't be used with --thirdleg")
+	}
+	if c.dest != "" {
+		return cmdmain.UsageError("--dump-config can't be used with --dest")
+	}
+	dc := c.discoClient()
+	dc.Verbose = *cmdmain.FlagVerbose
+	dc.Logger = log.New(cmdmain.Stderr, "", log.LstdFlags)
+	syncHandlers, err := dc.SyncHandlers()
+	if err != nil {
+		return fmt.Errorf("sync handlers discovery failed: %v", err)
+	}
+	for _, sh := range syncHandlers {
+		fmt.Printf("%v -> %v\n", sh.From, sh.To)
+	}
+	return nil
+}
+
 func (c *syncCmd) syncAll() error {
 	if c.loop {
 		return cmdmain.UsageError("--all can't be used with --loop")
@@ -229,35 +256,30 @@ func (c *syncCmd) syncAll() error {
 	}
 
 	dc := c.discoClient()
-	dc.SetLogger(c.logger)
 	syncHandlers, err := dc.SyncHandlers()
 	if err != nil {
 		return fmt.Errorf("sync handlers discovery failed: %v", err)
 	}
-	if c.verbose {
-		log.Printf("To be synced:\n")
-		for _, sh := range syncHandlers {
-			log.Printf("%v -> %v", sh.From, sh.To)
-		}
+	cmdmain.Logf("To be synced:\n")
+	for _, sh := range syncHandlers {
+		cmdmain.Logf("%v -> %v", sh.From, sh.To)
 	}
 	for _, sh := range syncHandlers {
 		from := client.New(sh.From, client.OptionInsecure(c.insecureTLS))
-		from.SetLogger(c.logger)
+		from.Verbose = *cmdmain.FlagVerbose
+		from.Logger = log.New(cmdmain.Stderr, "", log.LstdFlags)
 		if err := from.SetupAuth(); err != nil {
 			return fmt.Errorf("could not setup auth for connecting to %v: %v", sh.From, err)
 		}
 		to := client.New(sh.To, client.OptionInsecure(c.insecureTLS))
-		to.SetLogger(c.logger)
+		to.Verbose = *cmdmain.FlagVerbose
+		to.Logger = log.New(cmdmain.Stderr, "", log.LstdFlags)
 		if err := to.SetupAuth(); err != nil {
 			return fmt.Errorf("could not setup auth for connecting to %v: %v", sh.To, err)
 		}
-		if c.verbose {
-			log.Printf("Now syncing: %v -> %v", sh.From, sh.To)
-		}
+		cmdmain.Logf("Now syncing: %v -> %v", sh.From, sh.To)
 		stats, err := c.doPass(from, to, nil)
-		if c.verbose {
-			log.Printf("sync stats, blobs: %d, bytes %d\n", stats.BlobsCopied, stats.BytesCopied)
-		}
+		cmdmain.Logf("sync stats, blobs: %d, bytes %d\n", stats.BlobsCopied, stats.BytesCopied)
 		if err != nil {
 			return err
 		}
@@ -271,7 +293,8 @@ func (c *syncCmd) syncAll() error {
 // the blobRoot and syncHandlers.
 func (c *syncCmd) discoClient() *client.Client {
 	cl := newClient(c.src, client.OptionInsecure(c.insecureTLS))
-	cl.SetLogger(c.logger)
+	cl.Verbose = *cmdmain.FlagVerbose
+	cl.Logger = log.New(cmdmain.Stderr, "", log.LstdFlags)
 	return cl
 }
 
@@ -301,6 +324,8 @@ func enumerateAllBlobs(ctx context.Context, s blobserver.Storage, destc chan<- b
 //     directly to dest. (sneakernet mode, copying to a portable drive
 //     and transporting thirdLeg to dest)
 func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStats, retErr error) {
+	var statsMu sync.Mutex // guards stats return value
+
 	srcBlobs := make(chan blob.SizedRef, 100)
 	destBlobs := make(chan blob.SizedRef, 100)
 	srcErr := make(chan error, 1)
@@ -348,15 +373,22 @@ func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStat
 	destNotHaveBlobs := make(chan blob.SizedRef)
 
 	readSrcBlobs := srcBlobs
-	if c.verbose {
+	if *cmdmain.FlagVerbose {
 		readSrcBlobs = loggingBlobRefChannel(srcBlobs)
 	}
 
 	mismatches := []blob.Ref{}
+
+	logErrorf := func(format string, args ...interface{}) {
+		log.Printf(format, args...)
+		statsMu.Lock()
+		stats.ErrorCount++
+		statsMu.Unlock()
+	}
+
 	onMismatch := func(br blob.Ref) {
 		// TODO(bradfitz): check both sides and repair, carefully.  For now, fail.
-		log.Printf("WARNING: blobref %v has differing sizes on source and dest", br)
-		stats.ErrorCount++
+		logErrorf("WARNING: blobref %v has differing sizes on source and dest", br)
 		mismatches = append(mismatches, br)
 	}
 
@@ -381,37 +413,47 @@ func (c *syncCmd) doPass(src, dest, thirdLeg blobserver.Storage) (stats SyncStat
 		firstHopDest = thirdLeg
 	}
 
+	var gate = syncutil.NewGate(c.concurrency)
+	var wg sync.WaitGroup
+
 	for sb := range syncBlobs {
-		fmt.Fprintf(cmdmain.Stdout, "Destination needs blob: %s\n", sb)
+		sb := sb
+		gate.Start()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer gate.Done()
+			fmt.Fprintf(cmdmain.Stdout, "Destination needs blob: %s\n", sb)
+			blobReader, size, err := src.Fetch(sb.Ref)
 
-		blobReader, size, err := src.Fetch(sb.Ref)
-		if err != nil {
-			stats.ErrorCount++
-			log.Printf("Error fetching %s: %v", sb.Ref, err)
-			continue
-		}
-		if size != sb.Size {
-			stats.ErrorCount++
-			log.Printf("Source blobserver's enumerate size of %d for blob %s doesn't match its Get size of %d",
-				sb.Size, sb.Ref, size)
-			continue
-		}
-
-		if _, err := blobserver.Receive(firstHopDest, sb.Ref, blobReader); err != nil {
-			stats.ErrorCount++
-			log.Printf("Upload of %s to destination blobserver failed: %v", sb.Ref, err)
-			continue
-		}
-		stats.BlobsCopied++
-		stats.BytesCopied += int64(size)
-
-		if c.removeSrc {
-			if err = src.RemoveBlobs([]blob.Ref{sb.Ref}); err != nil {
-				stats.ErrorCount++
-				log.Printf("Failed to delete %s from source: %v", sb.Ref, err)
+			if err != nil {
+				logErrorf("Error fetching %s: %v", sb.Ref, err)
+				return
 			}
-		}
+			if size != sb.Size {
+				logErrorf("Source blobserver's enumerate size of %d for blob %s doesn't match its Get size of %d",
+					sb.Size, sb.Ref, size)
+				return
+			}
+
+			_, err = blobserver.Receive(firstHopDest, sb.Ref, blobReader)
+			if err != nil {
+				logErrorf("Upload of %s to destination blobserver failed: %v", sb.Ref, err)
+				return
+			}
+			statsMu.Lock()
+			stats.BlobsCopied++
+			stats.BytesCopied += int64(size)
+			statsMu.Unlock()
+
+			if c.removeSrc {
+				if err := src.RemoveBlobs([]blob.Ref{sb.Ref}); err != nil {
+					logErrorf("Failed to delete %s from source: %v", sb.Ref, err)
+				}
+			}
+		}()
 	}
+	wg.Wait()
 
 	checkSourceError()
 	checkDestError()

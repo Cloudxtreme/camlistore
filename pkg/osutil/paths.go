@@ -215,6 +215,26 @@ func DefaultTLSKey() string {
 	return filepath.Join(CamliConfigDir(), "tls.key")
 }
 
+// RegisterLetsEncryptCacheFunc registers a func f to return the path to the
+// default Let's Encrypt cache.
+// It may skip by returning the empty string.
+func RegisterLetsEncryptCacheFunc(f func() string) {
+	letsEncryptCacheFuncs = append(letsEncryptCacheFuncs, f)
+}
+
+var letsEncryptCacheFuncs []func() string
+
+// DefaultLetsEncryptCache returns the path to the default Let's Encrypt cache
+// directory (or file, depending on the ACME implementation).
+func DefaultLetsEncryptCache() string {
+	for _, f := range letsEncryptCacheFuncs {
+		if v := f(); v != "" {
+			return v
+		}
+	}
+	return filepath.Join(CamliConfigDir(), "letsencrypt.cache")
+}
+
 // NewJSONConfigParser returns a jsonconfig.ConfigParser with its IncludeDirs
 // set with CamliConfigDir and the contents of CAMLI_INCLUDE_PATH.
 func NewJSONConfigParser() *jsonconfig.ConfigParser {

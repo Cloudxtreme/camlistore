@@ -19,7 +19,9 @@ limitations under the License.
 package fs
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -36,37 +38,43 @@ import (
 	"testing"
 	"time"
 
+	"bazil.org/fuse"
+	"bazil.org/fuse/syscallx"
 	"camlistore.org/pkg/test"
-	"camlistore.org/third_party/bazil.org/fuse/syscallx"
 )
 
 var (
-	errmu   sync.Mutex
-	lasterr error
+	errmu         sync.Mutex
+	osxFuseMarker string
 )
 
 func condSkip(t *testing.T) {
 	errmu.Lock()
 	defer errmu.Unlock()
-	if lasterr != nil {
-		t.Skipf("Skipping test; some other test already failed.")
-	}
 	if !(runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
 		t.Skipf("Skipping test on OS %q", runtime.GOOS)
 	}
 	if runtime.GOOS == "darwin" {
-		_, err := os.Stat("/Library/Filesystems/osxfusefs.fs/Support/mount_osxfusefs")
-		if os.IsNotExist(err) {
-			test.DependencyErrorOrSkip(t)
-		} else if err != nil {
+		// TODO: simplify if/when bazil drops 2.x support.
+		_, err := os.Stat(fuse.OSXFUSELocationV3.Mount)
+		if err == nil {
+			osxFuseMarker = "cammount@osxfuse"
+			return
+		}
+		if !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
-	}
-}
-
-func brokenTest(t *testing.T) {
-	if v, _ := strconv.ParseBool(os.Getenv("RUN_BROKEN_TESTS")); !v {
-		t.Skipf("Skipping broken tests without RUN_BROKEN_TESTS=1")
+		_, err = os.Stat(fuse.OSXFUSELocationV2.Mount)
+		if err == nil {
+			osxFuseMarker = "mount_osxfusefs@"
+			// TODO(mpl): add a similar check/warning to pkg/fs or cammount.
+			t.Log("OSXFUSE version 2.x detected. Please consider upgrading to v 3.x.")
+			return
+		}
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		test.DependencyErrorOrSkip(t)
 	}
 }
 
@@ -171,7 +179,7 @@ func cammountTest(t *testing.T, fn func(env *mountEnv)) {
 		case err := <-waitc:
 			log.Printf("cammount exited: %v", err)
 		}
-		if !test.WaitFor(not(dirToBeFUSE(mountPoint)), 5*time.Second, 1*time.Second) {
+		if !test.WaitFor(not(isMounted(mountPoint)), 5*time.Second, 1*time.Second) {
 			// It didn't unmount. Try again.
 			Unmount(mountPoint)
 		}
@@ -408,6 +416,61 @@ func TestRename(t *testing.T) {
 		}
 		if got, want := statStr(name3), reg; got != want {
 			t.Errorf("name3 = %q; want %q", got, want)
+		}
+	})
+}
+
+func TestMoveAt(t *testing.T) {
+	condSkip(t)
+	var beforeTime, afterTime time.Time
+	oldName := filepath.FromSlash("1/1/1")
+	newDir := filepath.FromSlash("2/1")
+	newName := filepath.Join(newDir, "1")
+	inEmptyMutDir(t, func(env *mountEnv, rootDir string) {
+		name1 := filepath.Join(rootDir, oldName)
+		name2 := filepath.Join(rootDir, newName)
+
+		if err := os.MkdirAll(name1, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(rootDir, newDir), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(time.Second)
+		beforeTime = time.Now()
+		time.Sleep(time.Second)
+
+		if err := os.Rename(name1, name2); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(name2); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(time.Second)
+		afterTime = time.Now()
+	})
+	cammountTest(t, func(env *mountEnv) {
+		atPrefix := filepath.Join(env.mountPoint, "at")
+		testname := strings.Split(testName(), ".")[0]
+
+		beforeName := filepath.Join(beforeTime.Format(time.RFC3339), testname, oldName)
+		notYetExistName := filepath.Join(beforeTime.Format(time.RFC3339), testname, newName)
+		afterName := filepath.Join(afterTime.Format(time.RFC3339), testname, newName)
+		goneName := filepath.Join(afterTime.Format(time.RFC3339), testname, oldName)
+
+		if _, err := os.Stat(filepath.Join(atPrefix, beforeName)); err != nil {
+			t.Errorf("%v before; want found, got not found; err: %v", beforeName, err)
+		}
+		if _, err := os.Stat(filepath.Join(atPrefix, notYetExistName)); !os.IsNotExist(err) {
+			t.Errorf("%v before; want not found, got found; err: %v", notYetExistName, err)
+		}
+		if _, err := os.Stat(filepath.Join(atPrefix, afterName)); err != nil {
+			t.Errorf("%v after; want found, got not found; err: %v", afterName, err)
+		}
+		if _, err := os.Stat(filepath.Join(atPrefix, goneName)); !os.IsNotExist(err) {
+			t.Errorf("%v after; want not found, got found; err: %v", goneName, err)
 		}
 	})
 }
@@ -657,6 +720,49 @@ func not(cond func() bool) func() bool {
 	}
 }
 
+// isInProcMounts returns whether dir is found as a mount point of /dev/fuse in
+// /proc/mounts. It does not guarantee the dir is usable as such, as it could have
+// been left unmounted by a previously interrupted process ("transport endpoint is
+// not connected" error).
+func isInProcMounts(dir string) (error, bool) {
+	if runtime.GOOS != "linux" {
+		return errors.New("only available on linux"), false
+	}
+	data, err := ioutil.ReadFile("/proc/mounts")
+	if err != nil {
+		return err, false
+	}
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	dir = strings.TrimSuffix(dir, "/")
+	for sc.Scan() {
+		l := sc.Text()
+		if !strings.HasPrefix(l, "/dev/fuse") {
+			continue
+		}
+		if strings.Fields(l)[1] == dir {
+			return nil, true
+		}
+	}
+	return sc.Err(), false
+}
+
+// isMounted returns whether dir is considered mounted as far as the filesystem
+// is concerned, when one needs to know whether to unmount dir. It does not
+// guarantee the dir is usable as such, as it could have been left unmounted by a
+// previously interrupted process.
+func isMounted(dir string) func() bool {
+	if runtime.GOOS == "darwin" {
+		return dirToBeFUSE(dir)
+	}
+	return func() bool {
+		err, ok := isInProcMounts(dir)
+		if err != nil {
+			log.Print(err)
+		}
+		return ok
+	}
+}
+
 func dirToBeFUSE(dir string) func() bool {
 	return func() bool {
 		out, err := exec.Command("df", dir).CombinedOutput()
@@ -664,10 +770,7 @@ func dirToBeFUSE(dir string) func() bool {
 			return false
 		}
 		if runtime.GOOS == "darwin" {
-			if strings.Contains(string(out), "mount_osxfusefs@") {
-				return true
-			}
-			return false
+			return strings.Contains(string(out), osxFuseMarker)
 		}
 		if runtime.GOOS == "linux" {
 			return strings.Contains(string(out), "/dev/fuse") &&

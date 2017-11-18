@@ -39,8 +39,9 @@ import (
 	"camlistore.org/pkg/fs"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/search"
-	"camlistore.org/third_party/bazil.org/fuse"
-	fusefs "camlistore.org/third_party/bazil.org/fuse/fs"
+
+	"bazil.org/fuse"
+	fusefs "bazil.org/fuse/fs"
 )
 
 var (
@@ -56,6 +57,12 @@ func usage() {
 	os.Exit(2)
 }
 
+func init() {
+	// So we can simply use log.Printf and log.Fatalf.
+	// For logging that depends on verbosity (cmdmain.FlagVerbose), use cmdmain.Logf/Printf.
+	log.SetOutput(cmdmain.Stderr)
+}
+
 func main() {
 	var conn *fuse.Conn
 
@@ -67,6 +74,10 @@ func main() {
 	if *cmdmain.FlagLegal {
 		cmdmain.PrintLicenses()
 		return
+	}
+
+	if *cmdmain.FlagHelp {
+		usage()
 	}
 
 	narg := flag.NArg()
@@ -162,7 +173,7 @@ func main() {
 
 	conn, err = fuse.Mount(mountPoint, fuse.VolumeName(filepath.Base(mountPoint)))
 	if err != nil {
-		if err.Error() == "cannot find load_fusefs" && runtime.GOOS == "darwin" {
+		if err == fuse.ErrOSXFUSENotFound {
 			log.Fatal("FUSE not available; install from http://osxfuse.github.io/")
 		}
 		log.Fatalf("Mount: %v", err)

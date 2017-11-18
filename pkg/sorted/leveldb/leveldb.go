@@ -17,11 +17,12 @@ limitations under the License.
 // Package leveldb provides an implementation of sorted.KeyValue
 // on top of a single mutable database file on disk using
 // github.com/syndtr/goleveldb.
-package leveldb
+package leveldb // import "camlistore.org/pkg/sorted/leveldb"
 
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 
@@ -29,11 +30,11 @@ import (
 	"camlistore.org/pkg/sorted"
 	"go4.org/jsonconfig"
 
-	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb"
-	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/filter"
-	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/iterator"
-	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/opt"
-	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/filter"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 var _ sorted.Wiper = (*kvis)(nil)
@@ -43,7 +44,7 @@ func init() {
 }
 
 // NewStorage is a convenience that calls newKeyValueFromJSONConfig
-// with file as the leveldb storage file.
+// with file as the leveldb storage directory.
 func NewStorage(file string) (sorted.KeyValue, error) {
 	return newKeyValueFromJSONConfig(jsonconfig.Obj{"file": file})
 }
@@ -91,7 +92,6 @@ type kvis struct {
 	opts      *opt.Options
 	readOpts  *opt.ReadOptions
 	writeOpts *opt.WriteOptions
-	txmu      sync.Mutex
 }
 
 func (is *kvis) Get(key string) (string, error) {
@@ -110,7 +110,8 @@ func (is *kvis) Get(key string) (string, error) {
 
 func (is *kvis) Set(key, value string) error {
 	if err := sorted.CheckSizes(key, value); err != nil {
-		return err
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
+		return nil
 	}
 	return is.db.Put([]byte(key), []byte(value), is.writeOpts)
 }
@@ -173,11 +174,7 @@ func (lvb *lvbatch) Set(key, value string) {
 		return
 	}
 	if err := sorted.CheckSizes(key, value); err != nil {
-		if err == sorted.ErrKeyTooLarge {
-			lvb.err = fmt.Errorf("%v: %v", err, key)
-		} else {
-			lvb.err = fmt.Errorf("%v: %v", err, value)
-		}
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
 		return
 	}
 	lvb.batch.Put([]byte(key), []byte(value))
@@ -207,17 +204,17 @@ func (is *kvis) Close() error {
 type iter struct {
 	it iterator.Iterator
 
-	key, val   []byte
 	skey, sval *string // for caching string values
 
-	err    error
+	// closed is not strictly necessary, but helps us detect programmer
+	// errors like calling Next on a Closed iterator (which panics).
 	closed bool
 }
 
 func (it *iter) Close() error {
 	it.closed = true
 	it.it.Release()
-	return nil
+	return it.it.Error()
 }
 
 func (it *iter) KeyBytes() []byte {
@@ -247,11 +244,8 @@ func (it *iter) Value() string {
 }
 
 func (it *iter) Next() bool {
-	if err := it.it.Error(); err != nil {
-		return false
-	}
 	if it.closed {
-		panic("Next called after Next returned value")
+		panic("Next called on closed iterator")
 	}
 	it.skey, it.sval = nil, nil
 	return it.it.Next()

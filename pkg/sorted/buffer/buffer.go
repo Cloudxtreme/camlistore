@@ -18,10 +18,11 @@ limitations under the License.
 // buffers one KeyValue implementation in front of an another. It's
 // used for cases such as reindexing where you need a KeyValue but it
 // doesn't need to be flushed and consistent until the end.
-package buffer
+package buffer // import "camlistore.org/pkg/sorted/buffer"
 
 import (
 	"fmt"
+	"log"
 	"sync"
 
 	"camlistore.org/pkg/sorted"
@@ -101,7 +102,8 @@ func (kv *KeyValue) Get(key string) (string, error) {
 
 func (kv *KeyValue) Set(key, value string) error {
 	if err := sorted.CheckSizes(key, value); err != nil {
-		return err
+		log.Printf("Skipping storing (%q:%q): %v", key, value, err)
+		return nil
 	}
 	kv.mu.RLock()
 	err := kv.buf.Set(key, value)
@@ -163,7 +165,8 @@ func (kv *KeyValue) CommitBatch(bm sorted.BatchMutation) error {
 			continue
 		} else {
 			if err := sorted.CheckSizes(m.key, m.value); err != nil {
-				return err
+				log.Printf("Skipping storing (%q:%q): %v", m.key, m.value, err)
+				continue
 			}
 		}
 		bmbuf.Set(m.key, m.value)

@@ -7,10 +7,11 @@
 			"handler": "root",
 			"handlerArgs": {
 				"blobRoot": "/bs-and-maybe-also-index/",
-				"jsonSignRoot": "/sighelper/",
 				"helpRoot": "/help/",
+				"jsonSignRoot": "/sighelper/",
 				"ownerName": "Alice",
 				"searchRoot": "/my-search/",
+				"shareRoot": "/share/",
 				"statusRoot": "/status/",
 				"stealth": false
 			}
@@ -77,7 +78,8 @@
 		"/share/": {
 			"handler": "share",
 			"handlerArgs": {
-				"blobRoot": "/bs/"
+				"blobRoot": "/bs/",
+				"index": "/index/"
 			}
 		},
 		"/sighelper/": {

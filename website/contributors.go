@@ -100,7 +100,7 @@ func gitShortlog() *exec.Cmd {
 }
 
 func genContribPage() ([]byte, error) {
-	contribHTML := readTemplate("contrib.html")
+	contribHTML := readTemplate("contributors.html")
 
 	// The same committers could've authored commits with different emails/usersnames.
 	// We index the authors by name and by email to try and merge graphs connected by
@@ -186,7 +186,10 @@ func contribHandler() http.HandlerFunc {
 	if m := h1TitlePattern.FindSubmatch(c); len(m) > 1 {
 		title = string(m[1])
 	}
-	return func(rw http.ResponseWriter, req *http.Request) {
-		servePage(rw, title, "", c)
+	return func(w http.ResponseWriter, r *http.Request) {
+		servePage(w, pageParams{
+			title:   title,
+			content: c,
+		})
 	}
 }

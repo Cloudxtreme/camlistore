@@ -169,12 +169,20 @@ type File struct {
 	// server regardless of whether the field is empty or not. This may be
 	// used to include empty fields in Patch requests.
 	ForceSendFields []string `json:"-"`
+
+	// NullFields is a list of field names (e.g. "CreatedDate") to include
+	// in API requests with the JSON null value. By default, fields with
+	// empty values are omitted from API requests. However, any field with
+	// an empty value appearing in NullFields will be sent to the server as
+	// null. It is an error if a field in this list has a non-empty value.
+	// This may be used to include null fields in Patch requests.
+	NullFields []string `json:"-"`
 }
 
 func (s *File) MarshalJSON() ([]byte, error) {
 	type noMethod File
 	raw := noMethod(*s)
-	return gensupport.MarshalJSON(raw, s.ForceSendFields)
+	return gensupport.MarshalJSON(raw, s.ForceSendFields, s.NullFields)
 }
 
 // FileIndexableText: Indexable text attributes for the file (can only
@@ -190,12 +198,20 @@ type FileIndexableText struct {
 	// server regardless of whether the field is empty or not. This may be
 	// used to include empty fields in Patch requests.
 	ForceSendFields []string `json:"-"`
+
+	// NullFields is a list of field names (e.g. "Text") to include in API
+	// requests with the JSON null value. By default, fields with empty
+	// values are omitted from API requests. However, any field with an
+	// empty value appearing in NullFields will be sent to the server as
+	// null. It is an error if a field in this list has a non-empty value.
+	// This may be used to include null fields in Patch requests.
+	NullFields []string `json:"-"`
 }
 
 func (s *FileIndexableText) MarshalJSON() ([]byte, error) {
 	type noMethod FileIndexableText
 	raw := noMethod(*s)
-	return gensupport.MarshalJSON(raw, s.ForceSendFields)
+	return gensupport.MarshalJSON(raw, s.ForceSendFields, s.NullFields)
 }
 
 // FileLabels: Labels for the file.
@@ -216,12 +232,20 @@ type FileLabels struct {
 	// server regardless of whether the field is empty or not. This may be
 	// used to include empty fields in Patch requests.
 	ForceSendFields []string `json:"-"`
+
+	// NullFields is a list of field names (e.g. "Hidden") to include in API
+	// requests with the JSON null value. By default, fields with empty
+	// values are omitted from API requests. However, any field with an
+	// empty value appearing in NullFields will be sent to the server as
+	// null. It is an error if a field in this list has a non-empty value.
+	// This may be used to include null fields in Patch requests.
+	NullFields []string `json:"-"`
 }
 
 func (s *FileLabels) MarshalJSON() ([]byte, error) {
 	type noMethod FileLabels
 	raw := noMethod(*s)
-	return gensupport.MarshalJSON(raw, s.ForceSendFields)
+	return gensupport.MarshalJSON(raw, s.ForceSendFields, s.NullFields)
 }
 
 type FileParentsCollection struct {
@@ -238,12 +262,20 @@ type FileParentsCollection struct {
 	// server regardless of whether the field is empty or not. This may be
 	// used to include empty fields in Patch requests.
 	ForceSendFields []string `json:"-"`
+
+	// NullFields is a list of field names (e.g. "Id") to include in API
+	// requests with the JSON null value. By default, fields with empty
+	// values are omitted from API requests. However, any field with an
+	// empty value appearing in NullFields will be sent to the server as
+	// null. It is an error if a field in this list has a non-empty value.
+	// This may be used to include null fields in Patch requests.
+	NullFields []string `json:"-"`
 }
 
 func (s *FileParentsCollection) MarshalJSON() ([]byte, error) {
 	type noMethod FileParentsCollection
 	raw := noMethod(*s)
-	return gensupport.MarshalJSON(raw, s.ForceSendFields)
+	return gensupport.MarshalJSON(raw, s.ForceSendFields, s.NullFields)
 }
 
 // Permission: A single permission for a file.
@@ -271,12 +303,21 @@ type Permission struct {
 	// server regardless of whether the field is empty or not. This may be
 	// used to include empty fields in Patch requests.
 	ForceSendFields []string `json:"-"`
+
+	// NullFields is a list of field names (e.g. "AdditionalRoles") to
+	// include in API requests with the JSON null value. By default, fields
+	// with empty values are omitted from API requests. However, any field
+	// with an empty value appearing in NullFields will be sent to the
+	// server as null. It is an error if a field in this list has a
+	// non-empty value. This may be used to include null fields in Patch
+	// requests.
+	NullFields []string `json:"-"`
 }
 
 func (s *Permission) MarshalJSON() ([]byte, error) {
 	type noMethod Permission
 	raw := noMethod(*s)
-	return gensupport.MarshalJSON(raw, s.ForceSendFields)
+	return gensupport.MarshalJSON(raw, s.ForceSendFields, s.NullFields)
 }
 
 // method id "drive.files.get":
@@ -342,22 +383,21 @@ func (c *FilesGetCall) Context(ctx context.Context) *FilesGetCall {
 }
 
 func (c *FilesGetCall) doRequest(alt string) (*http.Response, error) {
+	reqHeaders := make(http.Header)
+	reqHeaders.Set("User-Agent", c.s.userAgent())
+	if c.ifNoneMatch_ != "" {
+		reqHeaders.Set("If-None-Match", c.ifNoneMatch_)
+	}
 	var body io.Reader = nil
 	c.urlParams_.Set("alt", alt)
 	urls := googleapi.ResolveRelative(c.s.BasePath, "files/{id}")
 	urls += "?" + c.urlParams_.Encode()
 	req, _ := http.NewRequest("GET", urls, body)
+	req.Header = reqHeaders
 	googleapi.Expand(req.URL, map[string]string{
 		"id": c.id,
 	})
-	req.Header.Set("User-Agent", c.s.userAgent())
-	if c.ifNoneMatch_ != "" {
-		req.Header.Set("If-None-Match", c.ifNoneMatch_)
-	}
-	if c.ctx_ != nil {
-		return ctxhttp.Do(c.ctx_, c.s.client, req)
-	}
-	return c.s.client.Do(req)
+	return gensupport.SendRequest(c.ctx_, c.s.client, req)
 }
 
 // Do executes the "drive.files.get" call.
@@ -367,7 +407,8 @@ func (c *FilesGetCall) doRequest(alt string) (*http.Response, error) {
 // error.(*googleapi.Error).Header. Use googleapi.IsNotModified to check
 // whether the returned error was because http.StatusNotModified was
 // returned.
-func (c *FilesGetCall) Do() (*File, error) {
+func (c *FilesGetCall) Do(opts ...googleapi.CallOption) (*File, error) {
+	gensupport.SetOptions(c.urlParams_, opts...)
 	res, err := c.doRequest("json")
 	if res != nil && res.StatusCode == http.StatusNotModified {
 		if res.Body != nil {
@@ -391,7 +432,8 @@ func (c *FilesGetCall) Do() (*File, error) {
 			HTTPStatusCode: res.StatusCode,
 		},
 	}
-	if err := json.NewDecoder(res.Body).Decode(&ret); err != nil {
+	target := &ret
+	if err := json.NewDecoder(res.Body).Decode(target); err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -447,9 +489,9 @@ type FilesInsertCall struct {
 	file             *File
 	urlParams_       gensupport.URLParams
 	media_           io.Reader
-	resumable_       googleapi.SizeReaderAt
+	mediaBuffer_     *gensupport.MediaBuffer
 	mediaType_       string
-	protocol_        string
+	mediaSize_       int64 // mediaSize, if known.  Used only for calls to progressUpdater_.
 	progressUpdater_ googleapi.ProgressUpdater
 	ctx_             context.Context
 }
@@ -462,25 +504,40 @@ func (r *FilesService) Insert(file *File) *FilesInsertCall {
 	return c
 }
 
-// Media specifies the media to upload in a single chunk. At most one of
-// Media and ResumableMedia may be set.
-func (c *FilesInsertCall) Media(r io.Reader) *FilesInsertCall {
-	c.media_ = r
-	c.protocol_ = "multipart"
+// Media specifies the media to upload in one or more chunks. The chunk
+// size may be controlled by supplying a MediaOption generated by
+// googleapi.ChunkSize. The chunk size defaults to
+// googleapi.DefaultUploadChunkSize.The Content-Type header used in the
+// upload request will be determined by sniffing the contents of r,
+// unless a MediaOption generated by googleapi.ContentType is
+// supplied.
+// At most one of Media and ResumableMedia may be set.
+func (c *FilesInsertCall) Media(r io.Reader, options ...googleapi.MediaOption) *FilesInsertCall {
+	opts := googleapi.ProcessMediaOptions(options)
+	chunkSize := opts.ChunkSize
+	if !opts.ForceEmptyContentType {
+		r, c.mediaType_ = gensupport.DetermineContentType(r, opts.ContentType)
+	}
+	c.media_, c.mediaBuffer_ = gensupport.PrepareUpload(r, chunkSize)
 	return c
 }
 
 // ResumableMedia specifies the media to upload in chunks and can be
-// canceled with ctx. At most one of Media and ResumableMedia may be
-// set. mediaType identifies the MIME media type of the upload, such as
-// "image/png". If mediaType is "", it will be auto-detected. The
-// provided ctx will supersede any context previously provided to the
-// Context method.
+// canceled with ctx.
+//
+// Deprecated: use Media instead.
+//
+// At most one of Media and ResumableMedia may be set. mediaType
+// identifies the MIME media type of the upload, such as "image/png". If
+// mediaType is "", it will be auto-detected. The provided ctx will
+// supersede any context previously provided to the Context method.
 func (c *FilesInsertCall) ResumableMedia(ctx context.Context, r io.ReaderAt, size int64, mediaType string) *FilesInsertCall {
 	c.ctx_ = ctx
-	c.resumable_ = io.NewSectionReader(r, 0, size)
-	c.mediaType_ = mediaType
-	c.protocol_ = "resumable"
+	rdr := gensupport.ReaderAtToReader(r, size)
+	rdr, c.mediaType_ = gensupport.DetermineContentType(rdr, mediaType)
+	c.mediaBuffer_ = gensupport.NewMediaBuffer(rdr, googleapi.DefaultUploadChunkSize)
+	c.media_ = nil
+	c.mediaSize_ = size
 	return c
 }
 
@@ -512,42 +569,41 @@ func (c *FilesInsertCall) Context(ctx context.Context) *FilesInsertCall {
 }
 
 func (c *FilesInsertCall) doRequest(alt string) (*http.Response, error) {
+	reqHeaders := make(http.Header)
+	reqHeaders.Set("User-Agent", c.s.userAgent())
 	var body io.Reader = nil
 	body, err := googleapi.WithoutDataWrapper.JSONReader(c.file)
 	if err != nil {
 		return nil, err
 	}
-	ctype := "application/json"
+	reqHeaders.Set("Content-Type", "application/json")
 	c.urlParams_.Set("alt", alt)
 	urls := googleapi.ResolveRelative(c.s.BasePath, "files")
-	if c.media_ != nil || c.resumable_ != nil {
+	if c.media_ != nil || c.mediaBuffer_ != nil {
 		urls = strings.Replace(urls, "https://www.googleapis.com/", "https://www.googleapis.com/upload/", 1)
-		c.urlParams_.Set("uploadType", c.protocol_)
+		protocol := "multipart"
+		if c.mediaBuffer_ != nil {
+			protocol = "resumable"
+		}
+		c.urlParams_.Set("uploadType", protocol)
+	}
+	if body == nil {
+		body = new(bytes.Buffer)
+		reqHeaders.Set("Content-Type", "application/json")
+	}
+	if c.media_ != nil {
+		combined, ctype := gensupport.CombineBodyMedia(body, "application/json", c.media_, c.mediaType_)
+		defer combined.Close()
+		reqHeaders.Set("Content-Type", ctype)
+		body = combined
+	}
+	if c.mediaBuffer_ != nil && c.mediaType_ != "" {
+		reqHeaders.Set("X-Upload-Content-Type", c.mediaType_)
 	}
 	urls += "?" + c.urlParams_.Encode()
-	if c.protocol_ != "resumable" {
-		var cancel func()
-		cancel, _ = googleapi.ConditionallyIncludeMedia(c.media_, &body, &ctype)
-		if cancel != nil {
-			defer cancel()
-		}
-	}
 	req, _ := http.NewRequest("POST", urls, body)
-	googleapi.SetOpaque(req.URL)
-	if c.protocol_ == "resumable" {
-		if c.mediaType_ == "" {
-			c.mediaType_ = googleapi.DetectMediaType(c.resumable_)
-		}
-		req.Header.Set("X-Upload-Content-Type", c.mediaType_)
-		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	} else {
-		req.Header.Set("Content-Type", ctype)
-	}
-	req.Header.Set("User-Agent", c.s.userAgent())
-	if c.ctx_ != nil {
-		return ctxhttp.Do(c.ctx_, c.s.client, req)
-	}
-	return c.s.client.Do(req)
+	req.Header = reqHeaders
+	return gensupport.SendRequest(c.ctx_, c.s.client, req)
 }
 
 // Do executes the "drive.files.insert" call.
@@ -557,7 +613,8 @@ func (c *FilesInsertCall) doRequest(alt string) (*http.Response, error) {
 // error.(*googleapi.Error).Header. Use googleapi.IsNotModified to check
 // whether the returned error was because http.StatusNotModified was
 // returned.
-func (c *FilesInsertCall) Do() (*File, error) {
+func (c *FilesInsertCall) Do(opts ...googleapi.CallOption) (*File, error) {
+	gensupport.SetOptions(c.urlParams_, opts...)
 	res, err := c.doRequest("json")
 	if res != nil && res.StatusCode == http.StatusNotModified {
 		if res.Body != nil {
@@ -575,22 +632,32 @@ func (c *FilesInsertCall) Do() (*File, error) {
 	if err := googleapi.CheckResponse(res); err != nil {
 		return nil, err
 	}
-	if c.protocol_ == "resumable" {
+	if c.mediaBuffer_ != nil {
 		loc := res.Header.Get("Location")
-		rx := &googleapi.ResumableUpload{
-			Client:        c.s.client,
-			UserAgent:     c.s.userAgent(),
-			URI:           loc,
-			Media:         c.resumable_,
-			MediaType:     c.mediaType_,
-			ContentLength: c.resumable_.Size(),
-			Callback:      c.progressUpdater_,
+		rx := &gensupport.ResumableUpload{
+			Client:    c.s.client,
+			UserAgent: c.s.userAgent(),
+			URI:       loc,
+			Media:     c.mediaBuffer_,
+			MediaType: c.mediaType_,
+			Callback: func(curr int64) {
+				if c.progressUpdater_ != nil {
+					c.progressUpdater_(curr, c.mediaSize_)
+				}
+			},
 		}
-		res, err = rx.Upload(c.ctx_)
+		ctx := c.ctx_
+		if ctx == nil {
+			ctx = context.TODO()
+		}
+		res, err = rx.Upload(ctx)
 		if err != nil {
 			return nil, err
 		}
 		defer res.Body.Close()
+		if err := googleapi.CheckResponse(res); err != nil {
+			return nil, err
+		}
 	}
 	ret := &File{
 		ServerResponse: googleapi.ServerResponse{
@@ -598,7 +665,8 @@ func (c *FilesInsertCall) Do() (*File, error) {
 			HTTPStatusCode: res.StatusCode,
 		},
 	}
-	if err := json.NewDecoder(res.Body).Decode(&ret); err != nil {
+	target := &ret
+	if err := json.NewDecoder(res.Body).Decode(target); err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -703,25 +771,23 @@ func (c *FilesPatchCall) Context(ctx context.Context) *FilesPatchCall {
 }
 
 func (c *FilesPatchCall) doRequest(alt string) (*http.Response, error) {
+	reqHeaders := make(http.Header)
+	reqHeaders.Set("User-Agent", c.s.userAgent())
 	var body io.Reader = nil
 	body, err := googleapi.WithoutDataWrapper.JSONReader(c.file)
 	if err != nil {
 		return nil, err
 	}
-	ctype := "application/json"
+	reqHeaders.Set("Content-Type", "application/json")
 	c.urlParams_.Set("alt", alt)
 	urls := googleapi.ResolveRelative(c.s.BasePath, "files/{id}")
 	urls += "?" + c.urlParams_.Encode()
 	req, _ := http.NewRequest("PATCH", urls, body)
+	req.Header = reqHeaders
 	googleapi.Expand(req.URL, map[string]string{
 		"id": c.id,
 	})
-	req.Header.Set("Content-Type", ctype)
-	req.Header.Set("User-Agent", c.s.userAgent())
-	if c.ctx_ != nil {
-		return ctxhttp.Do(c.ctx_, c.s.client, req)
-	}
-	return c.s.client.Do(req)
+	return gensupport.SendRequest(c.ctx_, c.s.client, req)
 }
 
 // Do executes the "drive.files.patch" call.
@@ -731,7 +797,8 @@ func (c *FilesPatchCall) doRequest(alt string) (*http.Response, error) {
 // error.(*googleapi.Error).Header. Use googleapi.IsNotModified to check
 // whether the returned error was because http.StatusNotModified was
 // returned.
-func (c *FilesPatchCall) Do() (*File, error) {
+func (c *FilesPatchCall) Do(opts ...googleapi.CallOption) (*File, error) {
+	gensupport.SetOptions(c.urlParams_, opts...)
 	res, err := c.doRequest("json")
 	if res != nil && res.StatusCode == http.StatusNotModified {
 		if res.Body != nil {
@@ -755,7 +822,8 @@ func (c *FilesPatchCall) Do() (*File, error) {
 			HTTPStatusCode: res.StatusCode,
 		},
 	}
-	if err := json.NewDecoder(res.Body).Decode(&ret); err != nil {
+	target := &ret
+	if err := json.NewDecoder(res.Body).Decode(target); err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -814,9 +882,9 @@ type FilesUpdateCall struct {
 	file             *File
 	urlParams_       gensupport.URLParams
 	media_           io.Reader
-	resumable_       googleapi.SizeReaderAt
+	mediaBuffer_     *gensupport.MediaBuffer
 	mediaType_       string
-	protocol_        string
+	mediaSize_       int64 // mediaSize, if known.  Used only for calls to progressUpdater_.
 	progressUpdater_ googleapi.ProgressUpdater
 	ctx_             context.Context
 }
@@ -859,25 +927,40 @@ func (c *FilesUpdateCall) UpdateViewedDate(updateViewedDate bool) *FilesUpdateCa
 	return c
 }
 
-// Media specifies the media to upload in a single chunk. At most one of
-// Media and ResumableMedia may be set.
-func (c *FilesUpdateCall) Media(r io.Reader) *FilesUpdateCall {
-	c.media_ = r
-	c.protocol_ = "multipart"
+// Media specifies the media to upload in one or more chunks. The chunk
+// size may be controlled by supplying a MediaOption generated by
+// googleapi.ChunkSize. The chunk size defaults to
+// googleapi.DefaultUploadChunkSize.The Content-Type header used in the
+// upload request will be determined by sniffing the contents of r,
+// unless a MediaOption generated by googleapi.ContentType is
+// supplied.
+// At most one of Media and ResumableMedia may be set.
+func (c *FilesUpdateCall) Media(r io.Reader, options ...googleapi.MediaOption) *FilesUpdateCall {
+	opts := googleapi.ProcessMediaOptions(options)
+	chunkSize := opts.ChunkSize
+	if !opts.ForceEmptyContentType {
+		r, c.mediaType_ = gensupport.DetermineContentType(r, opts.ContentType)
+	}
+	c.media_, c.mediaBuffer_ = gensupport.PrepareUpload(r, chunkSize)
 	return c
 }
 
 // ResumableMedia specifies the media to upload in chunks and can be
-// canceled with ctx. At most one of Media and ResumableMedia may be
-// set. mediaType identifies the MIME media type of the upload, such as
-// "image/png". If mediaType is "", it will be auto-detected. The
-// provided ctx will supersede any context previously provided to the
-// Context method.
+// canceled with ctx.
+//
+// Deprecated: use Media instead.
+//
+// At most one of Media and ResumableMedia may be set. mediaType
+// identifies the MIME media type of the upload, such as "image/png". If
+// mediaType is "", it will be auto-detected. The provided ctx will
+// supersede any context previously provided to the Context method.
 func (c *FilesUpdateCall) ResumableMedia(ctx context.Context, r io.ReaderAt, size int64, mediaType string) *FilesUpdateCall {
 	c.ctx_ = ctx
-	c.resumable_ = io.NewSectionReader(r, 0, size)
-	c.mediaType_ = mediaType
-	c.protocol_ = "resumable"
+	rdr := gensupport.ReaderAtToReader(r, size)
+	rdr, c.mediaType_ = gensupport.DetermineContentType(rdr, mediaType)
+	c.mediaBuffer_ = gensupport.NewMediaBuffer(rdr, googleapi.DefaultUploadChunkSize)
+	c.media_ = nil
+	c.mediaSize_ = size
 	return c
 }
 
@@ -909,44 +992,44 @@ func (c *FilesUpdateCall) Context(ctx context.Context) *FilesUpdateCall {
 }
 
 func (c *FilesUpdateCall) doRequest(alt string) (*http.Response, error) {
+	reqHeaders := make(http.Header)
+	reqHeaders.Set("User-Agent", c.s.userAgent())
 	var body io.Reader = nil
 	body, err := googleapi.WithoutDataWrapper.JSONReader(c.file)
 	if err != nil {
 		return nil, err
 	}
-	ctype := "application/json"
+	reqHeaders.Set("Content-Type", "application/json")
 	c.urlParams_.Set("alt", alt)
 	urls := googleapi.ResolveRelative(c.s.BasePath, "files/{id}")
-	if c.media_ != nil || c.resumable_ != nil {
+	if c.media_ != nil || c.mediaBuffer_ != nil {
 		urls = strings.Replace(urls, "https://www.googleapis.com/", "https://www.googleapis.com/upload/", 1)
-		c.urlParams_.Set("uploadType", c.protocol_)
+		protocol := "multipart"
+		if c.mediaBuffer_ != nil {
+			protocol = "resumable"
+		}
+		c.urlParams_.Set("uploadType", protocol)
+	}
+	if body == nil {
+		body = new(bytes.Buffer)
+		reqHeaders.Set("Content-Type", "application/json")
+	}
+	if c.media_ != nil {
+		combined, ctype := gensupport.CombineBodyMedia(body, "application/json", c.media_, c.mediaType_)
+		defer combined.Close()
+		reqHeaders.Set("Content-Type", ctype)
+		body = combined
+	}
+	if c.mediaBuffer_ != nil && c.mediaType_ != "" {
+		reqHeaders.Set("X-Upload-Content-Type", c.mediaType_)
 	}
 	urls += "?" + c.urlParams_.Encode()
-	if c.protocol_ != "resumable" {
-		var cancel func()
-		cancel, _ = googleapi.ConditionallyIncludeMedia(c.media_, &body, &ctype)
-		if cancel != nil {
-			defer cancel()
-		}
-	}
 	req, _ := http.NewRequest("PUT", urls, body)
+	req.Header = reqHeaders
 	googleapi.Expand(req.URL, map[string]string{
 		"id": c.id,
 	})
-	if c.protocol_ == "resumable" {
-		if c.mediaType_ == "" {
-			c.mediaType_ = googleapi.DetectMediaType(c.resumable_)
-		}
-		req.Header.Set("X-Upload-Content-Type", c.mediaType_)
-		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	} else {
-		req.Header.Set("Content-Type", ctype)
-	}
-	req.Header.Set("User-Agent", c.s.userAgent())
-	if c.ctx_ != nil {
-		return ctxhttp.Do(c.ctx_, c.s.client, req)
-	}
-	return c.s.client.Do(req)
+	return gensupport.SendRequest(c.ctx_, c.s.client, req)
 }
 
 // Do executes the "drive.files.update" call.
@@ -956,7 +1039,8 @@ func (c *FilesUpdateCall) doRequest(alt string) (*http.Response, error) {
 // error.(*googleapi.Error).Header. Use googleapi.IsNotModified to check
 // whether the returned error was because http.StatusNotModified was
 // returned.
-func (c *FilesUpdateCall) Do() (*File, error) {
+func (c *FilesUpdateCall) Do(opts ...googleapi.CallOption) (*File, error) {
+	gensupport.SetOptions(c.urlParams_, opts...)
 	res, err := c.doRequest("json")
 	if res != nil && res.StatusCode == http.StatusNotModified {
 		if res.Body != nil {
@@ -974,22 +1058,32 @@ func (c *FilesUpdateCall) Do() (*File, error) {
 	if err := googleapi.CheckResponse(res); err != nil {
 		return nil, err
 	}
-	if c.protocol_ == "resumable" {
+	if c.mediaBuffer_ != nil {
 		loc := res.Header.Get("Location")
-		rx := &googleapi.ResumableUpload{
-			Client:        c.s.client,
-			UserAgent:     c.s.userAgent(),
-			URI:           loc,
-			Media:         c.resumable_,
-			MediaType:     c.mediaType_,
-			ContentLength: c.resumable_.Size(),
-			Callback:      c.progressUpdater_,
+		rx := &gensupport.ResumableUpload{
+			Client:    c.s.client,
+			UserAgent: c.s.userAgent(),
+			URI:       loc,
+			Media:     c.mediaBuffer_,
+			MediaType: c.mediaType_,
+			Callback: func(curr int64) {
+				if c.progressUpdater_ != nil {
+					c.progressUpdater_(curr, c.mediaSize_)
+				}
+			},
 		}
-		res, err = rx.Upload(c.ctx_)
+		ctx := c.ctx_
+		if ctx == nil {
+			ctx = context.TODO()
+		}
+		res, err = rx.Upload(ctx)
 		if err != nil {
 			return nil, err
 		}
 		defer res.Body.Close()
+		if err := googleapi.CheckResponse(res); err != nil {
+			return nil, err
+		}
 	}
 	ret := &File{
 		ServerResponse: googleapi.ServerResponse{
@@ -997,7 +1091,8 @@ func (c *FilesUpdateCall) Do() (*File, error) {
 			HTTPStatusCode: res.StatusCode,
 		},
 	}
-	if err := json.NewDecoder(res.Body).Decode(&ret); err != nil {
+	target := &ret
+	if err := json.NewDecoder(res.Body).Decode(target); err != nil {
 		return nil, err
 	}
 	return ret, nil

@@ -38,6 +38,8 @@ import (
 	"camlistore.org/pkg/osutil"
 	. "camlistore.org/pkg/search"
 	"camlistore.org/pkg/test"
+
+	"golang.org/x/net/context"
 )
 
 // An indexOwnerer is something that knows who owns the index.
@@ -756,5 +758,75 @@ func TestHandler(t *testing.T) {
 	defer SetTestHookBug121(func() {})
 	for _, ht := range handlerTests {
 		ht.test(t)
+	}
+}
+
+// TestGetPermanodeLocationAllocs helps us making sure we keep
+// Handler.getPermanodeLocation (or equivalent), allocation-free.
+func TestGetPermanodeLocationAllocs(t *testing.T) {
+	defer index.SetVerboseCorpusLogging(true)
+	index.SetVerboseCorpusLogging(false)
+
+	idx := index.NewMemoryIndex() // string key-value pairs in memory, as if they were on disk
+	idd := indextest.NewIndexDeps(idx)
+	h := NewHandler(idx, idd.SignerBlobRef)
+	corpus, err := idx.KeepInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetCorpus(corpus)
+
+	pn1 := idd.NewPermanode()
+	lat := 45.18
+	long := 5.72
+	idd.SetAttribute(pn1, "latitude", fmt.Sprintf("%f", lat))
+	idd.SetAttribute(pn1, "longitude", fmt.Sprintf("%f", long))
+
+	pnVenue := idd.NewPermanode()
+	idd.SetAttribute(pnVenue, "camliNodeType", "foursquare.com:venue")
+	idd.SetAttribute(pnVenue, "latitude", fmt.Sprintf("%f", lat))
+	idd.SetAttribute(pnVenue, "longitude", fmt.Sprintf("%f", long))
+	pnCheckin := idd.NewPermanode()
+	idd.SetAttribute(pnCheckin, "camliNodeType", "foursquare.com:checkin")
+	idd.SetAttribute(pnCheckin, "foursquareVenuePermanode", pnVenue.String())
+
+	br, _ := idd.UploadFile("photo.jpg", exifFileContentLatLong(lat, long), time.Now())
+	pnPhoto := idd.NewPermanode()
+	idd.SetAttribute(pnPhoto, "camliContent", br.String())
+
+	const (
+		blobParseAlloc = 1 // blob.Parse uses one alloc
+
+		// allocs permitted in different tests
+		latLongAttr         = 0 // latitude/longitude attr lookup musn't alloc
+		altLocRef           = blobParseAlloc
+		camliContentFileLoc = blobParseAlloc
+	)
+
+	for _, tt := range []struct {
+		title    string
+		pn       blob.Ref
+		maxAlloc int
+	}{
+		{"explicit location from attrs", pn1, latLongAttr},
+		{"referenced permanode location", pnCheckin, latLongAttr + altLocRef},
+		{"location from exif photo", pnPhoto, latLongAttr + camliContentFileLoc},
+	} {
+		n := testing.AllocsPerRun(20, func() {
+			loc, err := h.ExportGetPermanodeLocation(context.TODO(), tt.pn, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loc.Latitude != lat {
+				t.Fatalf("wrong latitude: got %v, wanted %v", loc.Latitude, lat)
+			}
+			if loc.Longitude != long {
+				t.Fatalf("wrong longitude: got %v, wanted %v", loc.Longitude, long)
+			}
+		})
+		t.Logf("%s: %v allocations (max %v)", tt.title, n, tt.maxAlloc)
+		if int(n) != tt.maxAlloc {
+			t.Errorf("LocationHandler.PermanodeLocation should not allocate more than %d", tt.maxAlloc)
+		}
 	}
 }

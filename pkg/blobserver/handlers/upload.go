@@ -33,8 +33,9 @@ import (
 	"camlistore.org/pkg/blobserver/protocol"
 	"camlistore.org/pkg/httputil"
 	"camlistore.org/pkg/jsonsign/signhandler"
-	"camlistore.org/pkg/readerutil"
 	"camlistore.org/pkg/schema"
+
+	"go4.org/readerutil"
 )
 
 // CreateBatchUploadHandler returns the handler that receives multi-part form uploads
@@ -177,7 +178,7 @@ func handleMultiPartUpload(rw http.ResponseWriter, req *http.Request, blobReceiv
 
 	receivedBlobs := make([]blob.SizedRef, 0, 10)
 
-	multipart, err := httputil.MultipartReader(req)
+	multipart, err := req.MultipartReader()
 	if multipart == nil {
 		httputil.BadRequestError(rw, fmt.Sprintf(
 			"Expected multipart/form-data POST request; %v", err))
@@ -241,6 +242,12 @@ func handleMultiPartUpload(rw http.ResponseWriter, req *http.Request, blobReceiv
 	res.Received = receivedBlobs
 
 	if req.Header.Get("X-Camlistore-Vivify") == "1" {
+		// TODO(mpl): In practice, this only works because we upload blobs one by one.
+		// If we sent many blobs in one multipart, the code below means
+		// all of them would have to be file schema blobs, which is a very
+		// particular case. Shouldn't we fix that?
+		// Or I suppose we could document that a file schema blob that
+		// wants to be vivified should always be sent alone.
 		for _, got := range receivedBlobs {
 			err := vivify(blobReceiver, got)
 			if err != nil {

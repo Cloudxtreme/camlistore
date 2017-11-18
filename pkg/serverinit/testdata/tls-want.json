@@ -9,9 +9,10 @@
 			"handler": "root",
 			"handlerArgs": {
 				"blobRoot": "/bs-and-maybe-also-index/",
-				"jsonSignRoot": "/sighelper/",
 				"helpRoot": "/help/",
+				"jsonSignRoot": "/sighelper/",
 				"searchRoot": "/my-search/",
+				"shareRoot": "/share/",
 				"statusRoot": "/status/",
 				"stealth": false
 			}
@@ -73,13 +74,29 @@
 				"slurpToMemory": true
 			}
 		},
+		"/pics/": {
+			"handler": "app",
+			"handlerArgs": {
+				"appConfig": {
+					"cacheRoot": "/tmp/blobs/cache",
+					"camliRoot": "picsRoot",
+					"goTemplate": "gallery.html",
+					"httpsCert": "/tls.crt",
+					"httpsKey": "/tls.key"
+				},
+				"prefix": "/pics/",
+				"program": "publisher",
+				"serverListen": "1.2.3.4:443"
+			}
+		},
 		"/setup/": {
 			"handler": "setup"
 		},
 		"/share/": {
 			"handler": "share",
 			"handlerArgs": {
-				"blobRoot": "/bs/"
+				"blobRoot": "/bs/",
+				"index": "/index/"
 			}
 		},
 		"/sighelper/": {
@@ -102,19 +119,6 @@
 					"type": "kv"
 				},
 				"to": "/index/"
-			}
-		},
-		"/pics/": {
-			"handler": "app",
-			"handlerArgs": {
-				"program": "publisher",
-				"appConfig": {
-					"camliRoot": "picsRoot",
-					"goTemplate": "gallery.html",
-					"cacheRoot": "/tmp/blobs/cache",
-					"httpsCert": "/tls.crt",
-					"httpsKey": "/tls.key"
-				}
 			}
 		},
 		"/ui/": {

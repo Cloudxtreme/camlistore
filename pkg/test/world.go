@@ -53,8 +53,6 @@ type World struct {
 	server    *exec.Cmd
 	isRunning int32 // state of the camlistored server. Access with sync/atomic only.
 	serverErr error
-
-	cammount *os.Process
 }
 
 // CamliSourceRoot returns the root of the source tree, or an error.
@@ -105,8 +103,8 @@ func (w *World) CamliSourceRoot() string {
 	return w.camRoot
 }
 
-// Start builds the Camlistore binaries and starts a server.
-func (w *World) Start() error {
+// Build builds the Camlistore binaries.
+func (w *World) Build() error {
 	var err error
 	w.tempDir, err = ioutil.TempDir("", "camlistore-test-")
 	if err != nil {
@@ -120,8 +118,6 @@ func (w *World) Start() error {
 			"camtool",
 			"camlistored",
 		}
-		// TODO(mpl): investigate why we still rebuild camlistored everytime if run through devcam test.
-		// it looks like it's because we always resync the UI files and hence redo the embeds. Next CL.
 		var latestModtime time.Time
 		for _, target := range targs {
 			binPath := filepath.Join(w.camRoot, "bin", target)
@@ -155,6 +151,27 @@ func (w *World) Start() error {
 			log.Printf("%s\n", out)
 		}
 		log.Print("Ran make.go.")
+	}
+	return nil
+}
+
+// Help outputs the help of camlistored from the World.
+func (w *World) Help() ([]byte, error) {
+	if err := w.Build(); err != nil {
+		return nil, err
+	}
+	// Run camlistored -help.
+	cmd := exec.Command(
+		filepath.Join(w.camRoot, "bin", "camlistored"),
+		"-help",
+	)
+	return cmd.CombinedOutput()
+}
+
+// Start builds the Camlistore binaries and starts a server.
+func (w *World) Start() error {
+	if err := w.Build(); err != nil {
+		return err
 	}
 	// Start camlistored.
 	{
@@ -375,3 +392,8 @@ func (w *World) SecretRingFile() string {
 
 // SearchHandlerPath returns the path to the search handler, with trailing slash.
 func (w *World) SearchHandlerPath() string { return "/my-search/" }
+
+// ServerBinary returns the location of the camlistored binary running for this World.
+func (w *World) ServerBinary() string {
+	return filepath.Join(w.camRoot, "bin", "camlistored")
+}
