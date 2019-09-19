@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -29,29 +30,30 @@ import (
 	"strings"
 	"time"
 
-	fontawesomestatic "embed/fontawesome"
-	glitchstatic "embed/glitch"
-	leafletstatic "embed/leaflet"
-	lessstatic "embed/less"
-	reactstatic "embed/react"
+	fontawesomestatic "perkeep.org/clients/web/embed/fontawesome"
+	keepystatic "perkeep.org/clients/web/embed/keepy"
+	leafletstatic "perkeep.org/clients/web/embed/leaflet"
+	lessstatic "perkeep.org/clients/web/embed/less"
+	opensansstatic "perkeep.org/clients/web/embed/opensans"
+	reactstatic "perkeep.org/clients/web/embed/react"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/cacher"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/fileembed"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/misc/closure"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/server/app"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/types/camtypes"
-	uistatic "camlistore.org/server/camlistored/ui"
-	closurestatic "camlistore.org/server/camlistored/ui/closure"
-	"code.google.com/p/rsc/qr"
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
+	"perkeep.org/internal/closure"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/cacher"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/fileembed"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/server/app"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/types/camtypes"
+	uistatic "perkeep.org/server/perkeepd/ui"
+	closurestatic "perkeep.org/server/perkeepd/ui/closure"
+	"rsc.io/qr"
 )
 
 var (
@@ -64,20 +66,22 @@ var (
 	reactPattern       = regexp.MustCompile(`^react/(.+)$`)
 	leafletPattern     = regexp.MustCompile(`^leaflet/(.+)$`)
 	fontawesomePattern = regexp.MustCompile(`^fontawesome/(.+)$`)
-	glitchPattern      = regexp.MustCompile(`^glitch/(.+)$`)
+	openSansPattern    = regexp.MustCompile(`^opensans/(([^/]+)(/.*)?)$`)
+	keepyPattern       = regexp.MustCompile(`^keepy/(.+)$`)
 
 	disableThumbCache, _ = strconv.ParseBool(os.Getenv("CAMLI_DISABLE_THUMB_CACHE"))
 
-	vendorEmbed = filepath.Join("vendor", "embed")
+	vendorEmbed = filepath.Join("clients", "web", "embed")
 )
 
 // UIHandler handles serving the UI and discovery JSON.
 type UIHandler struct {
 	publishRoots map[string]*publishRoot
 
-	prefix string // of the UI handler itself
-	root   *RootHandler
-	search *search.Handler
+	prefix        string // of the UI handler itself
+	root          *RootHandler
+	search        *search.Handler
+	shareImporter *shareImporter // nil if no root.Storage
 
 	// Cache optionally specifies a cache blob server, used for
 	// caching image thumbnails and other emphemeral data.
@@ -87,20 +91,21 @@ type UIHandler struct {
 	resizeSem *syncutil.Sem
 	thumbMeta *ThumbMeta // optional thumbnail key->blob.Ref cache
 
-	// sourceRoot optionally specifies the path to root of Camlistore's
+	// sourceRoot optionally specifies the path to root of Perkeep's
 	// source. If empty, the UI files must be compiled in to the
 	// binary (with go run make.go).  This comes from the "sourceRoot"
 	// ui handler config option.
 	sourceRoot string
 
-	uiDir string // if sourceRoot != "", this is sourceRoot+"/server/camlistored/ui"
+	uiDir string // if sourceRoot != "", this is sourceRoot+"/server/perkeepd/ui"
 
 	closureHandler         http.Handler
 	fileLessHandler        http.Handler
 	fileReactHandler       http.Handler
 	fileLeafletHandler     http.Handler
 	fileFontawesomeHandler http.Handler
-	fileGlitchHandler      http.Handler
+	fileOpenSansHandler    http.Handler
+	fileKeepyHandler       http.Handler
 }
 
 func init() {
@@ -149,28 +154,28 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 		ui.sourceRoot = os.Getenv("CAMLI_DEV_CAMLI_ROOT")
 		if uistatic.IsAppEngine {
 			if _, err = os.Stat(filepath.Join(uistatic.GaeSourceRoot,
-				filepath.FromSlash("server/camlistored/ui/index.html"))); err != nil {
+				filepath.FromSlash("server/perkeepd/ui/index.html"))); err != nil {
 				hint := fmt.Sprintf("\"sourceRoot\" was not specified in the config,"+
 					" and the default sourceRoot dir %v does not exist or does not contain"+
-					" \"server/camlistored/ui/index.html\". devcam appengine can do that for you.",
+					" \"server/perkeepd/ui/index.html\". devcam appengine can do that for you.",
 					uistatic.GaeSourceRoot)
 				log.Print(hint)
-				return nil, errors.New("No sourceRoot found; UI not available.")
+				return nil, errors.New("no sourceRoot found; UI not available")
 			}
 			log.Printf("Using the default \"%v\" as the sourceRoot for AppEngine", uistatic.GaeSourceRoot)
 			ui.sourceRoot = uistatic.GaeSourceRoot
 		}
 		if ui.sourceRoot == "" && uistatic.Files.IsEmpty() {
-			ui.sourceRoot, err = osutil.GoPackagePath("camlistore.org")
+			ui.sourceRoot, err = osutil.GoPackagePath("perkeep.org")
 			if err != nil {
-				log.Printf("Warning: server not compiled with linked-in UI resources (HTML, JS, CSS), and camlistore.org not found in GOPATH.")
+				log.Printf("Warning: server not compiled with linked-in UI resources (HTML, JS, CSS), and perkeep.org not found in GOPATH.")
 			} else {
 				log.Printf("Using UI resources (HTML, JS, CSS) from disk, under %v", ui.sourceRoot)
 			}
 		}
 	}
 	if ui.sourceRoot != "" {
-		ui.uiDir = filepath.Join(ui.sourceRoot, filepath.FromSlash("server/camlistored/ui"))
+		ui.uiDir = filepath.Join(ui.sourceRoot, filepath.FromSlash("server/perkeepd/ui"))
 		// Ignore any fileembed files:
 		Files = &fileembed.Files{
 			DirFallback: filepath.Join(ui.sourceRoot, filepath.FromSlash("pkg/server")),
@@ -199,9 +204,9 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 		if err != nil {
 			return nil, fmt.Errorf("Could not make leaflet handler: %s", err)
 		}
-		ui.fileGlitchHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "glitch"), "npc_piggy__x1_walk_png_1354829432.png")
+		ui.fileKeepyHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "keepy"), "keepy-dancing.png")
 		if err != nil {
-			return nil, fmt.Errorf("Could not make glitch handler: %s", err)
+			return nil, fmt.Errorf("Could not make keepy handler: %s", err)
 		}
 		ui.fileFontawesomeHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "fontawesome"), "css/font-awesome.css")
 		if err != nil {
@@ -210,6 +215,10 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 		ui.fileLessHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "less"), "less.js")
 		if err != nil {
 			return nil, fmt.Errorf("Could not make less handler: %s", err)
+		}
+		ui.fileOpenSansHandler, err = makeFileServer(ui.sourceRoot, filepath.Join(vendorEmbed, "opensans"), "OpenSans.css")
+		if err != nil {
+			return nil, fmt.Errorf("Could not make Open Sans handler: %s", err)
 		}
 	}
 
@@ -222,6 +231,12 @@ func uiFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handler, er
 		ui.root.registerUIHandler(ui)
 	} else {
 		return nil, errors.New("failed to find the 'root' handler")
+	}
+
+	if ui.root.Storage != nil {
+		ui.shareImporter = &shareImporter{
+			dest: ui.root.Storage,
+		}
 	}
 
 	return ui, nil
@@ -251,7 +266,7 @@ func (ui *UIHandler) InitHandler(hl blobserver.FindHandlerByTyper) error {
 		ui.search = sh
 	}
 	camliRootQuery := func(camliRoot string) (*search.SearchResult, error) {
-		return sh.Query(&search.SearchQuery{
+		return sh.Query(context.TODO(), &search.SearchQuery{
 			Limit: 1,
 			Constraint: &search.Constraint{
 				Permanode: &search.PermanodeConstraint{
@@ -314,7 +329,7 @@ func (ui *UIHandler) makeClosureHandler(root string) (http.Handler, error) {
 // root is either:
 // 1) empty: use the Closure files compiled in to the binary (if
 //    available), else redirect to the Internet.
-// 2) a URL prefix: base of Camlistore to get Closure to redirect to
+// 2) a URL prefix: base of Perkeep to get Closure to redirect to
 // 3) a path on disk to the root of camlistore's source (which
 //    contains the necessary subset of Closure files)
 func makeClosureHandler(root, handlerName string) (http.Handler, error) {
@@ -364,7 +379,7 @@ const closureBaseURL closureRedirector = "https://closure-library.googlecode.com
 
 // closureRedirector is a hack to redirect requests for Closure's million *.js files
 // to https://closure-library.googlecode.com/git.
-// TODO: this doesn't work when offline. We need to run genjsdeps over all of the Camlistore
+// TODO: this doesn't work when offline. We need to run genjsdeps over all of the Perkeep
 // UI to figure out which Closure *.js files to fileembed and generate zembed. Then this
 // type can be deleted.
 type closureRedirector string
@@ -420,6 +435,8 @@ func (ui *UIHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		ui.serveUploadHelper(rw, req)
 	case strings.HasPrefix(suffix, "download/"):
 		ui.serveDownload(rw, req)
+	case strings.HasPrefix(suffix, "importshare"):
+		ui.importShare(rw, req)
 	case strings.HasPrefix(suffix, "thumbnail/"):
 		ui.serveThumbnail(rw, req)
 	case strings.HasPrefix(suffix, "tree/"):
@@ -434,10 +451,12 @@ func (ui *UIHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		ui.serveFromDiskOrStatic(rw, req, reactPattern, ui.fileReactHandler, reactstatic.Files)
 	case getSuffixMatches(req, leafletPattern):
 		ui.serveFromDiskOrStatic(rw, req, leafletPattern, ui.fileLeafletHandler, leafletstatic.Files)
-	case getSuffixMatches(req, glitchPattern):
-		ui.serveFromDiskOrStatic(rw, req, glitchPattern, ui.fileGlitchHandler, glitchstatic.Files)
+	case getSuffixMatches(req, keepyPattern):
+		ui.serveFromDiskOrStatic(rw, req, keepyPattern, ui.fileKeepyHandler, keepystatic.Files)
 	case getSuffixMatches(req, fontawesomePattern):
 		ui.serveFromDiskOrStatic(rw, req, fontawesomePattern, ui.fileFontawesomeHandler, fontawesomestatic.Files)
+	case getSuffixMatches(req, openSansPattern):
+		ui.serveFromDiskOrStatic(rw, req, openSansPattern, ui.fileOpenSansHandler, opensansstatic.Files)
 	default:
 		file := ""
 		if m := staticFilePattern.FindStringSubmatch(suffix); m != nil {
@@ -505,6 +524,7 @@ func (ui *UIHandler) discovery() *camtypes.UIDiscovery {
 		DirectoryHelper: path.Join(ui.prefix, "tree") + "/",
 		PublishRoots:    pubRoots,
 		MapClustering:   mapClustering,
+		ImportShare:     path.Join(ui.prefix, "importshare") + "/",
 	}
 	return uiDisco
 }
@@ -523,6 +543,14 @@ func (ui *UIHandler) serveDownload(w http.ResponseWriter, r *http.Request) {
 		Search:  ui.search,
 	}
 	dh.ServeHTTP(w, r)
+}
+
+func (ui *UIHandler) importShare(w http.ResponseWriter, r *http.Request) {
+	if ui.shareImporter == nil {
+		http.Error(w, "No ShareImporter capacity", 500)
+		return
+	}
+	ui.shareImporter.ServeHTTP(w, r)
 }
 
 func (ui *UIHandler) serveThumbnail(rw http.ResponseWriter, req *http.Request) {
@@ -656,6 +684,6 @@ func serveDepsJS(rw http.ResponseWriter, req *http.Request, dir string) {
 		return
 	}
 	rw.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	rw.Write([]byte("// auto-generated from camlistored\n"))
+	rw.Write([]byte("// auto-generated from perkeepd\n"))
 	rw.Write(b)
 }

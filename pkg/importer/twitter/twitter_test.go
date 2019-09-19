@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,20 +17,27 @@ limitations under the License.
 package twitter
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	imptest "camlistore.org/pkg/importer/test"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
 	"github.com/garyburd/go-oauth/oauth"
 	"go4.org/ctxutil"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/importer"
+	imptest "perkeep.org/pkg/importer/test"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
 )
+
+var ctxbg = context.Background()
+
+func init() {
+	testhooks.SetUseSHA1(true)
+}
 
 func TestGetUserID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.WithValue(context.TODO(), ctxutil.HTTPClient, &http.Client{
@@ -107,7 +114,7 @@ func TestIntegrationRun(t *testing.T) {
 
 	responder := httputil.FileResponder("testdata/user_timeline.json")
 	transport, err := httputil.NewRegexpFakeTransport([]*httputil.Matcher{
-		&httputil.Matcher{`^https\://api\.twitter\.com/1.1/statuses/user_timeline.json\?`, responder},
+		{`^https\://api\.twitter\.com/1.1/statuses/user_timeline.json\?`, responder},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +148,7 @@ func TestIntegrationRun(t *testing.T) {
 		}
 		defer zipFile.Close()
 
-		zipRef, err := schema.WriteFileFromReader(rc.Host.Target(), "camlistore_test.zip", zipFile)
+		zipRef, err := schema.WriteFileFromReader(ctxbg, rc.Host.Target(), "camlistore_test.zip", zipFile)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore AUTHORS
+Copyright 2015 The Perkeep AUTHORS
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ package blobpacked
 // integration test, but some Read/Close paths aren't tested well.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,8 +28,8 @@ import (
 	"os"
 	"sort"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/conv"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/conv"
 )
 
 // zipPart is some of the state from the "w:sha1-xxx:n" meta rows.
@@ -50,6 +51,7 @@ func (s byZipIndex) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func (s byZipIndex) Less(i, j int) bool { return s[i].idx < s[j].idx }
 
 func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadCloser, wholeSize int64, err error) {
+	ctx := context.TODO()
 	// See comment before the storage.meta field for the keys/values
 	// being scanned here.
 	startKey := wholeMetaPrefix + wholeRef.String()
@@ -57,7 +59,6 @@ func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadClose
 	if it == nil {
 		panic("nil iterator")
 	}
-	//defer it.Close()
 	rows := 0
 	var parts []zipPart
 	var nZipWant uint32
@@ -70,6 +71,7 @@ func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadClose
 				break
 			}
 			if err := conv.ParseFields(it.ValueBytes(), &wholeSize, &nZipWant); err != nil {
+				it.Close()
 				return nil, 0, err
 			}
 			continue
@@ -80,11 +82,13 @@ func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadClose
 			break
 		}
 		if err := conv.ParseFields(k[len(startKey)+len(":"):], &zp.idx); err != nil {
+			it.Close()
 			return nil, 0, fmt.Errorf("blobpacked: error parsing meta key %q: %v", k, err)
 		}
 		// "<zipchunk-blobref> <offset-in-zipchunk-blobref> <offset-in-whole_u64> <length_u32>"
 		var ignore uint64
 		if err := conv.ParseFields(it.ValueBytes(), &zp.zipRef, &zp.zipOff, &ignore, &zp.len); err != nil {
+			it.Close()
 			return nil, 0, fmt.Errorf("blobpacked: error parsing meta key %q = %q: %v", k, it.ValueBytes(), err)
 		}
 		parts = append(parts, zp)
@@ -112,6 +116,7 @@ func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadClose
 		parts[0].len -= uint32(needSkip)
 	}
 	rc = &wholeFromZips{
+		ctx:    ctx,
 		src:    s.large,
 		remain: wholeSize - offset,
 		zp:     parts,
@@ -122,6 +127,7 @@ func (s *storage) OpenWholeRef(wholeRef blob.Ref, offset int64) (rc io.ReadClose
 // wholeFromZips is an io.ReadCloser that stitches together
 // a wholeRef from the inside of 0+ blobpacked zip files.
 type wholeFromZips struct {
+	ctx    context.Context
 	src    blob.SubFetcher
 	err    error // sticky
 	closed bool
@@ -179,7 +185,7 @@ func (zr *wholeFromZips) initCur() {
 	}
 	zp := zr.zp[0]
 	zr.zp = zr.zp[1:]
-	rc, err := zr.src.SubFetch(zp.zipRef, int64(zp.zipOff), int64(zp.len))
+	rc, err := zr.src.SubFetch(zr.ctx, zp.zipRef, int64(zp.zipOff), int64(zp.len))
 	if err != nil {
 		if err == os.ErrNotExist {
 			err = fmt.Errorf("blobpacked: error opening next part of file: %v", err)

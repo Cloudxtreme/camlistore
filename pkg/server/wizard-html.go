@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ const topWizard = `
 <!doctype html>
 <html>
 <head>
-	<title>Camlistore setup</title>
+	<title>Perkeep setup</title>
 </head>
 <body>
 	<p>[<a href="/">Back</a>]</p>

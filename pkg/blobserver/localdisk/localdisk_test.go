@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,20 +17,17 @@ limitations under the License.
 package localdisk
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"sync"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/test"
-	. "camlistore.org/pkg/test/asserts"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/test"
 )
 
 func cleanUp(ds *DiskStorage) {
@@ -72,20 +69,19 @@ func TestReceiveStat(t *testing.T) {
 	tb := &test.Blob{"Foo"}
 	tb.MustUpload(t, ds)
 
-	ch := make(chan blob.SizedRef, 0)
-	errch := make(chan error, 1)
-	go func() {
-		errch <- ds.StatBlobs(ch, tb.BlobRefSlice())
-		close(ch)
-	}()
-	got := 0
-	for sb := range ch {
-		got++
-		tb.AssertMatches(t, sb)
-		break
+	ctx := context.Background()
+	got, err := blobserver.StatBlobs(ctx, ds, tb.BlobRefSlice())
+	if err != nil {
+		t.Fatalf("StatBlobs: %v", err)
 	}
-	AssertInt(t, 1, got, "number stat results")
-	AssertNil(t, <-errch, "result from stat")
+	if len(got) != 1 {
+		t.Errorf("got %d stat blobs; expected 1", len(got))
+	}
+	sb, ok := got[tb.BlobRef()]
+	if !ok {
+		t.Fatalf("stat response lacked information for %v", tb.BlobRef())
+	}
+	tb.AssertMatches(t, sb)
 }
 
 func TestMultiStat(t *testing.T) {
@@ -106,18 +102,18 @@ func TestMultiStat(t *testing.T) {
 	// In addition to the two "foo" and "bar" blobs, add
 	// maxParallelStats other dummy blobs, to exercise the stat
 	// rate-limiting (which had a deadlock once after a cleanup)
+	const maxParallelStats = 20
 	for i := 0; i < maxParallelStats; i++ {
-		blobs = append(blobs, blob.SHA1FromString(strconv.Itoa(i)))
+		blobs = append(blobs, blob.RefFromString(strconv.Itoa(i)))
 	}
 
-	ch := make(chan blob.SizedRef, 0)
-	errch := make(chan error, 1)
-	go func() {
-		errch <- ds.StatBlobs(ch, blobs)
-		close(ch)
-	}()
+	ctx := context.Background()
+	gotStat, err := blobserver.StatBlobs(ctx, ds, blobs)
+	if err != nil {
+		t.Fatalf("StatBlobs: %v", err)
+	}
 	got := 0
-	for sb := range ch {
+	for _, sb := range gotStat {
 		got++
 		if !need[sb.Ref] {
 			t.Errorf("didn't need %s", sb.Ref)
@@ -126,9 +122,6 @@ func TestMultiStat(t *testing.T) {
 	}
 	if want := 2; got != want {
 		t.Errorf("number stats = %d; want %d", got, want)
-	}
-	if err := <-errch; err != nil {
-		t.Errorf("StatBlobs: %v", err)
 	}
 	if len(need) != 0 {
 		t.Errorf("Not all stat results returned; still need %d", len(need))
@@ -140,7 +133,7 @@ func TestMissingGetReturnsNoEnt(t *testing.T) {
 	defer cleanUp(ds)
 	foo := &test.Blob{"foo"}
 
-	blob, _, err := ds.Fetch(foo.BlobRef())
+	blob, _, err := ds.Fetch(context.Background(), foo.BlobRef())
 	if err != os.ErrNotExist {
 		t.Errorf("expected ErrNotExist; got %v", err)
 	}
@@ -149,45 +142,9 @@ func TestMissingGetReturnsNoEnt(t *testing.T) {
 	}
 }
 
-func rename(old, new string) error {
-	if err := os.Rename(old, new); err != nil {
-		if renameErr := mapRenameError(err, old, new); renameErr != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 type file struct {
 	name     string
 	contents string
-}
-
-func TestRename(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Skipping test if not on windows")
-	}
-	files := []file{
-		file{name: filepath.Join(os.TempDir(), "foo"), contents: "foo"},
-		file{name: filepath.Join(os.TempDir(), "bar"), contents: "barr"},
-		file{name: filepath.Join(os.TempDir(), "baz"), contents: "foo"},
-	}
-	for _, v := range files {
-		if err := ioutil.WriteFile(v.name, []byte(v.contents), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// overwriting "bar" with "foo" should not be allowed
-	if err := rename(files[0].name, files[1].name); err == nil {
-		t.Fatalf("Renaming %v into %v should not succeed", files[0].name, files[1].name)
-	}
-
-	// but overwriting "baz" with "foo" is ok because they have the same
-	// contents
-	if err := rename(files[0].name, files[2].name); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestLocaldisk(t *testing.T) {

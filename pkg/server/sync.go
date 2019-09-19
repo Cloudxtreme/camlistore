@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -33,16 +34,15 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/types/camtypes"
-	"code.google.com/p/xsrftoken"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"golang.org/x/net/xsrftoken"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/types/camtypes"
 
 	"go4.org/syncutil"
 )
@@ -116,8 +116,12 @@ func (sh *SyncHandler) String() string {
 	return fmt.Sprintf("[SyncHandler %v -> %v]", sh.fromName, sh.toName)
 }
 
+func (sh *SyncHandler) fromToString() string {
+	return fmt.Sprintf("%v -> %v", sh.fromName, sh.toName)
+}
+
 func (sh *SyncHandler) logf(format string, args ...interface{}) {
-	log.Printf(sh.String()+" "+format, args...)
+	log.Printf("sync: "+sh.fromToString()+": "+format, args...)
 }
 
 func init() {
@@ -353,7 +357,7 @@ func (sh *SyncHandler) readQueueToMemory() error {
 		sh.addBlobToCopy(sb)
 		n++
 	}
-	sh.logf("Added %d pending blobs from sync queue to pending list", n)
+	sh.logf("added %d pending blobs from sync queue to pending list", n)
 	return <-errc
 }
 
@@ -616,11 +620,11 @@ func (sh *SyncHandler) syncLoop() {
 
 func (sh *SyncHandler) copyWorker(res chan<- copyResult, work <-chan blob.SizedRef) {
 	for sb := range work {
-		res <- copyResult{sb, sh.copyBlob(sb)}
+		res <- copyResult{sb, sh.copyBlob(context.TODO(), sb)}
 	}
 }
 
-func (sh *SyncHandler) copyBlob(sb blob.SizedRef) (err error) {
+func (sh *SyncHandler) copyBlob(ctx context.Context, sb blob.SizedRef) (err error) {
 	cs := sh.newCopyStatus(sb)
 	defer func() { cs.setError(err) }()
 	br := sb.Ref
@@ -634,7 +638,7 @@ func (sh *SyncHandler) copyBlob(sb blob.SizedRef) (err error) {
 	}
 
 	cs.setStatus(statusFetching)
-	rc, fromSize, err := sh.from.Fetch(br)
+	rc, fromSize, err := sh.from.Fetch(ctx, br)
 	if err != nil {
 		return fmt.Errorf("source fetch: %v", err)
 	}
@@ -660,7 +664,7 @@ func (sh *SyncHandler) copyBlob(sb blob.SizedRef) (err error) {
 	}
 
 	cs.setStatus(statusWriting)
-	newsb, err := sh.to.ReceiveBlob(br, io.TeeReader(bytes.NewReader(buf), incrWriter{cs, &cs.nwrite}))
+	newsb, err := sh.to.ReceiveBlob(ctx, br, io.TeeReader(bytes.NewReader(buf), incrWriter{cs, &cs.nwrite}))
 	if err != nil {
 		return fmt.Errorf("dest write: %v", err)
 	}
@@ -670,7 +674,8 @@ func (sh *SyncHandler) copyBlob(sb blob.SizedRef) (err error) {
 	return nil
 }
 
-func (sh *SyncHandler) ReceiveBlob(br blob.Ref, r io.Reader) (sb blob.SizedRef, err error) {
+func (sh *SyncHandler) ReceiveBlob(ctx context.Context, br blob.Ref, r io.Reader) (sb blob.SizedRef, err error) {
+	// TODO: use ctx?
 	n, err := io.Copy(ioutil.Discard, r)
 	if err != nil {
 		return
@@ -729,7 +734,7 @@ func (sh *SyncHandler) startFullValidation() {
 	}
 	sh.mu.Unlock()
 
-	sh.logf("Running full validation; determining validation shards...")
+	sh.logf("running full validation; determining validation shards...")
 	shards := sh.shardPrefixes()
 
 	sh.mu.Lock()
@@ -751,7 +756,7 @@ func (sh *SyncHandler) runFullValidation() {
 	wg.Add(len(shards))
 	sh.mu.Unlock()
 
-	sh.logf("full validation beginning with %d shards", len(shards))
+	sh.logf("full validation beginning with %d shards...", len(shards))
 
 	const maxShardWorkers = 30 // arbitrary
 	gate := syncutil.NewGate(maxShardWorkers)
@@ -766,7 +771,7 @@ func (sh *SyncHandler) runFullValidation() {
 		}()
 	}
 	wg.Wait()
-	sh.logf("Validation complete")
+	sh.logf("validation complete")
 }
 
 func (sh *SyncHandler) validateShardPrefix(pfx string) (err error) {
@@ -819,7 +824,7 @@ func (sh *SyncHandler) validateShardPrefix(pfx string) (err error) {
 			}
 		} else {
 			sh.mu.Lock()
-			sh.vmissing += 1
+			sh.vmissing++
 			sh.mu.Unlock()
 		}
 	}
@@ -889,9 +894,10 @@ func (sh *SyncHandler) shardPrefixes() []string {
 	var pfx []string
 	// TODO(bradfitz): do limit=1 enumerates against sh.from and sh.to with varying
 	// "after" values to determine all the blobref types on both sides.
-	// For now, be lazy and assume only sha1:
+	// For now, be lazy and assume only sha1 and sha224:
 	for i := 0; i < 256; i++ {
 		pfx = append(pfx, fmt.Sprintf("sha1-%02x", i))
+		pfx = append(pfx, fmt.Sprintf("sha224-%02x", i))
 	}
 	return pfx
 }
@@ -1046,40 +1052,41 @@ func storageDesc(v interface{}) string {
 //
 // For now, don't implement them. Wait until we need them.
 
-func (sh *SyncHandler) Fetch(blob.Ref) (file io.ReadCloser, size uint32, err error) {
-	panic("Unimplemeted blobserver.Fetch called")
+func (sh *SyncHandler) Fetch(context.Context, blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	panic("unimplemented blobserver.Fetch called")
 }
 
-func (sh *SyncHandler) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
-	sh.logf("Unexpected StatBlobs call")
+func (sh *SyncHandler) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	sh.logf("unexpected StatBlobs call")
 	return nil
 }
 
 func (sh *SyncHandler) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
 	defer close(dest)
-	sh.logf("Unexpected EnumerateBlobs call")
+	sh.logf("unexpected EnumerateBlobs call")
 	return nil
 }
 
-func (sh *SyncHandler) RemoveBlobs(blobs []blob.Ref) error {
-	panic("Unimplemeted RemoveBlobs")
+func (sh *SyncHandler) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
+	panic("unimplemented RemoveBlobs")
 }
 
-var stopEnumeratingError = errors.New("sentinel error: reached the hourly compare quota")
+var errStopEnumerating = errors.New("sentinel error: reached the hourly compare quota")
 
 // Every hour, hourlyCompare picks blob names from a random point in the source,
 // downloads up to hourlyBytes from the destination, and verifies them.
 func (sh *SyncHandler) hourlyCompare(hourlyBytes uint64) {
+	ctx := context.TODO()
 	ticker := time.NewTicker(time.Hour).C
 	for {
 		content := make([]byte, 16)
 		if _, err := rand.Read(content); err != nil {
 			panic(err)
 		}
-		after := blob.SHA1FromBytes(content).String()
+		after := blob.RefFromBytes(content).String()
 		var roundBytes uint64
 		var roundBlobs int
-		err := blobserver.EnumerateAllFrom(context.TODO(), sh.from, after, func(sr blob.SizedRef) error {
+		err := blobserver.EnumerateAllFrom(ctx, sh.from, after, func(sr blob.SizedRef) error {
 			sh.mu.Lock()
 			if _, ok := sh.needCopy[sr.Ref]; ok {
 				sh.mu.Unlock()
@@ -1088,9 +1095,9 @@ func (sh *SyncHandler) hourlyCompare(hourlyBytes uint64) {
 			sh.mu.Unlock()
 
 			if roundBytes+uint64(sr.Size) > hourlyBytes {
-				return stopEnumeratingError
+				return errStopEnumerating
 			}
-			blob, size, err := sh.to.(blob.Fetcher).Fetch(sr.Ref)
+			blob, size, err := sh.to.(blob.Fetcher).Fetch(ctx, sr.Ref)
 			if err != nil {
 				return fmt.Errorf("error fetching %s: %v", sr.Ref, err)
 			}
@@ -1115,7 +1122,7 @@ func (sh *SyncHandler) hourlyCompare(hourlyBytes uint64) {
 			return nil
 		})
 		sh.mu.Lock()
-		if err != nil && err != stopEnumeratingError {
+		if err != nil && err != errStopEnumerating {
 			sh.compareErrors = append(sh.compareErrors, fmt.Sprintf("%s %v", time.Now(), err))
 			sh.logf("!! hourly compare error !!: %v", err)
 		}

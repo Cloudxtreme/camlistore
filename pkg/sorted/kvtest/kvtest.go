@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 // Package kvtest tests sorted.KeyValue implementations.
-package kvtest // import "camlistore.org/pkg/sorted/kvtest"
+package kvtest // import "perkeep.org/pkg/sorted/kvtest"
 
 import (
 	"reflect"
 	"testing"
+	"time"
 
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/test"
 )
 
 func TestSorted(t *testing.T, kv sorted.KeyValue) {
@@ -80,6 +81,10 @@ func TestSorted(t *testing.T, kv sorted.KeyValue) {
 	// Deleting a non-existent item in a batch should not be an error
 	testDeleteNotFoundBatch(t, kv)
 	testDeletePartialNotFoundBatch(t, kv)
+
+	if txReader, ok := kv.(sorted.TransactionalReader); ok {
+		testReadTransaction(t, txReader)
+	}
 }
 
 // Do not ever insert that key, as it used for testing deletion of non existing entries
@@ -120,12 +125,12 @@ func testInsertLarge(t *testing.T, kv sorted.KeyValue) {
 	largeKey := make([]byte, sorted.MaxKeySize-1)
 	// setting all the bytes because postgres whines about an invalid byte sequence
 	// otherwise
-	for k, _ := range largeKey {
+	for k := range largeKey {
 		largeKey[k] = 'A'
 	}
 	largeKey[sorted.MaxKeySize-2] = 'B'
 	largeValue := make([]byte, sorted.MaxValueSize-1)
-	for k, _ := range largeValue {
+	for k := range largeValue {
 		largeValue[k] = 'A'
 	}
 	largeValue[sorted.MaxValueSize-2] = 'B'
@@ -218,4 +223,63 @@ func isEmpty(t *testing.T, kv sorted.KeyValue) bool {
 		t.Fatalf("Error closing iterator while testing for emptiness: %v", err)
 	}
 	return !hasRow
+}
+
+func testReadTransaction(t *testing.T, kv sorted.TransactionalReader) {
+	set := func(k, v string) {
+		if err := kv.Set(k, v); err != nil {
+			t.Fatalf("Error setting %q to %q: %v", k, v, err)
+		}
+	}
+	set("raceKey", "orig")
+	tx := kv.BeginReadTx()
+
+	// We want to be sure the transaction is always closed before exiting,
+	// but we can't just defer tx.Close(), because on implementations that
+	// implement transactions with simple locks, the last call to set()
+	// below cannot run until the read transaction is closed. Furthermore,
+	// we need to make sure set() completes before returning, because if the
+	// caller closes the database connection before set() runs, it will
+	// panic.
+	//
+	// On the happy path, the sequence of events looks like:
+	//
+	// 1. Explicitly close the transaction.
+	// 2. Wait for set() to complete.
+	// 3. Return.
+	//
+	// ...but we use the boolean and defer statement below to ensure cleanup
+	// on errors.
+	txClosed := false
+	defer func() {
+		if !txClosed {
+			tx.Close()
+		}
+	}()
+
+	get := func(k string) string {
+		v, err := tx.Get(k)
+		if err != nil {
+			t.Fatalf("Error getting %q: %v", k, err)
+		}
+		return v
+	}
+	if get("raceKey") != "orig" {
+		t.Fatalf("Read saw the wrong initial value")
+	}
+
+	done := make(chan struct{}, 1)
+	go func() {
+		set("raceKey", "new")
+		done <- struct{}{}
+	}()
+
+	time.Sleep(time.Second / 5)
+	if get("raceKey") != "orig" {
+		t.Fatalf("Read transaction saw an update that happened after it started")
+	}
+
+	tx.Close()
+	txClosed = true
+	<-done
 }

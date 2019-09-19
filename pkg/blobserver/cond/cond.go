@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,20 +35,20 @@ Example usage:
 	}
   }
 */
-package cond // import "camlistore.org/pkg/blobserver/cond"
+package cond // import "perkeep.org/pkg/blobserver/cond"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/schema"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/schema"
 )
 
 // A storageFunc selects a destination for a given blob. It may consume from src but must always return
@@ -159,32 +159,32 @@ func isSchemaPicker(thenSto, elseSto blobserver.Storage) storageFunc {
 	}
 }
 
-func (sto *condStorage) ReceiveBlob(br blob.Ref, src io.Reader) (sb blob.SizedRef, err error) {
+func (sto *condStorage) ReceiveBlob(ctx context.Context, br blob.Ref, src io.Reader) (sb blob.SizedRef, err error) {
 	destSto, src, err := sto.storageForReceive(br, src)
 	if err != nil {
 		return
 	}
-	return blobserver.Receive(destSto, br, src)
+	return blobserver.Receive(ctx, destSto, br, src)
 }
 
-func (sto *condStorage) RemoveBlobs(blobs []blob.Ref) error {
+func (sto *condStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	if sto.remove != nil {
-		return sto.remove.RemoveBlobs(blobs)
+		return sto.remove.RemoveBlobs(ctx, blobs)
 	}
 	return errors.New("cond: Remove not configured")
 }
 
-func (sto *condStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (sto *condStorage) Fetch(ctx context.Context, b blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	if sto.read != nil {
-		return sto.read.Fetch(b)
+		return sto.read.Fetch(ctx, b)
 	}
 	err = errors.New("cond: Read not configured")
 	return
 }
 
-func (sto *condStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (sto *condStorage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	if sto.read != nil {
-		return sto.read.StatBlobs(dest, blobs)
+		return sto.read.StatBlobs(ctx, blobs, fn)
 	}
 	return errors.New("cond: Read not configured")
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,14 +16,14 @@ limitations under the License.
 
 // Package nodeattr contains constants for permanode attribute names.
 //
-// For all date values in RFC 3339 format, Camlistore additionally
+// For all date values in RFC 3339 format, Perkeep additionally
 // treats the special timezone offset -00:01 (one minute west of UTC)
 // as meaning that the local time was known, but the location or
 // timezone was not. Usually this is from EXIF files.
-package nodeattr // import "camlistore.org/pkg/schema/nodeattr"
+package nodeattr // import "perkeep.org/pkg/schema/nodeattr"
 
 const (
-	// Type is the Camlistore permanode type ("camliNodeType").
+	// Type is the Perkeep permanode type ("camliNodeType").
 	// Importer-specific ones are of the form "domain.com:objecttype".
 	// Well-defined ones are documented in doc/schema/claims/attributes.txt.
 	Type = "camliNodeType"
@@ -119,4 +119,10 @@ const (
 
 	// Version is http://schema.org/version
 	Version = "version"
+
+	// Starred is a boolean indicating a user "starred" or marked something as a favorite.
+	Starred = "starred"
+
+	// Folder is a string representing a logical collection of files grouped together
+	Folder = "folder"
 )

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// ClockOrigin is an arbitrary contemporary date that can be used as a starting
+// time in tests. It is 2011-11-28 01:32:36.000123456 +0000 UTC.
+var ClockOrigin = time.Unix(1322443956, 123456)
 
 // BrokenTest marks the test as broken and calls t.Skip, unless the environment
 // variable RUN_BROKEN_TESTS is set to 1 (or some other boolean true value).

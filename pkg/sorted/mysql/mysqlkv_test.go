@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/kvtest"
-	"camlistore.org/pkg/test/dockertest"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/kvtest"
+	"perkeep.org/pkg/test/dockertest"
 )
 
 // TestMySQLKV tests against a real MySQL instance, using a Docker container.
@@ -48,6 +48,7 @@ func TestMySQLKV(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mysql.NewKeyValue = %v", err)
 	}
+	defer kv.Close()
 	kvtest.TestSorted(t, kv)
 }
 
@@ -66,6 +67,7 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mysql.NewKeyValue = %v", err)
 	}
+	defer kv.Close()
 
 	kv.(*keyValue).KeyValue.BatchSetFunc = func(*sql.Tx, string, string) error {
 		return errors.New("Forced failure to trigger a rollback")

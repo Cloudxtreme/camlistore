@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,43 +28,45 @@ Example low-level config:
      },
 
 */
-package localdisk // import "camlistore.org/pkg/blobserver/localdisk"
+package localdisk // import "perkeep.org/pkg/blobserver/localdisk"
 
 import (
+	"bytes"
 	"fmt"
-	"io"
-	"math"
+	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
-	"sync"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/local"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/files"
+	"perkeep.org/pkg/blobserver/local"
 
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
 )
 
+// TODO: rename DiskStorage to Storage.
+
 // DiskStorage implements the blobserver.Storage interface using the
 // local filesystem.
 type DiskStorage struct {
-	root string
+	blobserver.Storage
+	blob.SubFetcher
 
-	// dirLockMu must be held for writing when deleting an empty directory
-	// and for read when receiving blobs.
-	dirLockMu *sync.RWMutex
+	root string
 
 	// gen will be nil if partition != ""
 	gen *local.Generationer
-
-	// tmpFileGate limits the number of temporary files open at the same
-	// time, so we don't run into the max set by ulimit. It is nil on
-	// systems (Windows) where we don't know the maximum number of open
-	// file descriptors.
-	tmpFileGate *syncutil.Gate
 }
+
+// Validate we implement expected interfaces.
+var (
+	_ blobserver.Storage = (*DiskStorage)(nil)
+	_ blob.SubFetcher    = (*DiskStorage)(nil) // for blobpacked; Issue 1136
+)
 
 func (ds *DiskStorage) String() string {
 	return fmt.Sprintf("\"filesystem\" file-per-blob at %s", ds.root)
@@ -72,6 +74,9 @@ func (ds *DiskStorage) String() string {
 
 // IsDir reports whether root is a localdisk (file-per-blob) storage directory.
 func IsDir(root string) (bool, error) {
+	if osutil.DirExists(filepath.Join(root, "sha1")) {
+		return true, nil
+	}
 	if osutil.DirExists(filepath.Join(root, blob.RefFromString("").HashName())) {
 		return true, nil
 	}
@@ -106,15 +111,14 @@ func New(root string) (*DiskStorage, error) {
 		return nil, fmt.Errorf("Failed to stat directory %q: %v", root, err)
 	}
 	if !fi.IsDir() {
-		return nil, fmt.Errorf("Storage root %q exists but is not a directory.", root)
+		return nil, fmt.Errorf("storage root %q exists but is not a directory", root)
 	}
+	fileSto := files.NewStorage(files.OSFS(), root)
 	ds := &DiskStorage{
-		root:      root,
-		dirLockMu: new(sync.RWMutex),
-		gen:       local.NewGenerationer(root),
-	}
-	if err := ds.migrate3to2(); err != nil {
-		return nil, fmt.Errorf("Error updating localdisk format: %v", err)
+		Storage:    fileSto,
+		SubFetcher: fileSto,
+		root:       root,
+		gen:        local.NewGenerationer(root),
 	}
 	if _, _, err := ds.StorageGeneration(); err != nil {
 		return nil, fmt.Errorf("Error initialization generation for %q: %v", root, err)
@@ -128,11 +132,16 @@ func New(root string) (*DiskStorage, error) {
 		return nil, err
 	}
 	if ul < minFDLimit {
-		return nil, fmt.Errorf("The max number of open file descriptors on your system (ulimit -n) is too low. Please fix it with 'ulimit -S -n X' with X being at least %d.", recommendedFDLimit)
+		return nil, fmt.Errorf("the max number of open file descriptors on your system (ulimit -n) is too low. Please fix it with 'ulimit -S -n X' with X being at least %d", recommendedFDLimit)
 	}
-	// Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Camlistore.
-	// TODO(mpl): make this used and enforced Camlistore-wide. Issue #837.
-	ds.tmpFileGate = syncutil.NewGate(int(ul * 80 / 100))
+	// Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
+	// TODO(mpl): make this used and enforced Perkeep-wide. Issue #837.
+	fileSto.SetNewFileGate(syncutil.NewGate(int(ul * 80 / 100)))
+
+	err = ds.checkFS()
+	if err != nil {
+		return nil, err
+	}
 	return ds, nil
 }
 
@@ -148,80 +157,50 @@ func init() {
 	blobserver.RegisterStorageConstructor("filesystem", blobserver.StorageConstructor(newFromConfig))
 }
 
-func (ds *DiskStorage) tryRemoveDir(dir string) {
-	ds.dirLockMu.Lock()
-	defer ds.dirLockMu.Unlock()
-	os.Remove(dir) // ignore error
-}
-
-func (ds *DiskStorage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
-	return ds.fetch(br, 0, -1)
-}
-
-func (ds *DiskStorage) SubFetch(br blob.Ref, offset, length int64) (io.ReadCloser, error) {
-	if offset < 0 || length < 0 {
-		return nil, blob.ErrNegativeSubFetch
-	}
-	rc, _, err := ds.fetch(br, offset, length)
-	return rc, err
-}
-
-// u32 converts n to an uint32, or panics if n is out of range
-func u32(n int64) uint32 {
-	if n < 0 || n > math.MaxUint32 {
-		panic("bad size " + fmt.Sprint(n))
-	}
-	return uint32(n)
-}
-
-// length -1 means entire file
-func (ds *DiskStorage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, size uint32, err error) {
-	fileName := ds.blobPath(br)
-	stat, err := os.Stat(fileName)
-	if os.IsNotExist(err) {
-		return nil, 0, os.ErrNotExist
-	}
-	size = u32(stat.Size())
-	file, err := os.Open(fileName)
+// checkFS verifies the DiskStorage root storage path
+// operations include: stat, read/write file, mkdir, delete (files and directories)
+//
+// TODO: move this into the files package too?
+func (ds *DiskStorage) checkFS() (ret error) {
+	tempdir, err := ioutil.TempDir(ds.root, "")
 	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.ErrNotExist
+		return fmt.Errorf("localdisk check: unable to create tempdir in %s, err=%v", ds.root, err)
+	}
+	defer func() {
+		err := os.RemoveAll(tempdir)
+		if err != nil {
+			cleanErr := fmt.Errorf("localdisk check: unable to clean temp dir: %v", err)
+			if ret == nil {
+				ret = cleanErr
+			} else {
+				log.Printf("WARNING: %v", cleanErr)
+			}
 		}
-		return nil, 0, err
-	}
-	// normal Fetch:
-	if length < 0 {
-		return file, size, nil
-	}
-	// SubFetch:
-	if offset < 0 || offset > stat.Size() {
-		if offset < 0 {
-			return nil, 0, blob.ErrNegativeSubFetch
-		}
-		return nil, 0, blob.ErrOutOfRangeOffsetSubFetch
-	}
-	return struct {
-		io.Reader
-		io.Closer
-	}{
-		io.NewSectionReader(file, offset, length),
-		file,
-	}, 0 /* unused */, err
-}
+	}()
 
-func (ds *DiskStorage) RemoveBlobs(blobs []blob.Ref) error {
-	for _, blob := range blobs {
-		fileName := ds.blobPath(blob)
-		err := os.Remove(fileName)
-		switch {
-		case err == nil:
-			continue
-		case os.IsNotExist(err):
-			// deleting already-deleted file; harmless.
-			continue
-		default:
-			return err
-		}
+	tempfile := filepath.Join(tempdir, "FILE.tmp")
+	filename := filepath.Join(tempdir, "FILE")
+	data := []byte("perkeep rocks")
+	err = ioutil.WriteFile(tempfile, data, 0644)
+	if err != nil {
+		return fmt.Errorf("localdisk check: unable to write into %s, err=%v", ds.root, err)
+	}
+
+	out, err := ioutil.ReadFile(tempfile)
+	if err != nil {
+		return fmt.Errorf("localdisk check: unable to read from %s, err=%v", tempfile, err)
+	}
+	if bytes.Compare(out, data) != 0 {
+		return fmt.Errorf("localdisk check: tempfile contents didn't match, got=%q", out)
+	}
+	if _, err := os.Lstat(filename); !os.IsNotExist(err) {
+		return fmt.Errorf("localdisk check: didn't expect file to exist, Lstat had other error, err=%v", err)
+	}
+	if err := os.Rename(tempfile, filename); err != nil {
+		return fmt.Errorf("localdisk check: rename failed, err=%v", err)
+	}
+	if _, err := os.Lstat(filename); err != nil {
+		return fmt.Errorf("localdisk check: after rename passed Lstat had error, err=%v", err)
 	}
 	return nil
 }

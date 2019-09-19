@@ -28,7 +28,7 @@ if things here are confusing or lacking.</p>
 <!-- ---------------------------------------------------------------------- -->
 <dt id='blobserver'>blob server</dt>
 
-  <dd>the simplest and lowest layer of the Camlistore servers (see: <a
+  <dd>the simplest and lowest layer of the Perkeep servers (see: <a
      href="/doc/arch.md">architecture</a>).  A blob server, while
      potentially shared between users, is <em>logically private to a
      single user</em> and holds that user's blobs (<a
@@ -38,15 +38,15 @@ if things here are confusing or lacking.</p>
        <ul>
 
          <li><a
-         href="/gw/doc/protocol/blob-get.md"><b>get</b></a>
+         href="/doc/protocol/blob-get.md"><b>get</b></a>
          a blob by its blobref.</li>
 
          <li><a
-         href="/gw/doc/protocol/blob-upload.md"><b>put</b></a>
+         href="/doc/protocol/blob-upload.md"><b>put</b></a>
          a blob by its blobref.</li>
 
          <li><a
-         href="/gw/doc/protocol/blob-enumerate.md"><b>enumerate</b></a>
+         href="/doc/protocol/blob-enumerate.md"><b>enumerate</b></a>
          all your blobs, sorted by their blobrefs.  Enumeration is
          only really used by your search server and by a <em>full sync</em>
          between your blob server mirrors.</li>
@@ -57,7 +57,7 @@ if things here are confusing or lacking.</p>
 <!-- ---------------------------------------------------------------------- -->
 <dt id='schemablob'>schema blob</dt>
 
-<dd>a <a href="/doc/schema/">Camlistore-recognized data structure</a>, serialized as a JSON
+<dd>a <a href="/doc/schema/">Perkeep-recognized data structure</a>, serialized as a JSON
 object (map).  A schema blob must have top-level keys
 <code>camliVersion</code> and <code>camliType</code> and start with a open brace (<code>{</code>, byte 0x7B).  You may use any valid JSON
 serialization library to generate schema blobs.  Whitespace or formatting doesn't matter, as long as the blob
@@ -97,14 +97,14 @@ starts with <code>{</code> and is <a href="http://json.org/">valid JSON</a> in i
 <!-- ---------------------------------------------------------------------- -->
 <dt id='permanode'>permanode</dt>
 
-<dd>since an object is mutable and Camlistore is primarily content-addressed,
+<dd>since an object is mutable and Perkeep is primarily content-addressed,
   the question arises how you could have a stable reference to something that's
-  changing.  Camlistore solves this with the concept of a <em>permanode</em>.
-  Like a permalink on the web, a permanode is a stable link to a Camli object.
+  changing.  Perkeep solves this with the concept of a <em>permanode</em>.
+  Like a permalink on the web, a permanode is a stable link to a Perkeep object.
 
   <p>A permanode is simply a <a href="/doc/json-signing/">signed</a>
      schema blob with no data inside that would be interesting to
-     mutate.  See <a href="/gw/doc/schema/permanode.md">the
+     mutate.  See <a href="/doc/schema/permanode.md">the
      permanode spec</a>.</p>
 
   <p>A permanent reference to a mutable object then is simply the blobref of
@@ -115,7 +115,7 @@ starts with <code>{</code> and is <a href="http://json.org/">valid JSON</a> in i
      on mutating an object (by all creating new, signed mutation schema blobs),
      the owner ultimately decides the policies on how the mutations are respected.</p>
 
-  <p>Example permanode blob:  (as generated with <code><a href="/cmd/camput">camput</a> --permanode</code>)</p>
+  <p>Example permanode blob:  (as generated with <code><a href="/cmd/pk put">pk put</a> --permanode</code>)</p>
 
      <pre class='sty' style="overflow: auto;">{"camliVersion": 1,
   "camliSigner": "sha1-c4da9d771661563a27704b91b67989e7ea1e50b8",

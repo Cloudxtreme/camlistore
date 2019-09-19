@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package gce provides tools to deploy Camlistore on Google Compute Engine.
-package gce // import "camlistore.org/pkg/deploy/gce"
+// Package gce provides tools to deploy Perkeep on Google Compute Engine.
+package gce // import "perkeep.org/pkg/deploy/gce"
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -32,12 +33,11 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
 
 	"cloud.google.com/go/logging"
 	"go4.org/cloud/google/gceutil"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	cloudresourcemanager "google.golang.org/api/cloudresourcemanager/v1"
@@ -111,7 +111,7 @@ type InstanceConf struct {
 
 	Ctime time.Time // Timestamp for this configuration.
 
-	WIP bool // Whether to use the camlistored-WORKINPROGRESS.tar.gz tarball instead of the "production" one
+	WIP bool // Whether to use the perkeepd-WORKINPROGRESS.tar.gz tarball instead of the "production" one
 }
 
 func (conf *InstanceConf) bucketBase() string {
@@ -349,6 +349,7 @@ func (d *Deployer) enableAPIs() error {
 		"storage-api.googleapis.com":       "Google Cloud Storage JSON",
 		"logging.googleapis.com":           "Stackdriver Logging",
 		"compute.googleapis.com":           "Google Compute Engine",
+		"geocoding-backend.googleapis.com": "Google Maps Geocoding",
 	}
 	enabledServices := make(map[string]bool)
 	for _, v := range list.Services {
@@ -504,11 +505,11 @@ func (d *Deployer) Create(ctx context.Context) (*compute.Instance, error) {
 		return nil, fmt.Errorf("could not scan project for existing instances: %v", err)
 	}
 
-	if err := d.setBuckets(storageService, ctx); err != nil {
+	if err := d.setBuckets(ctx, storageService); err != nil {
 		return nil, fmt.Errorf("could not create buckets: %v", err)
 	}
 
-	if err := d.createInstance(computeService, ctx); err != nil {
+	if err := d.createInstance(ctx, computeService); err != nil {
 		return nil, fmt.Errorf("could not create compute instance: %v", err)
 	}
 
@@ -542,7 +543,7 @@ func LooksLikeRegion(s string) bool {
 
 // createInstance starts the creation of the Compute Engine instance and waits for the
 // result of the creation operation. It should be called after setBuckets and setupHTTPS.
-func (d *Deployer) createInstance(computeService *compute.Service, ctx context.Context) error {
+func (d *Deployer) createInstance(ctx context.Context, computeService *compute.Service) error {
 	coreosImgURL, err := gceutil.CoreOSImageURL(d.Client)
 	if err != nil {
 		return fmt.Errorf("error looking up latest CoreOS stable image: %v", err)
@@ -587,15 +588,24 @@ func (d *Deployer) createInstance(computeService *compute.Service, ctx context.C
 					Value: googleapi.String("gs://" + d.Conf.configDir),
 				},
 				{
+					Key: "perkeep-config-version",
+					// perkeep-config-version being defined requires this launcher to deploy Perkeep
+					//  at rev >= 7eda9fd5027fda88166d6c03b6490cffbf2de5fb , so that any newly deployed Perkeep
+					// knows it can use the new configuration without DBNames.
+					// TODO(mpl): but how do we enforce it, or at least make it more obvious/documented?
+					// With a flag defaulting to "1" maybe?
+					Value: googleapi.String("1"),
+				},
+				{
 					Key:   "user-data",
 					Value: googleapi.String(config),
 				},
 			},
 		},
 		NetworkInterfaces: []*compute.NetworkInterface{
-			&compute.NetworkInterface{
+			{
 				AccessConfigs: []*compute.AccessConfig{
-					&compute.AccessConfig{
+					{
 						Type: "ONE_TO_ONE_NAT",
 						Name: "External NAT",
 					},
@@ -669,7 +679,7 @@ OpLoop:
 				for _, operr := range op.Error.Errors {
 					d.Printf("Error: %+v", operr)
 				}
-				return fmt.Errorf("failed to start.")
+				return fmt.Errorf("failed to start")
 			}
 			if Verbose {
 				d.Printf("Success. %+v", op)
@@ -684,18 +694,18 @@ OpLoop:
 
 func cloudConfig(conf *InstanceConf) string {
 	config := strings.Replace(baseInstanceConfig, "INNODB_BUFFER_POOL_SIZE=NNN", "INNODB_BUFFER_POOL_SIZE="+strconv.Itoa(innodbBufferPoolSize(conf.Machine)), -1)
-	camlistoredTarball := "https://storage.googleapis.com/camlistore-release/docker/"
+	perkeepdTarball := "https://storage.googleapis.com/camlistore-release/docker/"
 	if conf.WIP {
-		camlistoredTarball += "camlistored-WORKINPROGRESS.tar.gz"
+		perkeepdTarball += "perkeepd-WORKINPROGRESS.tar.gz"
 	} else {
-		camlistoredTarball += "camlistored.tar.gz"
+		perkeepdTarball += "perkeepd.tar.gz"
 	}
-	config = strings.Replace(config, "CAMLISTORED_TARBALL", camlistoredTarball, 1)
+	config = strings.Replace(config, "CAMLISTORED_TARBALL", perkeepdTarball, 1)
 	return config
 }
 
 // setBuckets defines the buckets needed by the instance and creates them.
-func (d *Deployer) setBuckets(storageService *storage.Service, ctx context.Context) error {
+func (d *Deployer) setBuckets(ctx context.Context, storageService *storage.Service) error {
 	projBucket := d.Conf.Project + "-camlistore"
 
 	needBucket := map[string]bool{
@@ -760,14 +770,14 @@ func (d *Deployer) setFirewall(ctx context.Context, computeService *compute.Serv
 	}
 
 	needRules := map[string]compute.Firewall{
-		"default-allow-http": compute.Firewall{
+		"default-allow-http": {
 			Name:         "default-allow-http",
 			SourceRanges: []string{"0.0.0.0/0"},
 			SourceTags:   []string{"http-server"},
 			Allowed:      []*compute.FirewallAllowed{{IPProtocol: "tcp", Ports: []string{"80"}}},
 			Network:      defaultNet.SelfLink,
 		},
-		"default-allow-https": compute.Firewall{
+		"default-allow-https": {
 			Name:         "default-allow-https",
 			SourceRanges: []string{"0.0.0.0/0"},
 			SourceTags:   []string{"https-server"},
@@ -819,7 +829,7 @@ func (d *Deployer) setFirewall(ctx context.Context, computeService *compute.Serv
 // of the GCE machine type.
 func innodbBufferPoolSize(machine string) int {
 	// Totally arbitrary. We don't need much here because
-	// camlistored slurps this all into its RAM on start-up
+	// perkeepd slurps this all into its RAM on start-up
 	// anyway. So this is all prety overkill and more than the
 	// 8MB default.
 	switch machine {
@@ -893,7 +903,7 @@ coreos:
 
         [Install]
         WantedBy=multi-user.target
-    - name: camlistored.service
+    - name: perkeepd.service
       command: start
       content: |
         [Unit]
@@ -904,7 +914,7 @@ coreos:
         [Service]
         ExecStartPre=/usr/bin/docker run --rm -v /opt/bin:/opt/bin camlistore/systemd-docker
         ExecStartPre=/bin/bash -c '/usr/bin/curl CAMLISTORED_TARBALL | /bin/gunzip -c | /usr/bin/docker load'
-        ExecStart=/opt/bin/systemd-docker run --rm -p 80:80 -p 443:443 --name %n -v /run/camjournald.sock:/run/camjournald.sock -v /var/lib/camlistore/tmp:/tmp --link=mysql.service:mysqldb camlistore/server
+        ExecStart=/opt/bin/systemd-docker run --rm -p 80:80 -p 443:443 --name %n -v /run/camjournald.sock:/run/camjournald.sock -v /var/lib/camlistore/tmp:/tmp --link=mysql.service:mysqldb perkeep/server
         RestartSec=1s
         Restart=always
         Type=notify

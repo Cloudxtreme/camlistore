@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Camlistore AUTHORS
+Copyright 2016 The Perkeep AUTHORS
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 func TestClaimsAttrValue(t *testing.T) {
@@ -79,7 +78,7 @@ func TestClaimsAttrValue(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		got := index.ClaimsAttrValue(claims, tt.attr, tt.t, blob.Ref{})
+		got := index.Exp_ClaimsAttrValue(claims, tt.attr, tt.t)
 		if got != tt.want {
 			t.Errorf("%d. attr %q = %v; want %v",
 				i, tt.attr, got, tt.want)

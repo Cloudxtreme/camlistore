@@ -1,7 +1,7 @@
 Flickr Importer
 ===============
 
-This is an incomplete Camlistore importer for Flickr. So far it can import the
+This is an incomplete Perkeep importer for Flickr. So far it can import the
 first 100 photos from a photostream and also their set metadata.
 
 To use:
@@ -16,5 +16,5 @@ To use:
 
 TODO:
 
-https://github.com/camlistore/camlistore/issues?q=is%3Aopen+flickr+
+https://github.com/perkeep/perkeep/issues?q=is%3Aopen+flickr+
 

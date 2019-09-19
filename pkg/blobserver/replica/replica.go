@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,21 +32,24 @@ Example config:
           }
       },
 */
-package replica // import "camlistore.org/pkg/blobserver/replica"
+package replica // import "perkeep.org/pkg/blobserver/replica"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
+	"golang.org/x/sync/errgroup"
+
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 )
 
 var (
@@ -131,10 +134,10 @@ func newFromConfig(ld blobserver.Loader, config jsonconfig.Obj) (storage blobser
 	return sto, nil
 }
 
-func (sto *replicaStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (sto *replicaStorage) Fetch(ctx context.Context, b blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	// TODO: race these? first to respond?
 	for _, replica := range sto.readReplicas {
-		file, size, err = replica.Fetch(b)
+		file, size, err = replica.Fetch(ctx, b)
 		if err == nil {
 			return
 		}
@@ -143,49 +146,42 @@ func (sto *replicaStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, e
 }
 
 // StatBlobs stats all read replicas.
-func (sto *replicaStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
-	need := make(map[blob.Ref]bool)
+func (sto *replicaStorage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	var (
+		mu     sync.Mutex // serializes calls to fn, guards need
+		need   = make(map[blob.Ref]bool)
+		failed bool
+	)
 	for _, br := range blobs {
 		need[br] = true
 	}
 
-	ch := make(chan blob.SizedRef, buffered)
-	donec := make(chan bool)
-
-	go func() {
-		for sb := range ch {
-			if need[sb.Ref] {
-				dest <- sb
-				delete(need, sb.Ref)
-			}
-		}
-		donec <- true
-	}()
-
-	errc := make(chan error, buffered)
-	statReplica := func(s blobserver.Storage) {
-		errc <- s.StatBlobs(ch, blobs)
-	}
+	group, ctx := errgroup.WithContext(ctx)
 
 	for _, replica := range sto.readReplicas {
-		go statReplica(replica)
+		replica := replica
+		group.Go(func() error {
+			return replica.StatBlobs(ctx, blobs, func(sb blob.SizedRef) error {
+				mu.Lock()
+				defer mu.Unlock()
+				if failed {
+					return nil
+				}
+				if !need[sb.Ref] {
+					// dup, lost race from other replica
+					return nil
+				}
+				delete(need, sb.Ref)
+				if err := fn(sb); err != nil {
+					failed = true
+					return err
+				}
+				return nil
+			})
+		})
 	}
 
-	var retErr error
-	for range sto.readReplicas {
-		if err := <-errc; err != nil {
-			retErr = err
-		}
-	}
-	close(ch)
-	<-donec
-
-	// Safe to access need map now; as helper goroutine is
-	// done with it.
-	if len(need) == 0 {
-		return nil
-	}
-	return retErr
+	return group.Wait()
 }
 
 type sizedBlobAndError struct {
@@ -194,7 +190,7 @@ type sizedBlobAndError struct {
 	err error
 }
 
-func (sto *replicaStorage) ReceiveBlob(br blob.Ref, src io.Reader) (_ blob.SizedRef, err error) {
+func (sto *replicaStorage) ReceiveBlob(ctx context.Context, br blob.Ref, src io.Reader) (_ blob.SizedRef, err error) {
 	// Slurp the whole blob before replicating. Bounded by 16 MB anyway.
 	var buf bytes.Buffer
 	size, err := io.Copy(&buf, src)
@@ -207,7 +203,7 @@ func (sto *replicaStorage) ReceiveBlob(br blob.Ref, src io.Reader) (_ blob.Sized
 	uploadToReplica := func(idx int, dst blobserver.BlobReceiver) {
 		// Using ReceiveNoHash because it's already been
 		// verified implicitly by the io.Copy above:
-		sb, err := blobserver.ReceiveNoHash(dst, br, bytes.NewReader(buf.Bytes()))
+		sb, err := blobserver.ReceiveNoHash(ctx, dst, br, bytes.NewReader(buf.Bytes()))
 		resc <- sizedBlobAndError{idx, sb, err}
 	}
 	for idx, replica := range sto.replicas {
@@ -242,10 +238,10 @@ func (sto *replicaStorage) ReceiveBlob(br blob.Ref, src io.Reader) (_ blob.Sized
 	return
 }
 
-func (sto *replicaStorage) RemoveBlobs(blobs []blob.Ref) error {
+func (sto *replicaStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	errch := make(chan error, buffered)
 	removeFrom := func(s blobserver.Storage) {
-		errch <- s.RemoveBlobs(blobs)
+		errch <- s.RemoveBlobs(ctx, blobs)
 	}
 	for _, replica := range sto.replicas {
 		go removeFrom(replica)

@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,20 +19,21 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"sort"
 	"sync"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/images"
-	"camlistore.org/pkg/jsonsign/signhandler"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/images"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/jsonsign/signhandler"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/types/camtypes"
 
 	"go4.org/jsonconfig"
 	"go4.org/types"
@@ -66,6 +67,7 @@ type RootHandler struct {
 	searchInitOnce sync.Once // runs searchInit, which populates searchHandler
 	searchInit     func()
 	searchHandler  *search.Handler // of SearchRoot, or nil
+	hasLegacySHA1  bool            // whether the index has SHA1 blobs. requires searchHandler.
 
 	ui   *UIHandler           // or nil, if none configured
 	sigh *signhandler.Handler // or nil, if none configured
@@ -146,6 +148,10 @@ func newRootFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (h http.Handle
 				log.Fatalf("Error fetching SearchRoot at %q: %v", prefix, err)
 			}
 			root.searchHandler = h.(*search.Handler)
+			// the result from root.searchHandler.HasLegacySHA1() is determined on index
+			// startup, and never changes during the server's lifetime, so we might as well
+			// cache it here too.
+			root.hasLegacySHA1 = root.searchHandler.HasLegacySHA1()
 			root.searchInit = nil
 		}
 	}
@@ -185,15 +191,26 @@ func (rh *RootHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ui/", http.StatusMovedPermanently)
 		return
 	}
-	if r.URL.Path == "/favicon.ico" {
+	switch r.URL.Path {
+	case "/favicon.ico":
 		ServeStaticFile(w, r, Files, "favicon.ico")
 		return
+	case "/mobile-setup":
+		http.Redirect(w, r, "/ui/mobile.html", http.StatusFound)
+		return
+	case "/":
+		break
+	default:
+		http.NotFound(w, r)
+		return
 	}
+
 	f := func(p string, a ...interface{}) {
 		fmt.Fprintf(w, p, a...)
 	}
-	f("<html><body><p>This is camlistored (%s), a "+
-		"<a href='http://camlistore.org'>Camlistore</a> server.</p>", buildinfo.Version())
+	f("<html><body><p>This is perkeepd (%s), a "+
+		"<a href='http://perkeep.org'>Perkeep</a> server.</p>",
+		html.EscapeString(buildinfo.Summary()))
 	if rh.ui != nil {
 		f("<p>To manage your content, access the <a href='%s'>%s</a>.</p>", rh.ui.prefix, rh.ui.prefix)
 	}
@@ -255,6 +272,7 @@ func (rh *RootHandler) serveDiscovery(rw http.ResponseWriter, req *http.Request)
 		}
 		d.SyncHandlers = syncHandlers
 	}
+	d.HasLegacySHA1Index = rh.hasLegacySHA1
 	discoveryHelper(rw, req, d)
 }
 

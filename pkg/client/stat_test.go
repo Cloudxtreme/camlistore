@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 )
 
 // Note: a few of the fields are here are before the protocol change
-// (camlistore.org/issue/123) but preserved to make sure we don't
+// (perkeep.org/issue/123) but preserved to make sure we don't
 // choke on them.
 var response = `{
    "stat": [

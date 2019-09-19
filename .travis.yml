@@ -1,14 +1,21 @@
 sudo: required
 dist: trusty
-go_import_path: camlistore.org
+go_import_path: perkeep.org
 language: go
 go:
-  - 1.9
+  - "1.12.x"
 before_install:
-  - sudo apt-get install -qq pkg-config fuse
+  - sudo apt-get install -qq pkg-config fuse build-essential
   - sudo modprobe fuse
   - sudo chmod 666 /dev/fuse
   - sudo chown root:$USER /etc/fuse.conf
-install: go run make.go -v
-before_script: go build -o ./bin/devcam ./dev/devcam
-script: ./bin/devcam test
+install: go run make.go -v=true -sqlite=true
+script: ${GOPATH}/bin/devcam test -sqlite=true
+
+notifications:
+    webhooks:
+        urls:
+            - "https://scalar.vector.im/api/neb/services/hooks/dHJhdmlzLWNpLyU0MGxpbmRuZXIlM0FtYXRyaXgub3JnLyUyMW5yT1prcEV0UG1WeEFnaGxTSCUzQW1hdHJpeC5vcmc"
+        on_success: change  # always|never|change
+        on_failure: always
+        on_start: never

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors.
+Copyright 2014 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 // Package app helps with configuring and starting server applications
-// from Camlistore.
+// from Perkeep.
 // See also https://camlistore.org/doc/app-environment for the related
 // variables.
-package app // import "camlistore.org/pkg/server/app"
+package app // import "perkeep.org/pkg/server/app"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -35,18 +36,18 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	camhttputil "camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/netutil"
-	"camlistore.org/pkg/search"
+	camhttputil "perkeep.org/internal/httputil"
+	"perkeep.org/internal/netutil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/search"
 
 	"go4.org/jsonconfig"
 )
 
 // Handler acts as a reverse proxy for a server application started by
-// Camlistore. It can also serve some extra JSON configuration to the app.
+// Perkeep. It can also serve some extra JSON configuration to the app.
 // In addition, the handler can be used as a limited search handler proxy.
 type Handler struct {
 	name    string            // Name of the app's program.
@@ -68,7 +69,7 @@ type Handler struct {
 	domainBlobsRefresh time.Time // last time the domainBlobs were refreshed
 
 	// Prefix is the URL path prefix where the app handler is mounted on
-	// Camlistore, stripped of its trailing slash. Examples:
+	// Perkeep, stripped of its trailing slash. Examples:
 	// "/pics", "/blog".
 	prefix             string
 	proxy              *httputil.ReverseProxy // For redirecting requests to the app.
@@ -140,7 +141,7 @@ func (a *Handler) handleMasterQuery(w http.ResponseWriter, r *http.Request) {
 	var masterQuery search.SearchQuery = *(sq)
 	des := *(masterQuery.Describe)
 	masterQuery.Describe = &des
-	sr, err := a.sh.Query(sq)
+	sr, err := a.sh.Query(r.Context(), sq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("error running master query: %v", err), 500)
 		return
@@ -171,7 +172,7 @@ func (a *Handler) refreshDomainBlobs() error {
 	var sq search.SearchQuery = *(a.masterQuery)
 	des := *(sq.Describe)
 	sq.Describe = &des
-	sr, err := a.sh.Query(&sq)
+	sr, err := a.sh.Query(context.TODO(), &sq)
 	if err != nil {
 		return fmt.Errorf("error running master query: %v", err)
 	}
@@ -207,7 +208,7 @@ func (a *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 		camhttputil.ServeJSONError(w, err)
 		return
 	}
-	sr, err := a.sh.Query(&sq)
+	sr, err := a.sh.Query(r.Context(), &sq)
 	if err != nil {
 		camhttputil.ServeJSONError(w, err)
 		return
@@ -290,7 +291,7 @@ func baseURL(serverBaseURL, listenAddr string) (string, error) {
 // jsonconfig.Obj.
 
 // HandlerConfig holds the configuration for an app Handler. See
-// https://camlistore.org/doc/app-environment for the corresponding environment
+// https://perkeep.org/doc/app-environment for the corresponding environment
 // variables. If developing an app, see FromJSONConfig and NewHandler for details
 // on where defaults are applied.
 type HandlerConfig struct {
@@ -300,7 +301,7 @@ type HandlerConfig struct {
 
 	// Prefix is the URL path prefix on APIHost where the app handler is mounted.
 	// It always ends with a trailing slash. Examples: "/pics/", "/blog/".
-	// Defaults to the Camlistore URL path prefix for this app handler.
+	// Defaults to the Perkeep URL path prefix for this app handler.
 	Prefix string `json:"prefix,omitempty"`
 
 	// Listen is the address (of the form host|ip:port) on which the app
@@ -309,7 +310,7 @@ type HandlerConfig struct {
 	// part and a random port.
 	Listen string `json:"listen,omitempty"`
 
-	// ServerListen is the Camlistore server's listen address. Defaults to
+	// ServerListen is the Perkeep server's listen address. Defaults to
 	// the ServerBaseURL host part.
 	ServerListen string `json:"serverListen,omitempty"`
 
@@ -320,11 +321,11 @@ type HandlerConfig struct {
 	// scheme, the ServerBaseURL host part, and the port of Listen.
 	BackendURL string `json:"backendURL,omitempty"`
 
-	// ServerBaseURL is the Camlistore server's BaseURL. Defaults to the
-	// BaseURL value in the Camlistore server configuration.
+	// ServerBaseURL is the Perkeep server's BaseURL. Defaults to the
+	// BaseURL value in the Perkeep server configuration.
 	ServerBaseURL string `json:"serverBaseURL,omitempty"`
 
-	// APIHost is the URL of the Camlistore server which the app should
+	// APIHost is the URL of the Perkeep server which the app should
 	// use to make API calls. It always ends in a trailing slash. It defines CAMLI_API_HOST.
 	// If empty, the default is ServerBaseURL, with a trailing slash appended.
 	APIHost string `json:"apiHost,omitempty"`
@@ -377,7 +378,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 			}
 			parsedUrl, err := url.Parse(cfg.ServerBaseURL)
 			if err != nil {
-				return nil, fmt.Errorf("app: could not initialize Handler for %q: unparsable ServerBaseURL %q", name, cfg.ServerBaseURL, err)
+				return nil, fmt.Errorf("app: could not initialize Handler for %q: unparseable ServerBaseURL %q: %v", name, cfg.ServerBaseURL, err)
 			}
 			serverListen = parsedUrl.Host
 		}
@@ -471,7 +472,7 @@ func (a *Handler) Start() error {
 	if binPath == "" || err != nil {
 		binPath, err = exec.LookPath(name)
 		if err != nil {
-			return fmt.Errorf("%q executable not found in PATH.", name)
+			return fmt.Errorf("%q executable not found in PATH", name)
 		}
 	}
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore Authors
+Copyright 2015 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ limitations under the License.
 package camtypes
 
 import (
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 
 	"go4.org/types"
 )
@@ -47,6 +47,12 @@ type Discovery struct {
 	// AuthToken is an auth.OpAll token used by the web UI and the WebSocket.
 	// It is randomly generated the first time discovery is served.
 	AuthToken string `json:"authToken"`
+
+	// HasLegacySHA1Index reports whether this server
+	// contains legacy SHA-1 sums of files in its wholeref
+	// index. When true, clients can additional compute the SHA-1 of
+	// local files to upload to avoid uploading duplicates.
+	HasLegacySHA1Index bool `json:"hasLegacySHA1Index"`
 
 	// SyncHandlers lists discovery information about the available sync handlers.
 	SyncHandlers []SyncHandlerDiscovery `json:"syncHandlers,omitempty"`
@@ -98,6 +104,8 @@ type UIDiscovery struct {
 	PublishRoots map[string]*PublishRootDiscovery `json:"publishRoots"`
 	// MapClustering defines whether to cluster position markers on the map aspect.
 	MapClustering bool `json:"mapClustering"`
+	// ImportShare is the path to the share importer handler.
+	ImportShare string `json:"importShare"`
 }
 
 // PublishRootDiscovery contains discovery information for the publish roots.

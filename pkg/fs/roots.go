@@ -1,7 +1,7 @@
 // +build linux darwin
 
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ limitations under the License.
 package fs
 
 import (
-	"log"
+	"context"
 	"os"
 	"strings"
 	"sync"
@@ -27,11 +27,10 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/search"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
 )
 
 const refreshTime = 1 * time.Minute
@@ -83,7 +82,7 @@ func (n *rootsDir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	for name := range n.m {
 		ents = append(ents, fuse.Dirent{Name: name})
 	}
-	log.Printf("rootsDir.ReadDirAll() -> %v", ents)
+	Logger.Printf("rootsDir.ReadDirAll() -> %v", ents)
 	return ents, nil
 }
 
@@ -103,9 +102,9 @@ func (n *rootsDir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 
 	claim := schema.NewDelAttributeClaim(br, "camliRoot", "")
-	_, err := n.fs.client.UploadAndSignBlob(claim)
+	_, err := n.fs.client.UploadAndSignBlob(ctx, claim)
 	if err != nil {
-		log.Println("rootsDir.Remove:", err)
+		Logger.Println("rootsDir.Remove:", err)
 		return fuse.EIO
 	}
 
@@ -116,7 +115,7 @@ func (n *rootsDir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 }
 
 func (n *rootsDir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
-	log.Printf("rootsDir.Rename %q -> %q", req.OldName, req.NewName)
+	Logger.Printf("rootsDir.Rename %q -> %q", req.OldName, req.NewName)
 	if n.isRO() {
 		return fuse.EPERM
 	}
@@ -126,11 +125,11 @@ func (n *rootsDir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir f
 	_, collision := n.m[req.NewName]
 	n.mu.Unlock()
 	if !exists {
-		log.Printf("*rootsDir.Rename src name %q isn't known", req.OldName)
+		Logger.Printf("*rootsDir.Rename src name %q isn't known", req.OldName)
 		return fuse.ENOENT
 	}
 	if collision {
-		log.Printf("*rootsDir.Rename dest %q already exists", req.NewName)
+		Logger.Printf("*rootsDir.Rename dest %q already exists", req.NewName)
 		return fuse.EIO
 	}
 
@@ -139,27 +138,27 @@ func (n *rootsDir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir f
 	// before asking for the directory name.
 	res, err := n.fs.client.Describe(ctx, &search.DescribeRequest{BlobRef: target})
 	if err != nil {
-		log.Println("rootsDir.Rename:", err)
+		Logger.Println("rootsDir.Rename:", err)
 		return fuse.EIO
 	}
 	db := res.Meta[target.String()]
 	if db == nil {
-		log.Printf("Failed to pull meta for target: %v", target)
+		Logger.Printf("Failed to pull meta for target: %v", target)
 		return fuse.EIO
 	}
 
 	for k := range db.Permanode.Attr {
 		const p = "camliPath:"
 		if strings.HasPrefix(k, p) {
-			log.Printf("Found file in %q: %q, disallowing rename", req.OldName, k[len(p):])
+			Logger.Printf("Found file in %q: %q, disallowing rename", req.OldName, k[len(p):])
 			return fuse.EIO
 		}
 	}
 
 	claim := schema.NewSetAttributeClaim(target, "camliRoot", req.NewName)
-	_, err = n.fs.client.UploadAndSignBlob(claim)
+	_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
 	if err != nil {
-		log.Printf("Upload rename link error: %v", err)
+		Logger.Printf("Upload rename link error: %v", err)
 		return fuse.EIO
 	}
 
@@ -182,7 +181,7 @@ func (n *rootsDir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir f
 }
 
 func (n *rootsDir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	log.Printf("fs.roots: Lookup(%q)", name)
+	Logger.Printf("fs.roots: Lookup(%q)", name)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if err := n.condRefresh(ctx); err != nil {
@@ -218,21 +217,21 @@ func (n *rootsDir) condRefresh(ctx context.Context) error {
 	if n.lastQuery.After(time.Now().Add(-refreshTime)) {
 		return nil
 	}
-	log.Printf("fs.roots: querying")
+	Logger.Printf("fs.roots: querying")
 
 	var rootRes, impRes *search.WithAttrResponse
 	var grp syncutil.Group
 	grp.Go(func() (err error) {
 		// TODO(mpl): use a search query instead.
-		rootRes, err = n.fs.client.GetPermanodesWithAttr(&search.WithAttrRequest{N: 100, Attr: "camliRoot", At: n.at})
+		rootRes, err = n.fs.client.GetPermanodesWithAttr(ctx, &search.WithAttrRequest{N: 100, Attr: "camliRoot", At: n.at})
 		return
 	})
 	grp.Go(func() (err error) {
-		impRes, err = n.fs.client.GetPermanodesWithAttr(&search.WithAttrRequest{N: 100, Attr: "camliImportRoot", At: n.at})
+		impRes, err = n.fs.client.GetPermanodesWithAttr(ctx, &search.WithAttrRequest{N: 100, Attr: "camliImportRoot", At: n.at})
 		return
 	})
 	if err := grp.Err(); err != nil {
-		log.Printf("fs.roots: error refreshing permanodes: %v", err)
+		Logger.Printf("fs.roots: error refreshing permanodes: %v", err)
 		return fuse.EIO
 	}
 
@@ -256,7 +255,7 @@ func (n *rootsDir) condRefresh(ctx context.Context) error {
 
 	dres, err := n.fs.client.Describe(ctx, dr)
 	if err != nil {
-		log.Printf("Describe failure: %v", err)
+		Logger.Printf("Describe failure: %v", err)
 		return fuse.EIO
 	}
 
@@ -308,9 +307,9 @@ func (n *rootsDir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, 
 	name := req.Name
 
 	// Create a Permanode for the root.
-	pr, err := n.fs.client.UploadNewPermanode()
+	pr, err := n.fs.client.UploadNewPermanode(ctx)
 	if err != nil {
-		log.Printf("rootsDir.Create(%q): %v", name, err)
+		Logger.Printf("rootsDir.Create(%q): %v", name, err)
 		return nil, fuse.EIO
 	}
 
@@ -318,17 +317,17 @@ func (n *rootsDir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, 
 	// Add a camliRoot attribute to the root permanode.
 	grp.Go(func() (err error) {
 		claim := schema.NewSetAttributeClaim(pr.BlobRef, "camliRoot", name)
-		_, err = n.fs.client.UploadAndSignBlob(claim)
+		_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
 		return
 	})
 	// Set the title of the root permanode to the root name.
 	grp.Go(func() (err error) {
 		claim := schema.NewSetAttributeClaim(pr.BlobRef, "title", name)
-		_, err = n.fs.client.UploadAndSignBlob(claim)
+		_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
 		return
 	})
 	if err := grp.Err(); err != nil {
-		log.Printf("rootsDir.Create(%q): %v", name, err)
+		Logger.Printf("rootsDir.Create(%q): %v", name, err)
 		return nil, fuse.EIO
 	}
 

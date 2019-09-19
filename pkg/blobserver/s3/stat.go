@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,38 +17,35 @@ limitations under the License.
 package s3
 
 import (
+	"context"
 	"fmt"
-	"os"
 
-	"camlistore.org/pkg/blob"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 
 	"go4.org/syncutil"
 )
 
 var statGate = syncutil.NewGate(20) // arbitrary
 
-func (sto *s3Storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) (err error) {
+func (sto *s3Storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) (err error) {
 	if faultStat.FailErr(&err) {
 		return
 	}
-	// TODO: use sto.cache
-	var wg syncutil.Group
-	for _, br := range blobs {
-		br := br
-		statGate.Start()
-		wg.Go(func() error {
-			defer statGate.Done()
 
-			size, err := sto.s3Client.Stat(sto.dirPrefix+br.String(), sto.bucket)
-			if err == nil {
-				dest <- blob.SizedRef{Ref: br, Size: uint32(size)}
-				return nil
-			}
-			if err == os.ErrNotExist {
-				return nil
-			}
-			return fmt.Errorf("error statting %v: %v", br, err)
+	return blobserver.StatBlobsParallelHelper(ctx, blobs, fn, statGate, func(br blob.Ref) (sb blob.SizedRef, err error) {
+		resp, err := sto.client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+			Bucket: &sto.bucket,
+			Key:    aws.String(sto.dirPrefix + br.String()),
 		})
-	}
-	return wg.Err()
+		if err == nil {
+			return blob.SizedRef{Ref: br, Size: uint32(*resp.ContentLength)}, nil
+		}
+		if isNotFound(err) {
+			return sb, nil
+		}
+		return sb, fmt.Errorf("error statting %v: %v", br, err)
+	})
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,18 +17,17 @@ limitations under the License.
 package blobserver
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/constants"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/constants"
 )
 
-// MaxBlobSize is the size of a single blob in Camlistore.
+// MaxBlobSize is the size of a single blob in Perkeep.
 const MaxBlobSize = constants.MaxBlobSize
 
 var (
@@ -38,7 +37,7 @@ var (
 	ErrNotImplemented = errors.New("not implemented")
 )
 
-// BlobReceiver is the interface for receiving
+// BlobReceiver is the interface for receiving blobs.
 type BlobReceiver interface {
 	// ReceiveBlob accepts a newly uploaded blob and writes it to
 	// permanent storage.
@@ -53,30 +52,21 @@ type BlobReceiver interface {
 	// blobserver.Receive or blobserver.ReceiveString, which also
 	// take care of notifying the BlobReceiver's "BlobHub"
 	// notification bus for observers.
-	ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error)
+	ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error)
 }
 
+// BlobStatter is the interface for checking the size and existence of blobs.
 type BlobStatter interface {
-	// Stat checks for the existence of blobs, writing their sizes
-	// (if found back to the dest channel), and returning an error
-	// or nil.  Stat() should NOT close the channel.
-	// TODO(bradfitz): redefine this to close the channel? Or document
-	// better what the synchronization rules are.
-	StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error
-}
-
-func StatBlob(bs BlobStatter, br blob.Ref) (sb blob.SizedRef, err error) {
-	c := make(chan blob.SizedRef, 1)
-	err = bs.StatBlobs(c, []blob.Ref{br})
-	if err != nil {
-		return
-	}
-	select {
-	case sb = <-c:
-	default:
-		err = os.ErrNotExist
-	}
-	return
+	// Stat checks for the existence of blobs, calling fn in
+	// serial for each found blob, in any order, but with no
+	// duplicates. The blobs slice should not have duplicates.
+	//
+	// If fn returns an error, StatBlobs returns with that value
+	// and makes no further calls to fn.
+	//
+	// StatBlobs does not return an error on missing blobs, only
+	// on failure to stat blobs.
+	StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error
 }
 
 type StatReceiver interface {
@@ -160,11 +150,13 @@ type Config struct {
 }
 
 type BlobRemover interface {
-	// RemoveBlobs removes 0 or more blobs.  Removal of
-	// non-existent items isn't an error.  Returns failure if any
+	// RemoveBlobs removes 0 or more blobs. Removal of
+	// non-existent items isn't an error. Returns failure if any
 	// items existed but failed to be deleted.
 	// ErrNotImplemented may be returned for storage types not implementing removal.
-	RemoveBlobs(blobs []blob.Ref) error
+	// If RemoveBlobs returns an error, it's possible that either
+	// none or only some of the blobs were deleted.
+	RemoveBlobs(ctx context.Context, blobs []blob.Ref) error
 }
 
 // Storage is the interface that must be implemented by a blobserver
@@ -189,9 +181,10 @@ type StorageHandler interface {
 	http.Handler
 }
 
-// Optional interface for storage implementations which can be asked
-// to shut down cleanly. Regardless, all implementations should
-// be able to survive crashes without data loss.
+// ShutdownStorage is an optional interface for storage
+// implementations which can be asked to shut down
+// cleanly. Regardless, all implementations should be able to survive
+// crashes without data loss.
 type ShutdownStorage interface {
 	Storage
 	io.Closer
@@ -220,14 +213,14 @@ type GenerationNotSupportedError string
 func (s GenerationNotSupportedError) Error() string { return string(s) }
 
 /*
-The optional Generationer interface is an optimization and paranoia
+Generationer is an optional interface and an optimization and paranoia
 facility for clients which can be implemented by Storage
 implementations.
 
 If the client sees the same random string in multiple upload sessions,
 it assumes that the blobserver still has all the same blobs, and also
 it's the same server.  This mechanism is not fundamental to
-Camlistore's operation: the client could also check each blob before
+Perkeep's operation: the client could also check each blob before
 uploading, or enumerate all blobs from the server too.  This is purely
 an optimization so clients can mix this value into their "is this file
 uploaded?" local cache keys.

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package sorted provides a KeyValue interface and constructor registry.
-package sorted // import "camlistore.org/pkg/sorted"
+package sorted // import "perkeep.org/pkg/sorted"
 
 import (
 	"errors"
@@ -71,6 +71,16 @@ type KeyValue interface {
 	// Implementations should never lose data after a Set, Delete,
 	// or CommmitBatch, though.
 	Close() error
+}
+
+// TransactionalReader is an optional interface that may be implemented by storage
+// implementations. It may be implemented when a storage backend supports multiple
+// atomic reads.
+type TransactionalReader interface {
+	KeyValue
+
+	// BeginReadTx begins a read-only transaction.
+	BeginReadTx() ReadTransaction
 }
 
 // Wiper is an optional interface that may be implemented by storage
@@ -132,6 +142,20 @@ type Iterator interface {
 	// all the key/value pairs in a table is not considered to be an error.
 	// It is valid to call Close multiple times. Other methods should not be
 	// called after the iterator has been closed.
+	Close() error
+}
+
+// ReadTransaction is a read-only transaction on a KeyValue. It admits the same read
+// operations as the KeyValue itself, but writes that occur after the transaction is
+// created are not observed.
+//
+// Users should close the transaction as soon as it as no longer needed, as failing
+// to do so can tie up resources.
+type ReadTransaction interface {
+	Get(key string) (string, error)
+	Find(start, end string) Iterator
+
+	// End the transaction.
 	Close() error
 }
 

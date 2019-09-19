@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 // Package auth implements Camlistore authentication.
-package auth // import "camlistore.org/pkg/auth"
+package auth // import "perkeep.org/pkg/auth"
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -27,7 +28,7 @@ import (
 	"strings"
 	"sync"
 
-	"camlistore.org/pkg/httputil"
+	"perkeep.org/internal/httputil"
 )
 
 // Operation represents a bitmask of operations. See the OpX constants.
@@ -242,11 +243,11 @@ type UserPass struct {
 func (up *UserPass) AllowedAccess(req *http.Request) Operation {
 	user, pass, err := httputil.BasicAuth(req)
 	if err == nil {
-		if user == up.Username {
-			if pass == up.Password {
+		if subtle.ConstantTimeCompare([]byte(user), []byte(up.Username)) == 1 {
+			if subtle.ConstantTimeCompare([]byte(pass), []byte(up.Password)) == 1 {
 				return OpAll
 			}
-			if up.VivifyPass != nil && pass == *up.VivifyPass {
+			if up.VivifyPass != nil && subtle.ConstantTimeCompare([]byte(pass), []byte(*up.VivifyPass)) == 1 {
 				return OpVivify
 			}
 		}
@@ -339,7 +340,7 @@ func IsLocalhost(req *http.Request) bool {
 // against am.
 func AllowedWithAuth(am AuthMode, req *http.Request, op Operation) bool {
 	if op&OpUpload != 0 {
-		// upload (at least from camput) requires stat and get too
+		// upload (at least from pk-put) requires stat and get too
 		op = op | OpVivify
 	}
 	return am.AllowedAccess(req)&op == op
@@ -462,6 +463,15 @@ func DiscoveryToken() string {
 		return OmitAuthToken
 	}
 	return Token()
+}
+
+// TokenOrNone returns a token auth mode if token is not OmitAuthToken, and
+// otherwise a None auth mode.
+func TokenOrNone(token string) (AuthMode, error) {
+	if token == OmitAuthToken {
+		return None{}, nil
+	}
+	return NewTokenAuth(token)
 }
 
 func genProcessRand() {

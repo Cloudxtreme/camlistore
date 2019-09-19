@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Camlistore Authors.
+Copyright 2017 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // The scancab tool scans document and uploads them to the scanning cabinet
-// Camlistore application.
+// Perkeep application.
 package main
 
 import (
@@ -37,8 +37,8 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/buildinfo"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/buildinfo"
 )
 
 var (
@@ -264,7 +264,7 @@ func batchScanHelper(img string) {
 		log.Fatalf("Could not get self pid through /proc/self: %v", err)
 	}
 	pid := pidfi.Name()
-	fmt.Printf("[%d] Got format: %v for %v", pid, scanFormat, filebase)
+	fmt.Printf("[%s] Got format: %v for %v", pid, scanFormat, filebase)
 
 	ext := "jpg"
 	if os.Getenv("SCAN_LINEART") != "" {
@@ -479,7 +479,7 @@ func main() {
 	checkSanity()
 
 	if *flagVersion {
-		fmt.Fprintf(os.Stderr, "scancab version: %s\n", buildinfo.Version())
+		fmt.Fprintf(os.Stderr, "scancab version: %s\n", buildinfo.Summary())
 		return
 	}
 

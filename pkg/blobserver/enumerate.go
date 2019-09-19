@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ limitations under the License.
 package blobserver
 
 import (
+	"context"
 	"sync"
 
-	"camlistore.org/pkg/blob"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
 )
 
 // EnumerateAll runs fn for each blob in src.

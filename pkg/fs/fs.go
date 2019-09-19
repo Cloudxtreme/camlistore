@@ -1,7 +1,7 @@
 // +build linux darwin
 
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,11 +16,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package fs implements a FUSE filesystem for Camlistore and is
-// used by the cammount binary.
-package fs // import "camlistore.org/pkg/fs"
+// Package fs implements a FUSE filesystem for Perkeep and is
+// used by the pk-mount binary.
+package fs // import "perkeep.org/pkg/fs"
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -28,17 +29,21 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/lru"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/lru"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/client"
+	"perkeep.org/pkg/schema"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"golang.org/x/net/context"
 )
 
-var serverStart = time.Now()
+var (
+	serverStart = time.Now()
+	// Logger is used by the package to print all sorts of debugging statements. It
+	// is up to the user of the package to SetOutput the Logger to reduce verbosity.
+	Logger = log.New(os.Stderr, "PerkeepFS: ", log.LstdFlags)
+)
 
 type CamliFileSystem struct {
 	fetcher blob.Fetcher
@@ -164,7 +169,7 @@ func (n *node) schema() (*schema.Blob, error) {
 	if n.meta != nil {
 		return n.meta, nil
 	}
-	blob, err := n.fs.fetchSchemaMeta(n.blobref)
+	blob, err := n.fs.fetchSchemaMeta(context.TODO(), n.blobref)
 	if err == nil {
 		n.meta = blob
 		n.populateAttr()
@@ -180,13 +185,13 @@ func isWriteFlags(flags fuse.OpenFlags) bool {
 var _ fusefs.NodeOpener = (*node)(nil)
 
 func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fusefs.Handle, error) {
-	log.Printf("CAMLI Open on %v: %#v", n.blobref, req)
+	Logger.Printf("CAMLI Open on %v: %#v", n.blobref, req)
 	if isWriteFlags(req.Flags) {
 		return nil, fuse.EPERM
 	}
 	ss, err := n.schema()
 	if err != nil {
-		log.Printf("open of %v: %v", n.blobref, err)
+		Logger.Printf("open of %v: %v", n.blobref, err)
 		return nil, fuse.EIO
 	}
 	if ss.Type() == "directory" {
@@ -195,7 +200,7 @@ func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 	fr, err := ss.NewFileReader(n.fs.fetcher)
 	if err != nil {
 		// Will only happen if ss.Type != "file" or "bytes"
-		log.Printf("NewFileReader(%s) = %v", n.blobref, err)
+		Logger.Printf("NewFileReader(%s) = %v", n.blobref, err)
 		return nil, fuse.EIO
 	}
 	return &nodeReader{n: n, fr: fr}, nil
@@ -209,7 +214,7 @@ type nodeReader struct {
 var _ fusefs.HandleReader = (*nodeReader)(nil)
 
 func (nr *nodeReader) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
-	log.Printf("CAMLI nodeReader READ on %v: %#v", nr.n.blobref, req)
+	Logger.Printf("CAMLI nodeReader READ on %v: %#v", nr.n.blobref, req)
 	if req.Offset >= nr.fr.Size() {
 		return nil
 	}
@@ -223,7 +228,7 @@ func (nr *nodeReader) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse
 		err = nil
 	}
 	if err != nil {
-		log.Printf("camli read on %v at %d: %v", nr.n.blobref, req.Offset, err)
+		Logger.Printf("camli read on %v at %d: %v", nr.n.blobref, req.Offset, err)
 		return fuse.EIO
 	}
 	res.Data = buf[:n]
@@ -233,7 +238,7 @@ func (nr *nodeReader) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse
 var _ fusefs.HandleReleaser = (*nodeReader)(nil)
 
 func (nr *nodeReader) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-	log.Printf("CAMLI nodeReader RELEASE on %v", nr.n.blobref)
+	Logger.Printf("CAMLI nodeReader RELEASE on %v", nr.n.blobref)
 	nr.fr.Close()
 	return nil
 }
@@ -241,7 +246,7 @@ func (nr *nodeReader) Release(ctx context.Context, req *fuse.ReleaseRequest) err
 var _ fusefs.HandleReadDirAller = (*node)(nil)
 
 func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	log.Printf("CAMLI ReadDirAll on %v", n.blobref)
+	Logger.Printf("CAMLI ReadDirAll on %v", n.blobref)
 	n.dmu.Lock()
 	defer n.dmu.Unlock()
 	if n.dirents != nil {
@@ -250,17 +255,17 @@ func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	ss, err := n.schema()
 	if err != nil {
-		log.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
 		return nil, fuse.EIO
 	}
-	dr, err := schema.NewDirReader(n.fs.fetcher, ss.BlobRef())
+	dr, err := schema.NewDirReader(ctx, n.fs.fetcher, ss.BlobRef())
 	if err != nil {
-		log.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
 		return nil, fuse.EIO
 	}
-	schemaEnts, err := dr.Readdir(-1)
+	schemaEnts, err := dr.Readdir(ctx, -1)
 	if err != nil {
-		log.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
 		return nil, fuse.EIO
 	}
 	n.dirents = make([]fuse.Dirent, 0)
@@ -308,7 +313,7 @@ func (n *node) populateAttr() error {
 	case "symlink":
 		n.attr.Mode |= 0400
 	default:
-		log.Printf("unknown attr ss.Type %q in populateAttr", meta.Type())
+		Logger.Printf("unknown attr ss.Type %q in populateAttr", meta.Type())
 	}
 	return nil
 }
@@ -334,24 +339,24 @@ func (fs *CamliFileSystem) Statfs(ctx context.Context, req *fuse.StatfsRequest, 
 // Errors returned are:
 //    os.ErrNotExist -- blob not found
 //    os.ErrInvalid -- not JSON or a camli schema blob
-func (fs *CamliFileSystem) fetchSchemaMeta(br blob.Ref) (*schema.Blob, error) {
+func (fs *CamliFileSystem) fetchSchemaMeta(ctx context.Context, br blob.Ref) (*schema.Blob, error) {
 	blobStr := br.String()
 	if blob, ok := fs.blobToSchema.Get(blobStr); ok {
 		return blob.(*schema.Blob), nil
 	}
 
-	rc, _, err := fs.fetcher.Fetch(br)
+	rc, _, err := fs.fetcher.Fetch(ctx, br)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
 	blob, err := schema.BlobFromReader(br, rc)
 	if err != nil {
-		log.Printf("Error parsing %s as schema blob: %v", br, err)
+		Logger.Printf("Error parsing %s as schema blob: %v", br, err)
 		return nil, os.ErrInvalid
 	}
 	if blob.Type() == "" {
-		log.Printf("blob %s is JSON but lacks camliType", br)
+		Logger.Printf("blob %s is JSON but lacks camliType", br)
 		return nil, os.ErrInvalid
 	}
 	fs.blobToSchema.Add(blobStr, blob)
@@ -360,7 +365,7 @@ func (fs *CamliFileSystem) fetchSchemaMeta(br blob.Ref) (*schema.Blob, error) {
 
 // consolated logic for determining a node to mount based on an arbitrary blobref
 func (fs *CamliFileSystem) newNodeFromBlobRef(root blob.Ref) (fusefs.Node, error) {
-	blob, err := fs.fetchSchemaMeta(root)
+	blob, err := fs.fetchSchemaMeta(context.TODO(), root)
 	if err != nil {
 		return nil, err
 	}

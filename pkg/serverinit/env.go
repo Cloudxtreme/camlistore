@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +21,26 @@ import (
 	"os"
 	"strings"
 
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/types/serverconfig"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/types/serverconfig"
 
 	"cloud.google.com/go/compute/metadata"
+)
+
+// For getting a name in camlistore.net
+const (
+	// CamliNetDNS is the hostname of the camlistore.net DNS server.
+	CamliNetDNS = "camnetdns.camlistore.org"
+	// CamliNetDomain is the camlistore.net domain name. It is relevant to
+	// Perkeep, because a deployment through the Perkeep on Google Cloud launcher
+	// automatically offers a subdomain name in this domain to any instance.
+	CamliNetDomain = "camlistore.net"
+
+	// useDBNamesConfig is a sentinel value for DBUnique to indicate that we want the
+	// low-level configuration generator to keep on using the old DBNames
+	// style configuration for database names.
+	useDBNamesConfig = "useDBNamesConfig"
 )
 
 // DefaultEnvConfig returns the default configuration when running on a known
@@ -53,7 +68,7 @@ func DefaultEnvConfig() (*Config, error) {
 	if v := osutil.SecretRingFile(); !strings.HasPrefix(v, "/gcs/") {
 		return nil, fmt.Errorf("Internal error: secret ring path on GCE should be at /gcs/, not %q", v)
 	}
-	keyId, secRing, err := getOrMakeKeyring()
+	keyID, secRing, err := getOrMakeKeyring()
 	if err != nil {
 		return nil, err
 	}
@@ -61,21 +76,24 @@ func DefaultEnvConfig() (*Config, error) {
 	highConf := &serverconfig.Config{
 		Auth:               auth,
 		HTTPS:              true,
-		Identity:           keyId,
+		Identity:           keyID,
 		IdentitySecretRing: secRing,
 		GoogleCloudStorage: ":" + strings.TrimPrefix(blobBucket, "gs://"),
-		DBNames:            map[string]string{},
 		PackRelated:        true,
 		ShareHandler:       true,
 	}
 
 	externalIP, _ := metadata.ExternalIP()
 	hostName, _ := metadata.InstanceAttributeValue("camlistore-hostname")
-	// If they specified a hostname (probably with camdeploy), then:
-	// if it looks like an FQDN, camlistored is going to rely on Let's
-	// Encrypt, else camlistored is going to generate some self-signed for that
+	// If they specified a hostname (probably with pk-deploy), then:
+	// if it looks like an FQDN, perkeepd is going to rely on Let's
+	// Encrypt, else perkeepd is going to generate some self-signed for that
 	// hostname.
-	if hostName != "" {
+	// Also, if the hostname is in camlistore.net, we want Perkeep to initialize
+	// exactly as if the instance had no hostname, so that it registers its hostname/IP
+	// with the camlistore.net DNS server (possibly needlessly, if the instance IP has
+	// not changed) again.
+	if hostName != "" && !strings.HasSuffix(hostName, CamliNetDomain) {
 		highConf.BaseURL = fmt.Sprintf("https://%s", hostName)
 		highConf.Listen = "0.0.0.0:443"
 	} else {
@@ -83,16 +101,31 @@ func DefaultEnvConfig() (*Config, error) {
 	}
 
 	// Detect a linked Docker MySQL container. It must have alias "mysqldb".
-	if v := os.Getenv("MYSQLDB_PORT"); strings.HasPrefix(v, "tcp://") {
-		hostPort := strings.TrimPrefix(v, "tcp://")
-		highConf.MySQL = "root@" + hostPort + ":" // no password
-		highConf.DBNames["queue-sync-to-index"] = "sync_index_queue"
-		highConf.DBNames["ui_thumbcache"] = "ui_thumbmeta_cache"
-		highConf.DBNames["blobpacked_index"] = "blobpacked_index"
-	} else {
+	mysqlPort := os.Getenv("MYSQLDB_PORT")
+	if !strings.HasPrefix(mysqlPort, "tcp://") {
+		// No MySQL
 		// TODO: also detect Cloud SQL.
 		highConf.KVFile = "/index.kv"
+		return genLowLevelConfig(highConf)
+	}
+	hostPort := strings.TrimPrefix(mysqlPort, "tcp://")
+	highConf.MySQL = "root@" + hostPort + ":" // no password
+	configVersion, err := metadata.InstanceAttributeValue("perkeep-config-version")
+	if configVersion == "" || err != nil {
+		// the launcher is deploying a pre-"perkeep-config-version" Perkeep, which means
+		// we want the old configuration, with DBNames
+		highConf.DBUnique = useDBNamesConfig
+	} else if configVersion != "1" {
+		return nil, fmt.Errorf("unexpected value for VM instance metadata key 'perkeep-config-version': %q", configVersion)
 	}
 
-	return genLowLevelConfig(highConf)
+	conf, err := genLowLevelConfig(highConf)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := conf.readFields(); err != nil {
+		return nil, err
+	}
+	return conf, nil
 }

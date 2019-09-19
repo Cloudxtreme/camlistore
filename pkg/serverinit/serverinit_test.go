@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,25 +34,26 @@ import (
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/jsonsign/signhandler"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/server"
-	"camlistore.org/pkg/serverinit"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/clientconfig"
-	"camlistore.org/pkg/types/serverconfig"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/jsonsign/signhandler"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/server"
+	"perkeep.org/pkg/serverinit"
+	"perkeep.org/pkg/test"
+	"perkeep.org/pkg/types/clientconfig"
+	"perkeep.org/pkg/types/serverconfig"
 
 	// For registering all the handler constructors needed in TestInstallHandlers
-	_ "camlistore.org/pkg/blobserver/cond"
-	_ "camlistore.org/pkg/blobserver/replica"
-	_ "camlistore.org/pkg/importer/allimporters"
-	_ "camlistore.org/pkg/search"
-	_ "camlistore.org/pkg/server"
+	_ "perkeep.org/pkg/blobserver/cond"
+	_ "perkeep.org/pkg/blobserver/replica"
+	_ "perkeep.org/pkg/importer/allimporters"
+	_ "perkeep.org/pkg/search"
+	_ "perkeep.org/pkg/server"
 )
 
 var (
@@ -72,6 +73,7 @@ func init() {
 	// Avoid Linux vs. OS X differences in tests.
 	serverinit.SetTempDirFunc(func() string { return "/tmp" })
 	serverinit.SetNoMkdir(true)
+	testhooks.SetUseSHA1(true)
 }
 
 func prettyPrint(t *testing.T, w io.Writer, v interface{}) {
@@ -144,7 +146,8 @@ func replaceRingPath(path string) ([]byte, error) {
 		return nil, err
 	}
 
-	return bytes.Replace(slurpBytes, []byte(secringPlaceholder), []byte(secRing), 1), nil
+	// twice: once in search owner, and once in sighelper.
+	return bytes.Replace(slurpBytes, []byte(secringPlaceholder), []byte(secRing), 2), nil
 }
 
 // We just need to make sure that we don't match the prefix handlers too.
@@ -198,7 +201,7 @@ func testConfig(name string, t *testing.T) {
 	if err != nil {
 		return
 	}
-	if err := (&jsonconfig.ConfigParser{}).CheckTypes(lowLevelConf.Obj); err != nil {
+	if err := (&jsonconfig.ConfigParser{}).CheckTypes(lowLevelConf.Export_Obj()); err != nil {
 		t.Fatalf("Error while parsing low-level conf generated from %v: %v", name, err)
 	}
 
@@ -210,7 +213,7 @@ func testConfig(name string, t *testing.T) {
 		t.Fatalf("test %s: ReadFile: %v", name, err)
 	}
 	if *updateGolden {
-		contents, err := json.MarshalIndent(lowLevelConf.Obj, "", "\t")
+		contents, err := json.MarshalIndent(lowLevelConf.Export_Obj(), "", "\t")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,7 +222,7 @@ func testConfig(name string, t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	compareConfigurations(t, name, lowLevelConf.Obj, wantConf)
+	compareConfigurations(t, name, lowLevelConf.Export_Obj(), wantConf)
 }
 
 func compareConfigurations(t *testing.T, name, g interface{}, w interface{}) {
@@ -238,7 +241,8 @@ func canonicalizeGolden(t *testing.T, v []byte) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v = bytes.Replace(v, []byte(localPath), []byte(secringPlaceholder), 1)
+	// twice: once in search owner, and once in sighelper.
+	v = bytes.Replace(v, []byte(localPath), []byte(secringPlaceholder), 2)
 	if !bytes.HasSuffix(v, []byte("\n")) {
 		v = append(v, '\n')
 	}
@@ -246,14 +250,14 @@ func canonicalizeGolden(t *testing.T, v []byte) []byte {
 }
 
 func TestExpansionsInHighlevelConfig(t *testing.T) {
-	camroot, err := osutil.GoPackagePath("camlistore.org")
+	camroot, err := osutil.GoPackagePath("perkeep.org")
 	if err != nil {
-		t.Fatalf("failed to find camlistore.org GOPATH root: %v", err)
+		t.Fatalf("failed to find perkeep.org GOPATH root: %v", err)
 	}
 	const keyID = "26F5ABDA"
 	os.Setenv("TMP_EXPANSION_TEST", keyID)
 	os.Setenv("TMP_EXPANSION_SECRING", filepath.Join(camroot, filepath.FromSlash("pkg/jsonsign/testdata/test-secring.gpg")))
-	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.CamliConfigDir
+	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.PerkeepConfigDir
 	defer os.Setenv("CAMLI_CONFIG_DIR", os.Getenv("CAMLI_CONFIG_DIR")) // restore after test
 	os.Setenv("CAMLI_CONFIG_DIR", "whatever")
 	conf, err := serverinit.Load([]byte(`
@@ -277,9 +281,9 @@ func TestExpansionsInHighlevelConfig(t *testing.T) {
 }
 
 func TestInstallHandlers(t *testing.T) {
-	camroot, err := osutil.GoPackagePath("camlistore.org")
+	camroot, err := osutil.GoPackagePath("perkeep.org")
 	if err != nil {
-		t.Fatalf("failed to find camlistore.org GOPATH root: %v", err)
+		t.Fatalf("failed to find perkeep.org GOPATH root: %v", err)
 	}
 	conf := serverinit.DefaultBaseConfig
 	conf.Identity = "26F5ABDA"
@@ -292,27 +296,17 @@ func TestInstallHandlers(t *testing.T) {
 		t.Fatalf("Could not json encode config: %v", err)
 	}
 
-	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.CamliConfigDir
+	// Setting CAMLI_CONFIG_DIR to avoid triggering failInTests in osutil.PerkeepConfigDir
 	defer os.Setenv("CAMLI_CONFIG_DIR", os.Getenv("CAMLI_CONFIG_DIR")) // restore after test
 	os.Setenv("CAMLI_CONFIG_DIR", "whatever")
 	lowConf, err := serverinit.Load(confData)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// because these two are normally consumed in camlistored.go
-	// TODO(mpl): serverinit.Load should consume these 2 as well. Once
-	// consumed, we should keep all the answers as private fields, and then we
-	// put accessors on serverinit.Config. Maybe we even stop embedding
-	// jsonconfig.Obj in serverinit.Config too, so none of those methods are
-	// accessible.
-	lowConf.OptionalBool("https", true)
-	lowConf.OptionalString("listen", "")
 
-	reindex := false
-	var context *http.Request // only used by App Engine. See handlerLoader in serverinit.go
 	hi := http.NewServeMux()
 	address := "http://" + conf.Listen
-	_, err = lowConf.InstallHandlers(hi, address, reindex, context)
+	_, err = lowConf.InstallHandlers(hi, address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +451,7 @@ func TestGenerateClientConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to generate low-level config: %v", err)
 	}
-	generatedConf, err := clientconfig.GenerateClientConfig(lowLevelConf.Obj)
+	generatedConf, err := clientconfig.GenerateClientConfig(lowLevelConf.Export_Obj())
 	if err != nil {
 		t.Fatalf("Failed to generate client config: %v", err)
 	}
@@ -478,14 +472,12 @@ func TestGenerateClientConfig(t *testing.T) {
 // TestConfigHandlerRedaction validates that configHandler redacts sensitive
 // values, still resulting in a valid JSON document.
 func TestConfigHandlerRedaction(t *testing.T) {
-	config := &serverinit.Config{
-		Obj: jsonconfig.Obj{
-			"auth":                  "secret",
-			"aws_secret_access_key": "secret",
-			"password":              "secret",
-			"client_secret":         "secret",
-		},
-	}
+	config := serverinit.ExportNewConfigFromObj(jsonconfig.Obj{
+		"auth":                  "secret",
+		"aws_secret_access_key": "secret",
+		"password":              "secret",
+		"client_secret":         "secret",
+	})
 
 	rr := httptest.NewRecorder()
 	serverinit.ConfigHandler(config).ServeHTTP(rr, nil)
@@ -504,16 +496,14 @@ func TestConfigHandlerRedaction(t *testing.T) {
 }
 
 // TestConfigHandlerRemoveKnownKeys validates that configHandler removes
-// "knowkeys" keys properly, still resulting in a valid JSON document.
+// "_knownkeys" keys properly, still resulting in a valid JSON document.
 func TestConfigHandlerRemoveKnownKeys(t *testing.T) {
-	config := &serverinit.Config{
-		Obj: jsonconfig.Obj{
-			"/ui/": "",
-			"_knownkeys": map[string]string{
-				"key": "value",
-			},
+	config := serverinit.ExportNewConfigFromObj(jsonconfig.Obj{
+		"/ui/": "",
+		"_knownkeys": map[string]string{
+			"key": "value",
 		},
-	}
+	})
 
 	rr := httptest.NewRecorder()
 	serverinit.ConfigHandler(config).ServeHTTP(rr, nil)

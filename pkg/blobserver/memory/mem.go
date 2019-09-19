@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@ limitations under the License.
 
 // Package memory registers the "memory" blobserver storage type, storing blobs
 // in an in-memory map.
-package memory // import "camlistore.org/pkg/blobserver/memory"
+package memory // import "perkeep.org/pkg/blobserver/memory"
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -28,14 +29,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/lru"
+	"perkeep.org/internal/lru"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 
 	"go4.org/jsonconfig"
-	"go4.org/readerutil"
 	"go4.org/types"
-	"golang.org/x/net/context"
 )
 
 // Storage is an in-memory implementation of the blobserver Storage
@@ -76,11 +75,11 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Stora
 func NewCache(size int64) *Storage {
 	return &Storage{
 		maxSize: size,
-		lru:     lru.New(1<<31 - 1), // ~infinite items; we evict by size, not count
+		lru:     lru.New(0), // infinite items; we evict by size, not count
 	}
 }
 
-func (s *Storage) Fetch(ref blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (s *Storage) Fetch(ctx context.Context, ref blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.lru != nil {
@@ -108,7 +107,7 @@ func (s *Storage) Fetch(ref blob.Ref) (file io.ReadCloser, size uint32, err erro
 	}, size, nil
 }
 
-func (s *Storage) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
+func (s *Storage) SubFetch(ctx context.Context, ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 || length < 0 {
 		return nil, blob.ErrNegativeSubFetch
 	}
@@ -133,7 +132,7 @@ func (s *Storage) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, e
 	}, nil
 }
 
-func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (s *Storage) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	sb := blob.SizedRef{}
 	h := br.Hash()
 	if h == nil {
@@ -172,13 +171,15 @@ func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, err
 	return blob.SizedRef{br, uint32(len(all))}, nil
 }
 
-func (s *Storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (s *Storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	for _, br := range blobs {
 		s.mu.RLock()
 		b, ok := s.m[br]
 		s.mu.RUnlock()
 		if ok {
-			dest <- blob.SizedRef{br, uint32(len(b))}
+			if err := fn(blob.SizedRef{br, uint32(len(b))}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -235,12 +236,13 @@ func (s *Storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 		if br.String() < contToken {
 			continue
 		}
+		contents := s.m[br]
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case dest <- blobserver.BlobAndToken{
-			Blob: blob.NewBlob(br, uint32(len(s.m[br])), func() readerutil.ReadSeekCloser {
-				return blob.NewLazyReadSeekCloser(s, br)
+			Blob: blob.NewBlob(br, uint32(len(contents)), func(ctx context.Context) ([]byte, error) {
+				return contents, nil
 			}),
 			Token: br.String(),
 		}:
@@ -249,7 +251,7 @@ func (s *Storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 	return nil
 }
 
-func (s *Storage) RemoveBlobs(blobs []blob.Ref) error {
+func (s *Storage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, br := range blobs {

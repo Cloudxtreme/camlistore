@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@ import (
 	"sync"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver/stats"
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver/stats"
+	"perkeep.org/pkg/test"
 )
 
 func TestWriteFileMap(t *testing.T) {
@@ -36,7 +36,7 @@ func TestWriteFileMap(t *testing.T) {
 	r := &randReader{seed: 123, length: 5 << 20}
 	sr := new(stats.Receiver)
 	var buf bytes.Buffer
-	br, err := WriteFileMap(sr, m, io.TeeReader(r, &buf))
+	br, err := WriteFileMap(ctxbg, sr, m, io.TeeReader(r, &buf))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,13 +53,13 @@ func TestWriteFileMap(t *testing.T) {
 	//       just the size)
 	//   -- well-balanced tree
 	//   -- nothing too big, nothing too small.
-	if g, w := br.String(), "sha1-95a5d2686b239e36dff3aeb5a45ed18153121835"; g != w {
+	if g, w := br.String(), "sha1-d0f22d5a3787abcf38109408891825b37b99d6f8"; g != w {
 		t.Errorf("root blobref = %v; want %v", g, w)
 	}
-	if g, w := sr.NumBlobs(), 88; g != w {
+	if g, w := sr.NumBlobs(), 84; g != w {
 		t.Errorf("num blobs = %v; want %v", g, w)
 	}
-	if g, w := sr.SumBlobSize(), int64(5252655); g != w {
+	if g, w := sr.SumBlobSize(), int64(5252007); g != w {
 		t.Errorf("sum blob size = %v; want %v", g, w)
 	}
 	if g, w := sizes[len(sizes)-1], 262144; g != w {
@@ -73,13 +73,13 @@ func TestWriteThenRead(t *testing.T) {
 	r := &randReader{seed: 123, length: size}
 	sto := new(test.Fetcher)
 	var buf bytes.Buffer
-	br, err := WriteFileMap(sto, m, io.TeeReader(r, &buf))
+	br, err := WriteFileMap(ctxbg, sto, m, io.TeeReader(r, &buf))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var got bytes.Buffer
-	fr, err := NewFileReader(sto, br)
+	fr, err := NewFileReader(ctxbg, sto, br)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestWriteThenRead(t *testing.T) {
 	getOffsets := func() error {
 		offs = offs[:0]
 		var off int
-		return fr.ForeachChunk(func(_ []blob.Ref, p BytesPart) error {
+		return fr.ForeachChunk(ctxbg, func(_ []blob.Ref, p BytesPart) error {
 			offs = append(offs, off)
 			off += int(p.Size)
 			return err
@@ -134,7 +134,7 @@ func TestWriteThenRead(t *testing.T) {
 		return errFetch
 	}
 
-	fr, err = NewFileReader(sto, br)
+	fr, err = NewFileReader(ctxbg, sto, br)
 	if err != nil {
 		t.Fatal(err)
 	}

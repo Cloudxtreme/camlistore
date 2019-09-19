@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package cloudstorage
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io"
@@ -26,15 +27,14 @@ import (
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
 	"go4.org/jsonconfig"
 	"go4.org/oauthutil"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
@@ -91,12 +91,12 @@ func testStorage(t *testing.T, bucketDir string) {
 		t.Fatal("bucket not provided in config file or as a flag.")
 	}
 	if *clientID == "" {
-		if !metadata.OnGCE() {
-			if *clientSecret == "" {
-				t.Fatal("client ID and client secret required. Obtain from https://console.developers.google.com/ > Project > APIs & Auth > Credentials. Should be a 'native' or 'Installed application'")
-			}
-		} else {
+		if *clientSecret == "" {
+			// Assume auto if neither the the clientID and clientSecret are specified
+			// A service account key should be specified using the GOOGLE_APPLICATION_CREDENTIALS environment variable.
 			*clientID = "auto"
+		} else {
+			t.Fatal("client ID and client secret must be specified together. Obtain from https://console.developers.google.com/ > Project > APIs & Auth > Credentials. Should be a 'native' or 'Installed application'")
 		}
 	}
 	if *configFile == "" {
@@ -107,7 +107,7 @@ func testStorage(t *testing.T, bucketDir string) {
 			ClientSecret: *clientSecret,
 			RedirectURL:  oauthutil.TitleBarRedirectURL,
 		}
-		if !metadata.OnGCE() {
+		if !metadata.OnGCE() && *clientID != "auto" {
 			token, err := oauth2.ReuseTokenSource(nil,
 				&oauthutil.TokenSource{
 					Config:    config,
@@ -173,12 +173,12 @@ func testStorage(t *testing.T, bucketDir string) {
 			clearBucket := func(beforeTests bool) func() {
 				return func() {
 					var all []blob.Ref
-					blobserver.EnumerateAll(context.TODO(), sto, func(sb blob.SizedRef) error {
+					blobserver.EnumerateAll(ctx, sto, func(sb blob.SizedRef) error {
 						t.Logf("Deleting: %v", sb.Ref)
 						all = append(all, sb.Ref)
 						return nil
 					})
-					if err := sto.RemoveBlobs(all); err != nil {
+					if err := sto.RemoveBlobs(ctx, all); err != nil {
 						t.Fatalf("Error removing blobs during cleanup: %v", err)
 					}
 					if beforeTests {

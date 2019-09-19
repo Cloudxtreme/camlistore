@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,12 +32,14 @@ Example low-level config:
       },
     },
 */
-package drive // import "camlistore.org/pkg/blobserver/google/drive"
+package drive // import "perkeep.org/pkg/blobserver/google/drive"
 
 import (
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/google/drive/service"
 	"go4.org/jsonconfig"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/google/drive/service"
+
+	"context"
 
 	"go4.org/oauthutil"
 	"golang.org/x/oauth2"
@@ -53,7 +55,7 @@ type driveStorage struct {
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Storage, error) {
 	auth := config.RequiredObject("auth")
-	oAuthClient := oauth2.NewClient(oauth2.NoContext, oauthutil.NewRefreshTokenSource(&oauth2.Config{
+	oAuthClient := oauth2.NewClient(context.Background(), oauthutil.NewRefreshTokenSource(&oauth2.Config{
 		Scopes:       []string{Scope},
 		Endpoint:     google.Endpoint,
 		ClientID:     auth.RequiredString("client_id"),

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +21,8 @@ import (
 	"reflect"
 	"testing"
 
-	"camlistore.org/pkg/index"
-	. "camlistore.org/pkg/test"
+	. "perkeep.org/pkg/test"
 )
-
-var _ index.Interface = (*FakeIndex)(nil)
 
 type tbLogger struct {
 	testing.TB

@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"expvar"
 	"fmt"
@@ -32,20 +33,19 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/images"
-	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/search"
 	_ "github.com/nf/cr2"
 	"go4.org/readerutil"
 	"go4.org/syncutil"
 	"go4.org/syncutil/singleflight"
 	"go4.org/types"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/images"
+	"perkeep.org/internal/magic"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
 )
 
 const imageDebug = false
@@ -93,15 +93,15 @@ func squareImage(i image.Image) image.Image {
 	return si.SubImage(newB)
 }
 
-func writeToCache(cache blobserver.Storage, thumbBytes []byte, name string) (br blob.Ref, err error) {
+func writeToCache(ctx context.Context, cache blobserver.Storage, thumbBytes []byte, name string) (br blob.Ref, err error) {
 	tr := bytes.NewReader(thumbBytes)
 	if len(thumbBytes) < constants.MaxBlobSize {
-		br = blob.SHA1FromBytes(thumbBytes)
-		_, err = blobserver.Receive(cache, br, tr)
+		br = blob.RefFromBytes(thumbBytes)
+		_, err = blobserver.Receive(ctx, cache, br, tr)
 	} else {
 		// TODO: don't use rolling checksums when writing this. Tell
 		// the filewriter to use 16 MB chunks instead.
-		br, err = schema.WriteFileFromReader(cache, name, tr)
+		br, err = schema.WriteFileFromReader(ctx, cache, name, tr)
 	}
 	if err != nil {
 		return br, errors.New("failed to cache " + name + ": " + err.Error())
@@ -114,8 +114,8 @@ func writeToCache(cache blobserver.Storage, thumbBytes []byte, name string) (br 
 
 // cacheScaled saves in the image handler's cache the scaled image bytes
 // in thumbBytes, and puts its blobref in the scaledImage under the key name.
-func (ih *ImageHandler) cacheScaled(thumbBytes []byte, name string) error {
-	br, err := writeToCache(ih.Cache, thumbBytes, name)
+func (ih *ImageHandler) cacheScaled(ctx context.Context, thumbBytes []byte, name string) error {
+	br, err := writeToCache(ctx, ih.Cache, thumbBytes, name)
 	if err != nil {
 		return err
 	}
@@ -128,8 +128,8 @@ func (ih *ImageHandler) cacheScaled(thumbBytes []byte, name string) error {
 // 16MB) or a file schema blob.
 //
 // The ReadCloser should be closed when done reading.
-func (ih *ImageHandler) cached(br blob.Ref) (io.ReadCloser, error) {
-	rsc, _, err := ih.Cache.Fetch(br)
+func (ih *ImageHandler) cached(ctx context.Context, br blob.Ref) (io.ReadCloser, error) {
+	rsc, _, err := ih.Cache.Fetch(ctx, br)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func cacheKey(bref string, width int, height int) string {
 //
 // On successful read and population of buf, the returned format is non-empty.
 // Almost all errors are not interesting. Real errors will be logged.
-func (ih *ImageHandler) scaledCached(buf *bytes.Buffer, file blob.Ref) (format string) {
+func (ih *ImageHandler) scaledCached(ctx context.Context, buf *bytes.Buffer, file blob.Ref) (format string) {
 	key := cacheKey(file.String(), ih.MaxWidth, ih.MaxHeight)
 	br, err := ih.ThumbMeta.Get(key)
 	if err == errCacheMiss {
@@ -188,7 +188,7 @@ func (ih *ImageHandler) scaledCached(buf *bytes.Buffer, file blob.Ref) (format s
 		log.Printf("Warning: thumbnail cachekey(%q)->meta lookup error: %v", key, err)
 		return
 	}
-	fr, err := ih.cached(br)
+	fr, err := ih.cached(ctx, br)
 	if err != nil {
 		if imageDebug {
 			log.Printf("Could not get cached image %v: %v\n", br, err)
@@ -218,18 +218,24 @@ type formatAndImage struct {
 // imageConfigFromReader calls image.DecodeConfig on r. It returns an
 // io.Reader that is the concatentation of the bytes read and the remaining r,
 // the image configuration, and the error from image.DecodeConfig.
+// If the image is HEIC, and its config was decoded properly (but partially,
+// because we don't do ColorModel yet), it returns images.ErrHEIC.
 func imageConfigFromReader(r io.Reader) (io.Reader, image.Config, error) {
 	header := new(bytes.Buffer)
 	tr := io.TeeReader(r, header)
 	// We just need width & height for memory considerations, so we use the
 	// standard library's DecodeConfig, skipping the EXIF parsing and
 	// orientation correction for images.DecodeConfig.
-	conf, _, err := image.DecodeConfig(tr)
+	// image.DecodeConfig is able to deal with HEIC because we registered it
+	// in internal/images.
+	conf, format, err := image.DecodeConfig(tr)
+	if err == nil && format == "heic" {
+		err = images.ErrHEIC
+	}
 	return io.MultiReader(header, r), conf, err
 }
 
-func (ih *ImageHandler) newFileReader(fileRef blob.Ref) (io.ReadCloser, error) {
-	ctx := context.TODO()
+func (ih *ImageHandler) newFileReader(ctx context.Context, fileRef blob.Ref) (io.ReadCloser, error) {
 	fi, ok := fileInfoPacked(ctx, ih.Search, ih.Fetcher, nil, fileRef)
 	if debugPack {
 		log.Printf("pkg/server/image.go: fileInfoPacked: ok=%v, %+v", ok, fi)
@@ -248,11 +254,11 @@ func (ih *ImageHandler) newFileReader(fileRef blob.Ref) (io.ReadCloser, error) {
 		}, nil
 	}
 	// Default path, not going through blobpacked's fast path:
-	return schema.NewFileReader(ih.Fetcher, fileRef)
+	return schema.NewFileReader(ctx, ih.Fetcher, fileRef)
 }
 
-func (ih *ImageHandler) scaleImage(fileRef blob.Ref) (*formatAndImage, error) {
-	fr, err := ih.newFileReader(fileRef)
+func (ih *ImageHandler) scaleImage(ctx context.Context, fileRef blob.Ref) (*formatAndImage, error) {
+	fr, err := ih.newFileReader(ctx, fileRef)
 	if err != nil {
 		return nil, err
 	}
@@ -260,6 +266,14 @@ func (ih *ImageHandler) scaleImage(fileRef blob.Ref) (*formatAndImage, error) {
 
 	sr := readerutil.NewStatsReader(imageBytesFetchedVar, fr)
 	sr, conf, err := imageConfigFromReader(sr)
+	if err == images.ErrHEIC {
+		jpegBytes, err := images.HEIFToJPEG(sr, &images.Dimensions{MaxWidth: ih.MaxWidth, MaxHeight: ih.MaxHeight})
+		if err != nil {
+			log.Printf("cannot convert with heiftojpeg: %v", err)
+			return nil, errors.New("error converting HEIC image to jpeg")
+		}
+		return &formatAndImage{format: "jpeg", image: jpegBytes}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +337,7 @@ func (ih *ImageHandler) scaleImage(fileRef blob.Ref) (*formatAndImage, error) {
 var singleResize singleflight.Group
 
 func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, file blob.Ref) {
+	ctx := req.Context()
 	if !httputil.IsGet(req) {
 		http.Error(rw, "Invalid method", 400)
 		return
@@ -334,7 +349,7 @@ func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, fil
 	}
 
 	key := cacheKey(file.String(), mw, mh)
-	etag := blob.SHA1FromString(key).String()[5:]
+	etag := blob.RefFromString(key).String()[5:]
 	inm := req.Header.Get("If-None-Match")
 	if inm != "" {
 		if strings.Trim(inm, `"`) == etag {
@@ -355,7 +370,7 @@ func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, fil
 	cacheHit := false
 	if ih.ThumbMeta != nil && !disableThumbCache {
 		var buf bytes.Buffer
-		format = ih.scaledCached(&buf, file)
+		format = ih.scaledCached(ctx, &buf, file)
 		if format != "" {
 			cacheHit = true
 			imageData = buf.Bytes()
@@ -365,7 +380,7 @@ func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, fil
 	if !cacheHit {
 		thumbCacheMiss.Add(1)
 		imi, err := singleResize.Do(key, func() (interface{}, error) {
-			return ih.scaleImage(file)
+			return ih.scaleImage(ctx, file)
 		})
 		if err != nil {
 			http.Error(rw, err.Error(), 500)
@@ -375,7 +390,7 @@ func (ih *ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, fil
 		imageData = im.image
 		format = im.format
 		if ih.ThumbMeta != nil {
-			err := ih.cacheScaled(imageData, key)
+			err := ih.cacheScaled(ctx, imageData, key)
 			if err != nil {
 				log.Printf("image resize: %v", err)
 			}

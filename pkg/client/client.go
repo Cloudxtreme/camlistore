@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package client implements a Camlistore client.
-package client // import "camlistore.org/pkg/client"
+// Package client implements a Perkeep client.
+package client // import "perkeep.org/pkg/client"
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -35,23 +36,26 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/client/android"
-	"camlistore.org/pkg/hashutil"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/internal/hashutil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/client/android"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/types/camtypes"
 
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 	"golang.org/x/net/http2"
 )
 
-// A Client provides access to a Camlistore server.
+// A Client provides access to a Perkeep server.
+//
+// After use, a Client should be closed via its Close method to
+// release idle HTTP connections or other resourcedds.
 type Client struct {
 	// server is the input from user, pre-discovery.
 	// For example "http://foo.com" or "foo.com:1234".
@@ -69,6 +73,7 @@ type Client struct {
 	searchRoot             string      // Handler prefix, or "" if none
 	downloadHelper         string      // or "" if none
 	storageGen             string      // storage generation, or "" if not reported
+	hasLegacySHA1          bool        // Whether server has SHA-1 blobs indexed.
 	syncHandlers           []*SyncInfo // "from" and "to" url prefix for each syncHandler
 	serverKeyID            string      // Server's GPG public key ID.
 	helpRoot               string      // Handler prefix, or "" if none
@@ -100,7 +105,7 @@ type Client struct {
 	// If not empty, (and if using TLS) the full x509 verification is
 	// disabled, and we instead check the server's certificate against
 	// this list.
-	// The camlistore server prints the fingerprint to add to the config
+	// The perkeepd server prints the fingerprint to add to the config
 	// when starting.
 	trustedCerts []string
 
@@ -109,8 +114,8 @@ type Client struct {
 	insecureAnyTLSCert bool
 
 	initIgnoredFilesOnce sync.Once
-	// list of files that camput should ignore.
-	// Defaults to empty, but camput init creates a config with a non
+	// list of files that pk-put should ignore.
+	// Defaults to empty, but pk-put init creates a config with a non
 	// empty list.
 	// See IsIgnoredFile for the matching rules.
 	ignoredFiles  []string
@@ -145,7 +150,7 @@ type Client struct {
 	httpGate        *syncutil.Gate
 	transportConfig *TransportConfig // or nil
 
-	paramsOnly bool // config file and env vars are ignored.
+	noExtConfig bool // no external config; config file and env vars are ignored.
 
 	// sameOrigin indicates whether URLs in requests should be stripped from
 	// their scheme and HostPort parts. This is meant for when using the client
@@ -157,62 +162,100 @@ type Client struct {
 const maxParallelHTTP_h1 = 5
 const maxParallelHTTP_h2 = 50
 
-// New returns a new Camlistore Client.
-// The provided server is either "host:port" (assumed http, not https) or a URL prefix, with or without a path, or a server alias from the client configuration file. A server alias should not be confused with a hostname, therefore it cannot contain any colon or period.
-// Errors are not returned until subsequent operations.
-func New(server string, opts ...ClientOption) *Client {
-	if !isURLOrHostPort(server) {
-		configOnce.Do(parseConfig)
-		serverConf, ok := config.Servers[server]
-		if !ok {
-			log.Fatalf("%q looks like a server alias, but no such alias found in config at %v", server, osutil.UserClientConfigPath())
-		}
-		server = serverConf.Server
+// inGopherJS reports whether the client package is compiled by GopherJS, for use
+// in the browser.
+var inGopherJS bool
+
+// New returns a new Perkeep Client.
+//
+// By default, with no options, it uses the client as configured in
+// the environment or default configuration files.
+func New(opts ...ClientOption) (*Client, error) {
+	c := &Client{
+		haveCache: noHaveCache{},
+		Logger:    log.New(os.Stderr, "", log.Ldate|log.Ltime),
+		authMode:  auth.None{},
 	}
-	return newClient(server, auth.None{}, opts...)
+	for _, v := range opts {
+		v.modifyClient(c)
+	}
+	if c.sto != nil && len(opts) > 1 {
+		return nil, errors.New("use of OptionUseStorageClient precludes use of any other options")
+	}
+
+	if inGopherJS {
+		c.noExtConfig = true
+		c.sameOrigin = true
+	}
+	if c.noExtConfig {
+		c.setDefaultHTTPClient()
+		return c, nil
+	}
+
+	if c.server != "" {
+		if !isURLOrHostPort(c.server) {
+			configOnce.Do(parseConfig)
+			serverConf, ok := config.Servers[c.server]
+			if !ok {
+				log.Fatalf("%q looks like a server alias, but no such alias found in config at %v", c.server, osutil.UserClientConfigPath())
+			}
+			c.server = serverConf.Server
+		}
+		c.setDefaultHTTPClient()
+		return c, nil
+	}
+
+	var err error
+	c.server, err = getServer()
+	if err != nil {
+		return nil, err
+	}
+	err = c.SetupAuth()
+	if err != nil {
+		return nil, err
+	}
+	c.setDefaultHTTPClient()
+	return c, nil
 }
 
+func (c *Client) setDefaultHTTPClient() {
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{
+			Transport: c.transportForConfig(c.transportConfig),
+		}
+	}
+	c.httpGate = syncutil.NewGate(httpGateSize(c.httpClient.Transport))
+}
+
+// NewOrFail is like New, but calls log.Fatal instead of returning an error.
 func NewOrFail(opts ...ClientOption) *Client {
-	c := New(serverOrDie(), opts...)
-	err := c.SetupAuth()
+	c, err := New(opts...)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("error creating client: %v", err)
 	}
 	return c
 }
 
 // NewPathClient returns a new client accessing a subpath of c.
-func (c *Client) NewPathClient(path string) *Client {
+func (c *Client) NewPathClient(path string) (*Client, error) {
 	u, err := url.Parse(c.server)
 	if err != nil {
-		// Better than nothing
-		return New(c.server + path)
+		return nil, fmt.Errorf("bogus server %q for NewPathClient receiver: %v", c.server, err)
 	}
 	u.Path = path
-	pc := New(u.String())
+	pc, err := New(OptionServer(u.String()))
+	if err != nil {
+		return nil, err
+	}
 	pc.authMode = c.authMode
 	pc.discoOnce.Do(noop)
-	return pc
+	return pc, nil
 }
 
-// NewStorageClient returns a Client that doesn't use HTTP, but uses s
-// directly. This exists mainly so all the convenience methods on
-// Client (e.g. the Upload variants) are available against storage
-// directly.
-// When using NewStorageClient, callers should call Close when done,
-// in case the storage wishes to do a cleaner shutdown.
-func NewStorageClient(s blobserver.Storage) *Client {
-	return &Client{
-		sto:       s,
-		Logger:    log.New(os.Stderr, "", log.Ldate|log.Ltime),
-		haveCache: noHaveCache{},
-	}
-}
-
-// TransportConfig contains options for SetupTransport.
+// TransportConfig contains options for how HTTP requests are made.
 type TransportConfig struct {
 	// Proxy optionally specifies the Proxy for the transport. Useful with
-	// camput for debugging even localhost requests.
+	// pk-put for debugging even localhost requests.
 	Proxy   func(*http.Request) (*url.URL, error)
 	Verbose bool // Verbose enables verbose logging of HTTP requests.
 }
@@ -238,6 +281,13 @@ func (c *Client) useHTTP2(tc *TransportConfig) bool {
 // It is the caller's responsibility to then use that transport to set
 // the client's httpClient with SetHTTPClient.
 func (c *Client) transportForConfig(tc *TransportConfig) http.RoundTripper {
+	if inGopherJS {
+		// Calls to net.Dial* functions - which would happen if the client's transport
+		// is not nil - are prohibited with GopherJS. So we force nil here, so that the
+		// call to transportForConfig in newClient is of no consequence when on the
+		// browser.
+		return nil
+	}
 	if c == nil {
 		return nil
 	}
@@ -283,6 +333,46 @@ type ClientOption interface {
 	modifyClient(*Client)
 }
 
+// OptionServer returns a Client constructor option that forces use of
+// the provided server.
+//
+// The provided server is either "host:port" (assumed http, not https)
+// or a URL prefix, with or without a path, or a server alias from the
+// client configuration file. A server alias should not be confused
+// with a hostname, therefore it cannot contain any colon or period.
+func OptionServer(server string) ClientOption {
+	return optionServer(server)
+}
+
+type optionServer string
+
+func (s optionServer) modifyClient(c *Client) { c.server = string(s) }
+
+// OptionUseStorageClient returns a Client constructor option that
+// forces use of the provided blob storage target.
+//
+// This exists mainly so all the convenience methods on
+// Client (e.g. the Upload variants) are available against storage
+// directly.
+//
+// Use of OptionUseStorageClient is mutually exclusively
+// with all other options, although it does imply
+// OptionNoExternalConfig(true).
+func OptionUseStorageClient(s blobserver.Storage) ClientOption {
+	return optionStorage{s}
+}
+
+type optionStorage struct {
+	sto blobserver.Storage
+}
+
+func (o optionStorage) modifyClient(c *Client) {
+	c.sto = o.sto
+	c.noExtConfig = true
+}
+
+// OptionTransportConfig returns a ClientOption that makes the client use
+// the provided transport configuration options.
 func OptionTransportConfig(tc *TransportConfig) ClientOption {
 	return optionTransportConfig{tc}
 }
@@ -291,21 +381,28 @@ type optionTransportConfig struct {
 	tc *TransportConfig
 }
 
-func (o optionTransportConfig) modifyClient(c *Client) {
-	c.transportConfig = o.tc
-}
+func (o optionTransportConfig) modifyClient(c *Client) { c.transportConfig = o.tc }
 
+// OptionInsecure returns a ClientOption that controls whether HTTP
+// requests are allowed to be insecure (over HTTP or HTTPS without TLS
+// certificate checking). Use of this is strongly discouraged except
+// for local testing.
 func OptionInsecure(v bool) ClientOption {
 	return optionInsecure(v)
 }
 
 type optionInsecure bool
 
-func (o optionInsecure) modifyClient(c *Client) {
-	c.insecureAnyTLSCert = bool(o)
-}
+func (o optionInsecure) modifyClient(c *Client) { c.insecureAnyTLSCert = bool(o) }
 
+// OptionTrustedCert returns a ClientOption that makes the client
+// trust the provide self-signed cert signature. The value should be
+// the 20 byte hex prefix of the SHA-256 of the cert, as printed by
+// the perkeepd server on start-up.
+//
+// If cert is empty, the option has no effect.
 func OptionTrustedCert(cert string) ClientOption {
+	// TODO: remove this whole function now that we have LetsEncrypt?
 	return optionTrustedCert(cert)
 }
 
@@ -319,18 +416,27 @@ func (o optionTrustedCert) modifyClient(c *Client) {
 	}
 }
 
-// OptionSameOrigin sets whether URLs in requests should be stripped from
-// their scheme and HostPort parts. This is meant for when using the client
-// through gopherjs in the web UI. Because we'll run into CORS errors if
-// requests have a Host part.
-func OptionSameOrigin(v bool) ClientOption {
-	return optionSameOrigin(v)
+type optionNoExtConfig bool
+
+func (o optionNoExtConfig) modifyClient(c *Client) { c.noExtConfig = bool(o) }
+
+// OptionNoExternalConfig returns a Client constructor option that
+// prevents any on-disk config files or environment variables from
+// influencing the client. It may still use the disk for caches.
+func OptionNoExternalConfig() ClientOption {
+	return optionNoExtConfig(true)
 }
 
-type optionSameOrigin bool
+type optionAuthMode struct {
+	m auth.AuthMode
+}
 
-func (o optionSameOrigin) modifyClient(c *Client) {
-	c.sameOrigin = bool(o)
+func (o optionAuthMode) modifyClient(c *Client) { c.authMode = o.m }
+
+// OptionAuthMode returns a Client constructor option that sets the
+// client's authentication mode.
+func OptionAuthMode(m auth.AuthMode) ClientOption {
+	return optionAuthMode{m}
 }
 
 // noop is for use with syncutil.Onces.
@@ -340,13 +446,16 @@ var shareURLRx = regexp.MustCompile(`^(.+)/(` + blob.Pattern + ")$")
 
 // NewFromShareRoot uses shareBlobURL to set up and return a client that
 // will be used to fetch shared blobs.
-func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, target blob.Ref, err error) {
+func NewFromShareRoot(ctx context.Context, shareBlobURL string, opts ...ClientOption) (c *Client, target blob.Ref, err error) {
 	var root string
 	m := shareURLRx.FindStringSubmatch(shareBlobURL)
 	if m == nil {
 		return nil, blob.Ref{}, fmt.Errorf("Unknown share URL base")
 	}
-	c = New(m[1], opts...)
+	c, err = New(append(opts[:len(opts):cap(opts)], OptionServer(m[1]))...)
+	if err != nil {
+		return nil, blob.Ref{}, err
+	}
 	c.discoOnce.Do(noop)
 	c.prefixOnce.Do(noop)
 	c.prefixv = m[1]
@@ -355,7 +464,7 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	c.via = make(map[blob.Ref]blob.Ref)
 	root = m[2]
 
-	req := c.newRequest("GET", shareBlobURL, nil)
+	req := c.newRequest(ctx, "GET", shareBlobURL, nil)
 	res, err := c.expect2XX(req)
 	if err != nil {
 		return nil, blob.Ref{}, fmt.Errorf("error fetching %s: %v", shareBlobURL, err)
@@ -375,13 +484,13 @@ func NewFromShareRoot(shareBlobURL string, opts ...ClientOption) (c *Client, tar
 	}
 	target = b.ShareTarget()
 	if !target.Valid() {
-		return nil, blob.Ref{}, fmt.Errorf("no target.")
+		return nil, blob.Ref{}, fmt.Errorf("no target")
 	}
 	c.via[target] = rootbr
 	return c, target, nil
 }
 
-// SetHTTPClient sets the Camlistore client's HTTP client.
+// SetHTTPClient sets the Perkeep client's HTTP client.
 // If nil, the default HTTP client is used.
 func (c *Client) SetHTTPClient(client *http.Client) {
 	if client == nil {
@@ -415,7 +524,7 @@ func (c *Client) SetHaveCache(cache HaveCache) {
 
 func (c *Client) printf(format string, v ...interface{}) {
 	if c.Verbose && c.Logger != nil {
-		c.Logger.Printf(format, v)
+		c.Logger.Printf(format, v...)
 	}
 }
 
@@ -553,6 +662,14 @@ func (c *Client) StorageGeneration() (string, error) {
 	return c.storageGen, nil
 }
 
+// HasLegacySHA1 reports whether the server has SHA-1 blobs indexed.
+func (c *Client) HasLegacySHA1() (bool, error) {
+	if err := c.condDiscovery(); err != nil {
+		return false, err
+	}
+	return c.hasLegacySHA1, nil
+}
+
 // SyncInfo holds the data that were acquired with a discovery
 // and that are relevant to a syncHandler.
 type SyncInfo struct {
@@ -578,13 +695,13 @@ func (c *Client) SyncHandlers() ([]*SyncInfo, error) {
 var _ search.GetRecentPermanoder = (*Client)(nil)
 
 // GetRecentPermanodes implements search.GetRecentPermanoder against a remote server over HTTP.
-func (c *Client) GetRecentPermanodes(req *search.RecentRequest) (*search.RecentResponse, error) {
+func (c *Client) GetRecentPermanodes(ctx context.Context, req *search.RecentRequest) (*search.RecentResponse, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
 	}
 	url := sr + req.URLSuffix()
-	hreq := c.newRequest("GET", url)
+	hreq := c.newRequest(ctx, "GET", url)
 	hres, err := c.expect2XX(hreq)
 	if err != nil {
 		return nil, err
@@ -599,13 +716,17 @@ func (c *Client) GetRecentPermanodes(req *search.RecentRequest) (*search.RecentR
 	return res, nil
 }
 
-func (c *Client) GetPermanodesWithAttr(req *search.WithAttrRequest) (*search.WithAttrResponse, error) {
+// GetPermanodesWithAttr searches for permanodes that match the given search request.
+// The Fuzzy option in the request must not be set, and the Attribute option
+// must be set.
+// Only indexed attributes may be queried.
+func (c *Client) GetPermanodesWithAttr(ctx context.Context, req *search.WithAttrRequest) (*search.WithAttrResponse, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
 	}
 	url := sr + req.URLSuffix()
-	hreq := c.newRequest("GET", url)
+	hreq := c.newRequest(ctx, "GET", url)
 	hres, err := c.expect2XX(hreq)
 	if err != nil {
 		return nil, err
@@ -621,7 +742,6 @@ func (c *Client) GetPermanodesWithAttr(req *search.WithAttrRequest) (*search.Wit
 }
 
 func (c *Client) Describe(ctx context.Context, req *search.DescribeRequest) (*search.DescribeResponse, error) {
-	// TODO: use ctx (wait for Go 1.7?)
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
@@ -631,7 +751,7 @@ func (c *Client) Describe(ctx context.Context, req *search.DescribeRequest) (*se
 	if err != nil {
 		return nil, err
 	}
-	hreq := c.newRequest("POST", url, bytes.NewReader(body))
+	hreq := c.newRequest(ctx, "POST", url, bytes.NewReader(body))
 	hres, err := c.expect2XX(hreq)
 	if err != nil {
 		return nil, err
@@ -643,13 +763,13 @@ func (c *Client) Describe(ctx context.Context, req *search.DescribeRequest) (*se
 	return res, nil
 }
 
-func (c *Client) GetClaims(req *search.ClaimsRequest) (*search.ClaimsResponse, error) {
+func (c *Client) GetClaims(ctx context.Context, req *search.ClaimsRequest) (*search.ClaimsResponse, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
 	}
 	url := sr + req.URLSuffix()
-	hreq := c.newRequest("GET", url)
+	hreq := c.newRequest(ctx, "GET", url)
 	hres, err := c.expect2XX(hreq)
 	if err != nil {
 		return nil, err
@@ -661,7 +781,7 @@ func (c *Client) GetClaims(req *search.ClaimsRequest) (*search.ClaimsResponse, e
 	return res, nil
 }
 
-func (c *Client) query(req *search.SearchQuery) (*http.Response, error) {
+func (c *Client) query(ctx context.Context, req *search.SearchQuery) (*http.Response, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return nil, err
@@ -671,12 +791,12 @@ func (c *Client) query(req *search.SearchQuery) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	hreq := c.newRequest("POST", url, bytes.NewReader(body))
+	hreq := c.newRequest(ctx, "POST", url, bytes.NewReader(body))
 	return c.expect2XX(hreq)
 }
 
-func (c *Client) Query(req *search.SearchQuery) (*search.SearchResult, error) {
-	hres, err := c.query(req)
+func (c *Client) Query(ctx context.Context, req *search.SearchQuery) (*search.SearchResult, error) {
+	hres, err := c.query(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -689,8 +809,8 @@ func (c *Client) Query(req *search.SearchQuery) (*search.SearchResult, error) {
 
 // QueryRaw sends req and returns the body of the response, which should be the
 // unparsed JSON of a search.SearchResult.
-func (c *Client) QueryRaw(req *search.SearchQuery) ([]byte, error) {
-	hres, err := c.query(req)
+func (c *Client) QueryRaw(ctx context.Context, req *search.SearchQuery) ([]byte, error) {
+	hres, err := c.query(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -700,18 +820,32 @@ func (c *Client) QueryRaw(req *search.SearchQuery) ([]byte, error) {
 
 // SearchExistingFileSchema does a search query looking for an
 // existing file with entire contents of wholeRef, then does a HEAD
-// request to verify the file still exists on the server.  If so,
+// request to verify the file still exists on the server. If so,
 // it returns that file schema's blobref.
 //
-// May return (zero, nil) on ENOENT. A non-nil error is only returned
+// If multiple wholeRef values are provided, any may match. This is
+// used for searching for the file by multiple wholeRef hashes
+// (e.g. SHA-224 and SHA-1).
+//
+// It returns (zero, nil) if not found. A non-nil error is only returned
 // if there were problems searching.
-func (c *Client) SearchExistingFileSchema(wholeRef blob.Ref) (blob.Ref, error) {
+func (c *Client) SearchExistingFileSchema(ctx context.Context, wholeRef ...blob.Ref) (blob.Ref, error) {
 	sr, err := c.SearchRoot()
 	if err != nil {
 		return blob.Ref{}, err
 	}
-	url := sr + "camli/search/files?wholedigest=" + wholeRef.String()
-	req := c.newRequest("GET", url)
+	if len(wholeRef) == 0 {
+		return blob.Ref{}, nil
+	}
+	url := sr + "camli/search/files"
+	for i, ref := range wholeRef {
+		if i == 0 {
+			url += "?wholedigest=" + ref.String()
+		} else {
+			url += "&wholedigest=" + ref.String()
+		}
+	}
+	req := c.newRequest(ctx, "GET", url)
 	res, err := c.doReqGated(req)
 	if err != nil {
 		return blob.Ref{}, err
@@ -721,34 +855,88 @@ func (c *Client) SearchExistingFileSchema(wholeRef blob.Ref) (blob.Ref, error) {
 		res.Body.Close()
 		return blob.Ref{}, fmt.Errorf("client: got status code %d from URL %s; body %s", res.StatusCode, url, body)
 	}
-	var ress struct {
-		Files []blob.Ref `json:"files"`
-	}
+	var ress camtypes.FileSearchResponse
 	if err := httputil.DecodeJSON(res, &ress); err != nil {
+		// Check that we're not just hitting the change introduced in 2018-01-13-6e8a5930c9fee81640c6c75a9a549fec98064186
+		mismatch, err := c.versionMismatch(ctx)
+		if err != nil {
+			log.Printf("Could not verify whether client is too recent or server is too old: %v", err)
+		} else if mismatch {
+			return blob.Ref{}, fmt.Errorf("Client is too recent for this server. Use a client built before 2018-01-13-6e8a5930c9, or upgrade the server to after that revision.")
+		}
 		return blob.Ref{}, fmt.Errorf("client: error parsing JSON from URL %s: %v", url, err)
 	}
 	if len(ress.Files) == 0 {
 		return blob.Ref{}, nil
 	}
-	for _, f := range ress.Files {
-		if c.FileHasContents(f, wholeRef) {
-			return f, nil
+	for wholeRef, files := range ress.Files {
+		for _, f := range files {
+			if c.FileHasContents(ctx, f, blob.MustParse(wholeRef)) {
+				return f, nil
+			}
 		}
 	}
 	return blob.Ref{}, nil
 }
 
+// versionMismatch returns true if the server was built before 2018-01-13 and
+// the client was built at or after 2018-01-13.
+func (c *Client) versionMismatch(ctx context.Context) (bool, error) {
+	const shortRFC3339 = "2006-01-02"
+	version := buildinfo.GitInfo
+	if version == "" {
+		return false, errors.New("unknown client version")
+	}
+	version = version[:10] // keep only the date part
+	clientDate, err := time.Parse(shortRFC3339, version)
+	if err != nil {
+		return false, fmt.Errorf("could not parse date from version %q: %v", version, err)
+	}
+	apiChangeDate, _ := time.Parse(shortRFC3339, "2018-01-13")
+	if !clientDate.After(apiChangeDate) {
+		// client is old enough, all good.
+		return false, nil
+	}
+	url := c.discoRoot() + "/status/status.json"
+	req := c.newRequest(ctx, "GET", url)
+	res, err := c.doReqGated(req)
+	if err != nil {
+		return false, err
+	}
+	if res.StatusCode != 200 {
+		body, _ := ioutil.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		return false, fmt.Errorf("got status code %d from URL %s; body %s", res.StatusCode, url, body)
+	}
+	var status struct {
+		Version string `json:"version"`
+	}
+	if err := httputil.DecodeJSON(res, &status); err != nil {
+		return false, fmt.Errorf("error parsing JSON from URL %s: %v", url, err)
+	}
+	serverVersion := status.Version[:10]
+	serverDate, err := time.Parse(shortRFC3339, serverVersion)
+	if err != nil {
+		return false, fmt.Errorf("could not parse date from server version %q: %v", status.Version, err)
+	}
+	if serverDate.After(apiChangeDate) {
+		// server is recent enough, all good.
+		return false, nil
+	}
+	return true, nil
+}
+
 // FileHasContents returns true iff f refers to a "file" or "bytes" schema blob,
 // the server is configured with a "download helper", and the server responds
 // that all chunks of 'f' are available and match the digest of wholeRef.
-func (c *Client) FileHasContents(f, wholeRef blob.Ref) bool {
+func (c *Client) FileHasContents(ctx context.Context, f, wholeRef blob.Ref) bool {
 	if err := c.condDiscovery(); err != nil {
 		return false
 	}
 	if c.downloadHelper == "" {
 		return false
 	}
-	req := c.newRequest("HEAD", c.downloadHelper+f.String()+"/?verifycontents="+wholeRef.String())
+	req := c.newRequest(ctx, "HEAD", c.downloadHelper+f.String()+"/?verifycontents="+wholeRef.String())
 	res, err := c.expect2XX(req)
 	if err != nil {
 		log.Printf("download helper HEAD error: %v", err)
@@ -827,8 +1015,8 @@ func (c *Client) condDiscovery() error {
 // DiscoveryDoc returns the server's JSON discovery document.
 // This method exists purely for the "camtool discovery" command.
 // Clients shouldn't have to parse this themselves.
-func (c *Client) DiscoveryDoc() (io.Reader, error) {
-	res, err := c.discoveryResp()
+func (c *Client) DiscoveryDoc(ctx context.Context) (io.Reader, error) {
+	res, err := c.discoveryResp(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -847,9 +1035,9 @@ func (c *Client) DiscoveryDoc() (io.Reader, error) {
 	return bytes.NewReader(all), err
 }
 
-// HTTPVersion reports the HTTP version in use.
-func (c *Client) HTTPVersion() (string, error) {
-	req := c.newRequest("HEAD", c.discoRoot(), nil)
+// HTTPVersion reports the HTTP version in use, such as "HTTP/1.1" or "HTTP/2.0".
+func (c *Client) HTTPVersion(ctx context.Context) (string, error) {
+	req := c.newRequest(ctx, "HEAD", c.discoRoot(), nil)
 	res, err := c.doReqGated(req)
 	if err != nil {
 		return "", err
@@ -857,10 +1045,10 @@ func (c *Client) HTTPVersion() (string, error) {
 	return res.Proto, err
 }
 
-func (c *Client) discoveryResp() (*http.Response, error) {
+func (c *Client) discoveryResp(ctx context.Context) (*http.Response, error) {
 	// If the path is just "" or "/", do discovery against
 	// the URL to see which path we should actually use.
-	req := c.newRequest("GET", c.discoRoot(), nil)
+	req := c.newRequest(ctx, "GET", c.discoRoot(), nil)
 	req.Header.Set("Accept", "text/x-camli-configuration")
 	res, err := c.doReqGated(req)
 	if err != nil {
@@ -885,12 +1073,13 @@ func (c *Client) discoveryResp() (*http.Response, error) {
 }
 
 func (c *Client) doDiscovery() error {
+	ctx := context.TODO()
 	root, err := url.Parse(c.discoRoot())
 	if err != nil {
 		return err
 	}
 
-	res, err := c.discoveryResp()
+	res, err := c.discoveryResp(ctx)
 	if err != nil {
 		return err
 	}
@@ -923,6 +1112,7 @@ func (c *Client) doDiscovery() error {
 	c.shareRoot = u.String()
 
 	c.storageGen = disco.StorageGeneration
+	c.hasLegacySHA1 = disco.HasLegacySHA1Index
 
 	u, err = root.Parse(disco.BlobRoot)
 	if err != nil {
@@ -967,11 +1157,11 @@ func (c *Client) doDiscovery() error {
 // GetJSON sends a GET request to url, and unmarshals the returned
 // JSON response into data. The URL's host must match the client's
 // configured server.
-func (c *Client) GetJSON(url string, data interface{}) error {
+func (c *Client) GetJSON(ctx context.Context, url string, data interface{}) error {
 	if !strings.HasPrefix(url, c.discoRoot()) {
 		return fmt.Errorf("wrong URL (%q) for this server", url)
 	}
-	hreq := c.newRequest("GET", url)
+	hreq := c.newRequest(ctx, "GET", url)
 	resp, err := c.expect2XX(hreq)
 	if err != nil {
 		return err
@@ -982,8 +1172,8 @@ func (c *Client) GetJSON(url string, data interface{}) error {
 // Post is like http://golang.org/pkg/net/http/#Client.Post
 // but with implementation details like gated requests. The
 // URL's host must match the client's configured server.
-func (c *Client) Post(url string, bodyType string, body io.Reader) error {
-	resp, err := c.post(url, bodyType, body)
+func (c *Client) Post(ctx context.Context, url string, bodyType string, body io.Reader) error {
+	resp, err := c.post(ctx, url, bodyType, body)
 	if err != nil {
 		return err
 	}
@@ -993,13 +1183,13 @@ func (c *Client) Post(url string, bodyType string, body io.Reader) error {
 // Sign sends a request to the sign handler on server to sign the contents of r,
 // and return them signed. It uses the same implementation details, such as gated
 // requests, as Post.
-func (c *Client) Sign(server string, r io.Reader) (signed []byte, err error) {
+func (c *Client) Sign(ctx context.Context, server string, r io.Reader) (signed []byte, err error) {
 	signHandler, err := c.SignHandler()
 	if err != nil {
 		return nil, err
 	}
 	signServer := strings.TrimSuffix(server, "/") + signHandler
-	resp, err := c.post(signServer, "application/x-www-form-urlencoded", r)
+	resp, err := c.post(ctx, signServer, "application/x-www-form-urlencoded", r)
 	if err != nil {
 		return nil, err
 	}
@@ -1007,11 +1197,11 @@ func (c *Client) Sign(server string, r io.Reader) (signed []byte, err error) {
 	return ioutil.ReadAll(resp.Body)
 }
 
-func (c *Client) post(url string, bodyType string, body io.Reader) (*http.Response, error) {
+func (c *Client) post(ctx context.Context, url string, bodyType string, body io.Reader) (*http.Response, error) {
 	if !c.sameOrigin && !strings.HasPrefix(url, c.discoRoot()) {
 		return nil, fmt.Errorf("wrong URL (%q) for this server", url)
 	}
-	req := c.newRequest("POST", url, body)
+	req := c.newRequest(ctx, "POST", url, body)
 	req.Header.Set("Content-Type", bodyType)
 	res, err := c.expect2XX(req)
 	if err != nil {
@@ -1020,9 +1210,9 @@ func (c *Client) post(url string, bodyType string, body io.Reader) (*http.Respon
 	return res, nil
 }
 
-// newRequests creates a request with the authentication header, and with the
+// newRequest creates a request with the authentication header, and with the
 // appropriate scheme and port in the case of self-signed TLS.
-func (c *Client) newRequest(method, url string, body ...io.Reader) *http.Request {
+func (c *Client) newRequest(ctx context.Context, method, url string, body ...io.Reader) *http.Request {
 	var bodyR io.Reader
 	if len(body) > 0 {
 		bodyR = body[0]
@@ -1039,7 +1229,7 @@ func (c *Client) newRequest(method, url string, body ...io.Reader) *http.Request
 		req.ContentLength = int64(br.Len())
 	}
 	c.authMode.AddAuthHeader(req)
-	return req
+	return req.WithContext(ctx)
 }
 
 // expect2XX will doReqGated and promote HTTP response codes outside of
@@ -1114,7 +1304,7 @@ func (c *Client) http2DialTLSFunc() func(network, addr string, cfg *tls.Config) 
 
 // DialTLSFunc returns the adequate dial function, when using SSL, depending on
 // whether we're using insecure TLS (certificate verification is disabled), or we
-// have some trusted certs, or we're on android.1
+// have some trusted certs, or we're on android.
 // If the client's config has some trusted certs, the server's certificate will
 // be checked against those in the config after the TLS handshake.
 func (c *Client) DialTLSFunc() func(network, addr string) (net.Conn, error) {
@@ -1149,9 +1339,18 @@ func (c *Client) DialTLSFunc() func(network, addr string) (net.Conn, error) {
 			} else {
 				tlsConfig = &tls.Config{InsecureSkipVerify: true}
 			}
+			// Since we're doing the TLS handshake ourselves, we need to set the ServerName,
+			// in case the server uses SNI (as is the case if it's relying on Let's Encrypt,
+			// for example).
+			tlsConfig.ServerName = c.serverNameOfAddr(addr)
 			conn = tls.Client(ac, tlsConfig)
 			if err := conn.Handshake(); err != nil {
 				return nil, err
+			}
+			if stdTLS {
+				// Normal TLS verification succeeded and we do not have
+				// additional trusted certificate fingerprints to check for.
+				return conn, nil
 			}
 		} else {
 			conn, err = tls.Dial(network, addr, &tls.Config{InsecureSkipVerify: true})
@@ -1176,6 +1375,23 @@ func (c *Client) DialTLSFunc() func(network, addr string) (net.Conn, error) {
 	}
 }
 
+// serverNameOfAddr returns the host part of addr, or the empty string if addr
+// is not a valid address (see net.Dial). Additionally, if host is an IP literal,
+// serverNameOfAddr returns the empty string.
+func (c *Client) serverNameOfAddr(addr string) string {
+	serverName, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		c.printf("could not get server name from address %q: %v", addr, err)
+		return ""
+	}
+	if ip := net.ParseIP(serverName); ip != nil {
+		return ""
+	}
+	return serverName
+}
+
+// Signer returns the client's Signer, if any. The Signer signs JSON
+// mutation claims.
 func (c *Client) Signer() (*schema.Signer, error) {
 	c.signerOnce.Do(c.signerInit)
 	return c.signer, c.signerErr
@@ -1195,26 +1411,26 @@ func (c *Client) buildSigner() (*schema.Signer, error) {
 
 // sigTime optionally specifies the signature time.
 // If zero, the current time is used.
-func (c *Client) signBlob(bb schema.Buildable, sigTime time.Time) (string, error) {
+func (c *Client) signBlob(ctx context.Context, bb schema.Buildable, sigTime time.Time) (string, error) {
 	signer, err := c.Signer()
 	if err != nil {
 		return "", err
 	}
-	return bb.Builder().SignAt(signer, sigTime)
+	return bb.Builder().SignAt(ctx, signer, sigTime)
 }
 
 // uploadPublicKey uploads the public key (if one is defined), so
 // subsequent (likely synchronous) indexing of uploaded signed blobs
 // will have access to the public key to verify it. In the normal
 // case, the stat cache prevents this from doing anything anyway.
-func (c *Client) uploadPublicKey() error {
+func (c *Client) uploadPublicKey(ctx context.Context) error {
 	sigRef := c.SignerPublicKeyBlobref()
 	if !sigRef.Valid() {
 		return nil
 	}
 	var err error
 	if _, keyUploaded := c.haveCache.StatBlobCache(sigRef); !keyUploaded {
-		_, err = c.uploadString(c.publicKeyArmored, false)
+		_, err = c.uploadString(ctx, c.publicKeyArmored, false)
 	}
 	return err
 }
@@ -1232,49 +1448,49 @@ func (c *Client) checkMatchingKeys() {
 	}
 }
 
-func (c *Client) UploadAndSignBlob(b schema.AnyBlob) (*PutResult, error) {
-	signed, err := c.signBlob(b.Blob(), time.Time{})
+func (c *Client) UploadAndSignBlob(ctx context.Context, b schema.AnyBlob) (*PutResult, error) {
+	signed, err := c.signBlob(ctx, b.Blob(), time.Time{})
 	if err != nil {
 		return nil, err
 	}
 	c.checkMatchingKeys()
-	if err := c.uploadPublicKey(); err != nil {
+	if err := c.uploadPublicKey(ctx); err != nil {
 		return nil, err
 	}
-	return c.uploadString(signed, false)
+	return c.uploadString(ctx, signed, false)
 }
 
-func (c *Client) UploadBlob(b schema.AnyBlob) (*PutResult, error) {
+func (c *Client) UploadBlob(ctx context.Context, b schema.AnyBlob) (*PutResult, error) {
 	// TODO(bradfitz): ask the blob for its own blobref, rather
 	// than changing the hash function with uploadString?
-	return c.uploadString(b.Blob().JSON(), true)
+	return c.uploadString(ctx, b.Blob().JSON(), true)
 }
 
-func (c *Client) uploadString(s string, stat bool) (*PutResult, error) {
+func (c *Client) uploadString(ctx context.Context, s string, stat bool) (*PutResult, error) {
 	uh := NewUploadHandleFromString(s)
 	uh.SkipStat = !stat
-	return c.Upload(uh)
+	return c.Upload(ctx, uh)
 }
 
-func (c *Client) UploadNewPermanode() (*PutResult, error) {
+func (c *Client) UploadNewPermanode(ctx context.Context) (*PutResult, error) {
 	unsigned := schema.NewUnsignedPermanode()
-	return c.UploadAndSignBlob(unsigned)
+	return c.UploadAndSignBlob(ctx, unsigned)
 }
 
-func (c *Client) UploadPlannedPermanode(key string, sigTime time.Time) (*PutResult, error) {
+func (c *Client) UploadPlannedPermanode(ctx context.Context, key string, sigTime time.Time) (*PutResult, error) {
 	unsigned := schema.NewPlannedPermanode(key)
-	signed, err := c.signBlob(unsigned, sigTime)
+	signed, err := c.signBlob(ctx, unsigned, sigTime)
 	if err != nil {
 		return nil, err
 	}
 	c.checkMatchingKeys()
-	if err := c.uploadPublicKey(); err != nil {
+	if err := c.uploadPublicKey(ctx); err != nil {
 		return nil, err
 	}
-	return c.uploadString(signed, true)
+	return c.uploadString(ctx, signed, true)
 }
 
-// IsIgnoredFile returns whether the file at fullpath should be ignored by camput.
+// IsIgnoredFile returns whether the file at fullpath should be ignored by pk-put.
 // The fullpath is checked against the ignoredFiles list, trying the following rules in this order:
 // 1) star-suffix style matching (.e.g *.jpg).
 // 2) Shell pattern match as done by http://golang.org/pkg/path/filepath/#Match
@@ -1285,45 +1501,20 @@ func (c *Client) IsIgnoredFile(fullpath string) bool {
 	return c.ignoreChecker(fullpath)
 }
 
-// Close closes the client. In most cases, it's not necessary to close a Client.
-// The exception is for Clients created using NewStorageClient, where the Storage
-// might implement io.Closer.
+// Close closes the client.
 func (c *Client) Close() error {
 	if cl, ok := c.sto.(io.Closer); ok {
 		return cl.Close()
 	}
-	return nil
-}
-
-// NewFromParams returns a Client that uses the specified server base URL
-// and auth but does not use any on-disk config files or environment variables
-// for its configuration. It may still use the disk for caches.
-func NewFromParams(server string, mode auth.AuthMode, opts ...ClientOption) *Client {
-	cl := newClient(server, mode, opts...)
-	cl.paramsOnly = true
-	return cl
-}
-
-// TODO(bradfitz): move auth mode into a ClientOption? And
-// OptionNoDiskConfig to delete NewFromParams, etc, and just have New?
-
-func newClient(server string, mode auth.AuthMode, opts ...ClientOption) *Client {
-	c := &Client{
-		server:    server,
-		haveCache: noHaveCache{},
-		Logger:    log.New(os.Stderr, "", log.Ldate|log.Ltime),
-		authMode:  mode,
-	}
-	for _, v := range opts {
-		v.modifyClient(c)
-	}
-	if c.httpClient == nil {
-		c.httpClient = &http.Client{
-			Transport: c.transportForConfig(c.transportConfig),
+	if c := c.HTTPClient(); c != nil {
+		switch t := c.Transport.(type) {
+		case *http.Transport:
+			t.CloseIdleConnections()
+		case *http2.Transport:
+			t.CloseIdleConnections()
 		}
 	}
-	c.httpGate = syncutil.NewGate(httpGateSize(c.httpClient.Transport))
-	return c
+	return nil
 }
 
 func httpGateSize(rt http.RoundTripper) int {

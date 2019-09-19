@@ -1,7 +1,7 @@
 // +build linux darwin
 
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,11 @@ limitations under the License.
 package fs
 
 import (
-	"log"
+	"context"
 	"os"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"golang.org/x/net/context"
 )
 
 type atDir struct {
@@ -102,7 +101,7 @@ With More Coarse Granularities
 `
 
 func (n *atDir) Lookup(ctx context.Context, name string) (fusefs.Node, error) {
-	log.Printf("fs.atDir: Lookup(%q)", name)
+	Logger.Printf("fs.atDir: Lookup(%q)", name)
 
 	if name == "README.txt" {
 		return staticFileNode(atReadme), nil
@@ -110,7 +109,7 @@ func (n *atDir) Lookup(ctx context.Context, name string) (fusefs.Node, error) {
 
 	asOf, err := parseTime(name)
 	if err != nil {
-		log.Printf("Can't parse time: %v", err)
+		Logger.Printf("Can't parse time: %v", err)
 		return nil, fuse.ENOENT
 	}
 

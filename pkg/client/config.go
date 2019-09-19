@@ -1,5 +1,5 @@
 /*
-Copyright 2011 The Camlistore Authors.
+Copyright 2011 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,37 +27,41 @@ import (
 	"strings"
 	"sync"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/client/android"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/types/camtypes"
-	"camlistore.org/pkg/types/clientconfig"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/client/android"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/types/camtypes"
+	"perkeep.org/pkg/types/clientconfig"
 
 	"go4.org/wkfs"
 )
 
 // If set, flagServer overrides the JSON config file
-// ~/.config/camlistore/client-config.json
+// ~/.config/perkeep/client-config.json
 // (i.e. osutil.UserClientConfigPath()) "server" key.
 //
 // A main binary must call AddFlags to expose it.
 var flagServer string
 
+// AddFlags registers the "server" and "secret-keyring" string flags.
 func AddFlags() {
 	defaultPath := "/x/y/z/we're/in-a-test"
 	if !buildinfo.TestingLinked() {
 		defaultPath = osutil.UserClientConfigPath()
 	}
-	flag.StringVar(&flagServer, "server", "", "Camlistore server prefix. If blank, the default from the \"server\" field of "+defaultPath+" is used. Acceptable forms: https://you.example.com, example.com:1345 (https assumed), or http://you.example.com/alt-root")
+	flag.StringVar(&flagServer, "server", "", "Perkeep server prefix. If blank, the default from the \"server\" field of "+defaultPath+" is used. Acceptable forms: https://you.example.com, example.com:1345 (https assumed), or http://you.example.com/alt-root")
 	osutil.AddSecretRingFlag()
 }
 
-// ExplicitServer returns the blobserver given in the flags, if any.
+// ExplicitServer returns the Perkeep server given in the "server"
+// flag, if any.
+//
+// Use AddFlags to register the flag before any flag.Parse call.
 func ExplicitServer() string {
 	return flagServer
 }
@@ -89,14 +93,19 @@ func (c *Client) parseConfig() {
 		if c != nil && c.isSharePrefix {
 			return
 		}
-		errMsg := fmt.Sprintf("Client configuration file %v does not exist. See 'camput init' to generate it.", configPath)
-		if keyId := serverKeyId(); keyId != "" {
-			hint := fmt.Sprintf("\nThe key id %v was found in the server config %v, so you might want:\n'camput init -gpgkey %v'", keyId, osutil.UserServerConfigPath(), keyId)
+		errMsg := fmt.Sprintf("Client configuration file %v does not exist. See 'pk-put init' to generate it.", configPath)
+		if keyID := serverKeyId(); keyID != "" {
+			hint := fmt.Sprintf("\nThe key id %v was found in the server config %v, so you might want:\n'pk-put init -gpgkey %v'", keyID, osutil.UserServerConfigPath(), keyID)
 			errMsg += hint
 		}
 		log.Fatal(errMsg)
 	}
-	// TODO: instead of using jsonconfig, we could read the file, and unmarshall into the structs that we now have in pkg/types/clientconfig. But we'll have to add the old fields (before the name changes, and before the multi-servers change) to the structs as well for our graceful conversion/error messages to work.
+	// TODO: instead of using jsonconfig, we could read the file,
+	// and unmarshal into the structs that we now have in
+	// pkg/types/clientconfig. But we'll have to add the old
+	// fields (before the name changes, and before the
+	// multi-servers change) to the structs as well for our
+	// graceful conversion/error messages to work.
 	conf, err := osutil.NewJSONConfigParser().ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err.Error())
@@ -130,8 +139,12 @@ func (c *Client) parseConfig() {
 			log.Fatalf("entry %q in servers section is a %T, want an object", alias, vei)
 		}
 		serverConf := jsonconfig.Obj(serverMap)
+		serverStr, err := cleanServer(serverConf.OptionalString("server", ""))
+		if err != nil {
+			log.Fatalf("invalid server alias %q: %v", alias, err)
+		}
 		server := &clientconfig.Server{
-			Server:       cleanServer(serverConf.OptionalString("server", "")),
+			Server:       serverStr,
 			Auth:         serverConf.OptionalString("auth", ""),
 			IsDefault:    serverConf.OptionalBool("default", false),
 			TrustedCerts: serverConf.OptionalList("trustedCerts"),
@@ -159,7 +172,7 @@ func isURLOrHostPort(s string) bool {
 func convertToMultiServers(conf jsonconfig.Obj) (jsonconfig.Obj, error) {
 	server := conf.OptionalString("server", "")
 	if server == "" {
-		return nil, errors.New("Could not convert config to multi-servers style: no \"server\" key found.")
+		return nil, errors.New("could not convert config to multi-servers style: no \"server\" key found")
 	}
 	newConf := jsonconfig.Obj{
 		"servers": map[string]interface{}{
@@ -207,7 +220,7 @@ func printConfigChangeHelp(conf jsonconfig.Obj) {
 		}
 	}
 	if oldConfig {
-		configChangedMsg += "Please see https://camlistore.org/doc/client-config, or use camput init to recreate a default one."
+		configChangedMsg += "Please see https://perkeep.org/doc/client-config, or use pk-put init to recreate a default one."
 		log.Print(configChangedMsg)
 	}
 }
@@ -227,18 +240,18 @@ func serverKeyId() string {
 	if err != nil {
 		return ""
 	}
-	keyId, ok := obj["identity"].(string)
+	keyID, ok := obj["identity"].(string)
 	if !ok {
 		return ""
 	}
-	return keyId
+	return keyID
 }
 
 // cleanServer returns the canonical URL of the provided server, which must be a URL, IP, host (with dot), or host/ip:port.
 // The returned canonical URL will have trailing slashes removed and be prepended with "https://" if no scheme is provided.
-func cleanServer(server string) string {
+func cleanServer(server string) (string, error) {
 	if !isURLOrHostPort(server) {
-		log.Fatalf("server %q does not look like a server address and could be confused with a server alias. It should look like [http[s]://]foo[.com][:port] with at least one of the optional parts.", server)
+		return "", fmt.Errorf("server %q does not look like a server address and could be confused with a server alias. It should look like [http[s]://]foo[.com][:port] with at least one of the optional parts.", server)
 	}
 	// Remove trailing slash if provided.
 	if strings.HasSuffix(server, "/") {
@@ -248,12 +261,12 @@ func cleanServer(server string) string {
 	if !strings.HasPrefix(server, "http") && !strings.HasPrefix(server, "https") {
 		server = "https://" + server
 	}
-	return server
+	return server, nil
 }
 
-// serverOrDie returns the server's URL found either as a command-line flag,
+// getServer returns the server's URL found either as a command-line flag,
 // or as the default server in the config file.
-func serverOrDie() string {
+func getServer() (string, error) {
 	if s := os.Getenv("CAMLI_SERVER"); s != "" {
 		return cleanServer(s)
 	}
@@ -262,21 +275,24 @@ func serverOrDie() string {
 			configOnce.Do(parseConfig)
 			serverConf, ok := config.Servers[flagServer]
 			if ok {
-				return serverConf.Server
+				return serverConf.Server, nil
 			}
 			log.Printf("%q looks like a server alias, but no such alias found in config.", flagServer)
 		} else {
 			return cleanServer(flagServer)
 		}
 	}
-	server := defaultServer()
+	server, err := defaultServer()
+	if err != nil {
+		return "", err
+	}
 	if server == "" {
-		camtypes.ErrClientNoServer.Fatal()
+		return "", camtypes.ErrClientNoServer
 	}
 	return cleanServer(server)
 }
 
-func defaultServer() string {
+func defaultServer() (string, error) {
 	configOnce.Do(parseConfig)
 	wantAlias := os.Getenv("CAMLI_DEFAULT_SERVER")
 	for alias, serverConf := range config.Servers {
@@ -284,7 +300,7 @@ func defaultServer() string {
 			return cleanServer(serverConf.Server)
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func (c *Client) useTLS() bool {
@@ -293,13 +309,13 @@ func (c *Client) useTLS() bool {
 
 // SetupAuth sets the client's authMode. It tries from the environment first if we're on android or in dev mode, and then from the client configuration.
 func (c *Client) SetupAuth() error {
-	if c.paramsOnly {
+	if c.noExtConfig {
 		if c.authMode != nil {
 			if _, ok := c.authMode.(*auth.None); !ok {
 				return nil
 			}
 		}
-		return errors.New("client: paramsOnly set; auth should not be configured from config or env vars.")
+		return errors.New("client: noExtConfig set; auth should not be configured from config or env vars")
 	}
 	// env var takes precedence, but only if we're in dev mode or on android.
 	// Too risky otherwise.
@@ -316,7 +332,7 @@ func (c *Client) SetupAuth() error {
 		}
 	}
 	if c.server == "" {
-		return fmt.Errorf("No server defined for this client: can not set up auth.")
+		return fmt.Errorf("no server defined for this client: can not set up auth")
 	}
 	authConf := serverAuth(c.server)
 	if authConf == "" {
@@ -353,14 +369,16 @@ func (c *Client) SetupAuthFromString(a string) error {
 // CAMLI_SECRET_RING environment variable, the client config file's
 // "identitySecretRing" value, or the operating system default location.
 func (c *Client) SecretRingFile() string {
-	if secretRing, ok := osutil.ExplicitSecretRingFile(); ok {
-		return secretRing
+	if osutil.HasSecretRingFlag() {
+		if secretRing, ok := osutil.ExplicitSecretRingFile(); ok {
+			return secretRing
+		}
 	}
 	if android.OnAndroid() {
 		panic("on android, so CAMLI_SECRET_RING should have been defined, or --secret-keyring used.")
 	}
-	if c.paramsOnly {
-		log.Print("client: paramsOnly set; cannot get secret ring file from config or env vars.")
+	if c.noExtConfig {
+		log.Print("client: noExtConfig set; cannot get secret ring file from config or env vars.")
 		return ""
 	}
 	if configDisabled {
@@ -387,37 +405,37 @@ func (c *Client) SignerPublicKeyBlobref() blob.Ref {
 }
 
 func (c *Client) initSignerPublicKeyBlobref() {
-	if c.paramsOnly {
-		log.Print("client: paramsOnly set; cannot get public key from config or env vars.")
+	if c.noExtConfig {
+		log.Print("client: noExtConfig set; cannot get public key from config or env vars.")
 		return
 	}
-	keyId := os.Getenv("CAMLI_KEYID")
-	if keyId == "" {
+	keyID := os.Getenv("CAMLI_KEYID")
+	if keyID == "" {
 		configOnce.Do(parseConfig)
-		keyId = config.Identity
-		if keyId == "" {
-			log.Fatalf("No 'identity' key in JSON configuration file %q; have you run \"camput init\"?", osutil.UserClientConfigPath())
+		keyID = config.Identity
+		if keyID == "" {
+			log.Fatalf("No 'identity' key in JSON configuration file %q; have you run \"pk-put init\"?", osutil.UserClientConfigPath())
 		}
 	}
 	keyRing := c.SecretRingFile()
 	if !fileExists(keyRing) {
-		log.Fatalf("Could not find keyId %q, because secret ring file %q does not exist.", keyId, keyRing)
+		log.Fatalf("Could not find keyID %q, because secret ring file %q does not exist.", keyID, keyRing)
 	}
-	entity, err := jsonsign.EntityFromSecring(keyId, keyRing)
+	entity, err := jsonsign.EntityFromSecring(keyID, keyRing)
 	if err != nil {
-		log.Fatalf("Couldn't find keyId %q in secret ring %v: %v", keyId, keyRing, err)
+		log.Fatalf("Couldn't find keyID %q in secret ring %v: %v", keyID, keyRing, err)
 	}
 	armored, err := jsonsign.ArmoredPublicKey(entity)
 	if err != nil {
 		log.Fatalf("Error serializing public key: %v", err)
 	}
 
-	c.signerPublicKeyRef = blob.SHA1FromString(armored)
+	c.signerPublicKeyRef = blob.RefFromString(armored)
 	c.publicKeyArmored = armored
 }
 
 func (c *Client) initTrustedCerts() {
-	if c.paramsOnly {
+	if c.noExtConfig {
 		return
 	}
 	if e := os.Getenv("CAMLI_TRUSTED_CERT"); e != "" {
@@ -463,7 +481,7 @@ func (c *Client) initIgnoredFiles() {
 	defer func() {
 		c.ignoreChecker = newIgnoreChecker(c.ignoredFiles)
 	}()
-	if c.paramsOnly {
+	if c.noExtConfig {
 		return
 	}
 	if e := os.Getenv("CAMLI_IGNORED_FILES"); e != "" {

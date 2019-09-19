@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,17 +17,17 @@ limitations under the License.
 package mongo
 
 import (
-	"camlistore.org/pkg/blob"
+	"context"
 
 	"go4.org/syncutil"
-
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
+	"perkeep.org/pkg/blob"
 )
 
 var removeGate = syncutil.NewGate(100) // arbitrary
 
-func (m *mongoStorage) RemoveBlobs(blobs []blob.Ref) error {
+func (m *mongoStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	var wg syncutil.Group
 
 	for _, blob := range blobs {

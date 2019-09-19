@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Camlistore Authors.
+Copyright 2017 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"html/template"
 	"io"
@@ -29,17 +30,17 @@ import (
 	"strings"
 	"time"
 
-	uistatic "camlistore.org/app/scanningcabinet/ui"
-	"camlistore.org/pkg/app"
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/fileembed"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/search"
-	camliserver "camlistore.org/pkg/server"
+	uistatic "perkeep.org/app/scanningcabinet/ui"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/magic"
+	"perkeep.org/pkg/app"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/client"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/fileembed"
+	"perkeep.org/pkg/search"
+	camliserver "perkeep.org/pkg/server"
 
 	"go4.org/syncutil"
 )
@@ -60,7 +61,7 @@ var (
 )
 
 // config is used to unmarshal the application configuration JSON
-// that we get from Camlistore when we request it at $CAMLI_APP_CONFIG_URL.
+// that we get from Perkeep when we request it at $CAMLI_APP_CONFIG_URL.
 type extraConfig struct {
 	Auth       string `json:"auth,omitempty"`       // userpass:username:password
 	HTTPSCert  string `json:"httpsCert,omitempty"`  // path to the HTTPS certificate file.
@@ -79,7 +80,7 @@ func appConfig() (*extraConfig, error) {
 		return nil, fmt.Errorf("could not get a client to fetch extra config: %v", err)
 	}
 	conf := &extraConfig{}
-	if err := cl.GetJSON(configURL, conf); err != nil {
+	if err := cl.GetJSON(context.Background(), configURL, conf); err != nil {
 		return nil, fmt.Errorf("could not get app extra config at %v: %v", configURL, err)
 	}
 	return conf, nil
@@ -304,6 +305,7 @@ func (h *handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleUpload(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != "POST" {
 		http.Error(w, "not a POST", http.StatusMethodNotAllowed)
 		return
@@ -350,7 +352,7 @@ func (h *handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		fileName = path.Base(name)
 		cr.r = part
-		br, err = h.cl.UploadFile(fileName, &cr, nil)
+		br, err = h.cl.UploadFile(ctx, fileName, &cr, nil)
 		if err != nil {
 			httputil.ServeError(w, r, fmt.Errorf("could not write %v to blobserver: %v", fileName, err))
 			return
@@ -368,7 +370,7 @@ func (h *handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		if creationProvided {
 			newScan := scan
 			newScan.creation = creation
-			if err := h.updateScan(scan.permanode, &newScan, &scan); err != nil {
+			if err := h.updateScan(ctx, scan.permanode, &newScan, &scan); err != nil {
 				httputil.ServeError(w, r, fmt.Errorf("could not update scan: %v", err))
 				return
 			}
@@ -381,7 +383,7 @@ func (h *handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scanRef, err := h.createScan(mediaObject{
+	scanRef, err := h.createScan(ctx, mediaObject{
 		contentRef: br,
 		creation:   creation,
 	})
@@ -390,7 +392,7 @@ func (h *handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		httputil.ServeError(w, r, fmt.Errorf("could not create scan object for %v: %v", fileName, err))
 		return
 	}
-	w.Write([]byte(scanRef.String()))
+	io.WriteString(w, scanRef.String())
 }
 
 type countingReader struct {
@@ -458,6 +460,7 @@ func (h *handler) handleResource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleMakedoc(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != "POST" {
 		http.Error(w, "not a POST", http.StatusMethodNotAllowed)
 		return
@@ -490,7 +493,7 @@ func (h *handler) handleMakedoc(w http.ResponseWriter, r *http.Request) {
 			pages:    pages,
 			creation: time.Now(),
 		}
-		docRef, err := h.persistDocAndPages(newDoc)
+		docRef, err := h.persistDocAndPages(ctx, newDoc)
 		if err != nil {
 			httputil.ServeError(w, r, fmt.Errorf("could not create new document: %v", err))
 			return
@@ -578,6 +581,7 @@ func (h *handler) handleDoc(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleChangedoc(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != "POST" {
 		http.Error(w, "not a POST", http.StatusMethodNotAllowed)
 		return
@@ -591,7 +595,7 @@ func (h *handler) handleChangedoc(w http.ResponseWriter, r *http.Request) {
 
 	mode := r.FormValue("mode")
 	if mode == "break" {
-		if err := h.breakAndDeleteDoc(docRef); err != nil {
+		if err := h.breakAndDeleteDoc(ctx, docRef); err != nil {
 			httputil.ServeError(w, r, fmt.Errorf("could not delete document %v: %v", docRef, err))
 			return
 		}
@@ -599,7 +603,7 @@ func (h *handler) handleChangedoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "delete" {
-		if err := h.deleteDocAndImages(docRef); err != nil {
+		if err := h.deleteDocAndImages(ctx, docRef); err != nil {
 			httputil.ServeError(w, r, fmt.Errorf("could not do full delete of %v: %v", docRef, err))
 			return
 		}
@@ -626,7 +630,7 @@ func (h *handler) handleChangedoc(w http.ResponseWriter, r *http.Request) {
 	}
 	document.dueDate = duedate
 
-	if err := h.updateDocument(docRef, document); err != nil {
+	if err := h.updateDocument(ctx, docRef, document); err != nil {
 		httputil.ServeError(w, r, fmt.Errorf("could not update document %v: %v", docRef, err))
 		return
 	}

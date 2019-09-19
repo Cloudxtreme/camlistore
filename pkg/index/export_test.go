@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 func ExpReverseTimeString(s string) string {
@@ -53,8 +53,15 @@ func (c *Corpus) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
 	pm := &PermanodeMeta{
 		Claims: claims,
 	}
-	pm.restoreInvariants()
+	pm.restoreInvariants(c.keyId)
 	c.permanodes[pn] = pm
+}
+
+func (c *Corpus) Exp_AddKeyID(signerRef blob.Ref, signerID string) error {
+	return c.addKeyID(&mutationMap{
+		signerID:      signerID,
+		signerBlobRef: signerRef,
+	})
 }
 
 func (x *Index) NeededMapsForTest() (needs, neededBy map[blob.Ref][]blob.Ref, ready map[blob.Ref]bool) {
@@ -134,4 +141,8 @@ var Exp_KeyRecentPermanode = keyRecentPermanode
 
 func Exp_TypeOfKey(key string) string {
 	return typeOfKey(key)
+}
+
+func Exp_ClaimsAttrValue(claims []camtypes.Claim, attr string, at time.Time) string {
+	return claimsIntfAttrValue(claimSlice(claims), attr, at, nil)
 }

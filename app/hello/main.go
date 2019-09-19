@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors.
+Copyright 2014 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 // The hello application serves as an example on how to make stand-alone
-// server applications, interacting with a Camlistore server.
-package main // import "camlistore.org/app/hello"
+// server applications, interacting with a Perkeep server.
+package main // import "perkeep.org/app/hello"
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -26,9 +27,9 @@ import (
 	"os"
 	"runtime"
 
-	"camlistore.org/pkg/app"
-	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/webserver"
+	"perkeep.org/pkg/app"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/webserver"
 )
 
 var (
@@ -36,7 +37,7 @@ var (
 )
 
 // config is used to unmarshal the application configuration JSON
-// that we get from Camlistore when we request it at $CAMLI_APP_CONFIG_URL.
+// that we get from Perkeep when we request it at $CAMLI_APP_CONFIG_URL.
 type config struct {
 	Word string `json:"word,omitempty"` // Argument printed after "Hello " in the helloHandler response.
 }
@@ -51,7 +52,7 @@ func appConfig() *config {
 		log.Fatalf("could not get a client to fetch extra config: %v", err)
 	}
 	conf := &config{}
-	if err := cl.GetJSON(configURL, conf); err != nil {
+	if err := cl.GetJSON(context.TODO(), configURL, conf); err != nil {
 		log.Fatalf("could not get app config at %v: %v", configURL, err)
 	}
 	return conf
@@ -72,11 +73,11 @@ func main() {
 
 	if *flagVersion {
 		fmt.Fprintf(os.Stderr, "hello version: %s\nGo version: %s (%s/%s)\n",
-			buildinfo.Version(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			buildinfo.Summary(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return
 	}
 
-	log.Printf("Starting hello version %s; Go %s (%s/%s)", buildinfo.Version(), runtime.Version(),
+	log.Printf("Starting hello version %s; Go %s (%s/%s)", buildinfo.Summary(), runtime.Version(),
 		runtime.GOOS, runtime.GOARCH)
 
 	listenAddr, err := app.ListenAddress()
@@ -86,7 +87,7 @@ func main() {
 	conf := appConfig()
 	ws := webserver.New()
 	ws.Handle("/", &helloHandler{who: conf.Word})
-	// TODO(mpl): handle status requests too. Camlistore will send an auth
+	// TODO(mpl): handle status requests too. Perkeep will send an auth
 	// token in the extra config that should be used as the "password" for
 	// subsequent status requests.
 	if err := ws.Listen(listenAddr); err != nil {

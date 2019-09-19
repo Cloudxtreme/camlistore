@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore Authors.
+Copyright 2015 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@ import (
 	"strconv"
 	"strings"
 
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/types/clientconfig"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/types/clientconfig"
 )
 
 const helpHTML string = `<html>
@@ -39,24 +39,24 @@ const helpHTML string = `<html>
 			<h2>Help</h2>
 
 			<h3>Web User Interface</h3>
-			<p><a href='https://camlistore.org/doc/search-ui'>Search bar predicates.</a></p>
+			<p><a href='https://perkeep.org/doc/search-ui'>Search bar predicates.</a></p>
 
 			<h3>Client tools</h3>
 
 			<p>
-			You can download the Camlistore command line tools for Linux, Mac, and Windows at:
+			You can download the Perkeep command line tools for Linux, Mac, and Windows at:
 			<ul>
-				<li><a href="https://camlistore.org/download">camlistore.org/download</a></li>
+				<li><a href="https://perkeep.org/download">perkeep.org/download</a></li>
 			</ul>
 			</p>
 
-			<p>You will need to use the following <a href='https://camlistore.org/doc/client-config'>client configuration</a> in order to access this server using the command line tools.</p>
+			<p>You will need to use the following <a href='https://perkeep.org/doc/client-config'>client configuration</a> in order to access this server using the command line tools.</p>
 			<pre>{{ .ClientConfigJSON }}</pre>
 
                         {{ .SecringDownloadHint }}
 
 			<h3>Anything Else?</h3>
-			<p>See the Camlistore <a href='https://camlistore.org/doc/'>online documentation</a> and <a href='https://camlistore.org/community'>community contacts</a>.</p>
+			<p>See the Perkeep <a href='https://perkeep.org/doc/'>online documentation</a> and <a href='https://perkeep.org/community'>community contacts</a>.</p>
 		</body>
 	</html>`
 
@@ -117,7 +117,7 @@ func (hh *HelpHandler) InitHandler(hl blobserver.FindHandlerByTyper) error {
 	hh.clientConfig = clientConfig
 
 	hh.serverSecRing = clientConfig.IdentitySecretRing
-	clientConfig.IdentitySecretRing = "/home/you/.config/camlistore/identity-secring.gpg"
+	clientConfig.IdentitySecretRing = "/home/you/.config/perkeep/identity-secring.gpg"
 
 	tmpl, err := template.New("help").Parse(helpHTML)
 	if err != nil {
@@ -168,7 +168,7 @@ func (hh *HelpHandler) serveHelpHTML(cc *clientconfig.Config, rw http.ResponseWr
 	if strings.HasPrefix(hh.serverSecRing, "/gcs/") {
 		bucketdir := strings.TrimPrefix(hh.serverSecRing, "/gcs/")
 		bucketdir = strings.TrimSuffix(bucketdir, "/identity-secring.gpg")
-		hint = template.HTML(fmt.Sprintf("<p>Download your GnuPG secret ring from <a href=\"https://console.developers.google.com/storage/browser/%s/\">https://console.developers.google.com/storage/browser/%s/</a> and place it in your <a href='https://camlistore.org/doc/client-config'>Camlistore client config directory</a>. Keep it private. It's not encrypted or password-protected and anybody in possession of it can create Camlistore claims as your identity.</p>\n",
+		hint = template.HTML(fmt.Sprintf("<p>Download your GnuPG secret ring from <a href=\"https://console.developers.google.com/storage/browser/%s/\">https://console.developers.google.com/storage/browser/%s/</a> and place it in your <a href='https://perkeep.org/doc/client-config'>Perkeep client config directory</a>. Keep it private. It's not encrypted or password-protected and anybody in possession of it can create Perkeep claims as your identity.</p>\n",
 			bucketdir, bucketdir))
 	}
 

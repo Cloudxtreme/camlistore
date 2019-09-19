@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ package index
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"context"
 	"errors"
 	"fmt"
 	_ "image/gif"
@@ -35,23 +35,38 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/images"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/media"
-	"camlistore.org/pkg/schema"
 	"github.com/hjfreyer/taglib-go/taglib"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/tiff"
+	_ "go4.org/media/heif"
 	"go4.org/readerutil"
 	"go4.org/types"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/images"
+	"perkeep.org/internal/magic"
+	"perkeep.org/internal/media"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/schema"
 )
 
+func init() {
+	t, err := time.Parse(time.RFC3339, msdosEpoch)
+	if err != nil {
+		panic(fmt.Sprintf("Cannot parse MSDOS epoch: %v", err))
+	}
+	msdosEpochTime = t
+}
+
 type mutationMap struct {
-	kv map[string]string // the keys and values we populate
+	// When the mutations are from a claim, signerBlobRef is the signer of the
+	// claim, and signerID is its matching GPG key ID. They are copied out of kv because,
+	// when adding the corresponding entries in the corpus, the signerBlobRef-signerID
+	// relation needs to be known before the claim mutations themselves, so we need to
+	// make sure the keySignerKeyID entry is always added first.
+	signerBlobRef blob.Ref
+	signerID      string
+	kv            map[string]string // the keys and values we populate
 
 	// We record if we get a delete claim, so we can update
 	// the deletes cache right after committing the mutation.
@@ -91,13 +106,13 @@ func blobsFilteringOut(v []blob.Ref, x blob.Ref) []blob.Ref {
 	return nl
 }
 
-func (ix *Index) indexBlob(br blob.Ref) error {
-	rc, _, err := ix.blobSource.Fetch(br)
+func (ix *Index) indexBlob(ctx context.Context, br blob.Ref) error {
+	rc, _, err := ix.blobSource.Fetch(ctx, br)
 	if err != nil {
 		return fmt.Errorf("index: failed to fetch %v for reindexing: %v", br, err)
 	}
 	defer rc.Close()
-	if _, err := blobserver.Receive(ix, br, rc); err != nil {
+	if _, err := blobserver.Receive(ctx, ix, br, rc); err != nil {
 		return err
 	}
 	return nil
@@ -114,7 +129,7 @@ func (ix *Index) DisableOutOfOrderIndexing() {
 
 // indexReadyBlobs indexes blobs that have been recently marked as ready to be
 // reindexed, after the blobs they depend on eventually were indexed.
-func (ix *Index) indexReadyBlobs() {
+func (ix *Index) indexReadyBlobs(ctx context.Context) {
 	defer ix.reindexWg.Done()
 	ix.RLock()
 	// For tests
@@ -136,14 +151,14 @@ func (ix *Index) indexReadyBlobs() {
 		}
 		delete(ix.readyReindex, br)
 		ix.Unlock()
-		if err := ix.indexBlob(br); err != nil {
+		if err := ix.indexBlob(ctx, br); err != nil {
 			log.Printf("out-of-order indexBlob(%v) = %v", br, err)
 			failed[br] = true
 		}
 	}
 	ix.Lock()
 	defer ix.Unlock()
-	for br, _ := range failed {
+	for br := range failed {
 		ix.readyReindex[br] = true
 	}
 }
@@ -158,7 +173,7 @@ func (ix *Index) noteBlobIndexed(br blob.Ref) {
 			ix.readyReindex[needer] = true
 			delete(ix.needs, needer)
 			ix.reindexWg.Add(1)
-			go ix.indexReadyBlobs()
+			go ix.indexReadyBlobs(context.Background())
 		} else {
 			ix.needs[needer] = newNeeds
 		}
@@ -183,7 +198,7 @@ func (ix *Index) removeAllMissingEdges(br blob.Ref) {
 	}
 }
 
-func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	// Read from source before acquiring ix.Lock (Issue 878):
 	sniffer := NewBlobSniffer(blobRef)
 	written, err := io.Copy(sniffer, source)
@@ -205,9 +220,24 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (blob.SizedRef,
 		}
 	}()
 
+	// By default, return immediately if it looks like we already
+	// have indexed this blob before.  But if the user has
+	// CAMLI_REDO_INDEX_ON_RECEIVE set in their environment,
+	// always index it. This is generally only useful when working
+	// on the indexing code and retroactively indexing a subset of
+	// content without forcing a global reindexing.
 	if haveVal, haveErr := ix.s.Get("have:" + blobRef.String()); haveErr == nil {
 		if strings.HasSuffix(haveVal, "|indexed") {
-			return sbr, nil
+			if allowReindex, _ := strconv.ParseBool(os.Getenv("CAMLI_REDO_INDEX_ON_RECEIVE")); allowReindex {
+				if debugEnv {
+					log.Printf("index: reindexing %v", sbr)
+				}
+			} else {
+				if debugEnv {
+					log.Printf("index: ignoring upload of already-indexed %v", sbr)
+				}
+				return sbr, nil
+			}
 		}
 	}
 
@@ -217,8 +247,10 @@ func (ix *Index) ReceiveBlob(blobRef blob.Ref, source io.Reader) (blob.SizedRef,
 		fetcher: ix.blobSource,
 	}
 
-	ctx := context.TODO()
 	mm, err := ix.populateMutationMap(ctx, fetcher, blobRef, sniffer)
+	if debugEnv {
+		log.Printf("index of %v: mm=%v, err=%v", blobRef, mm, err)
+	}
 	if err != nil {
 		if err != errMissingDep {
 			return blob.SizedRef{}, err
@@ -307,9 +339,9 @@ func (ix *Index) populateMutationMap(ctx context.Context, fetcher *missTrackFetc
 		case "claim":
 			err = ix.populateClaim(ctx, fetcher, blob, mm)
 		case "file":
-			err = ix.populateFile(fetcher, blob, mm)
+			err = ix.populateFile(ctx, fetcher, blob, mm)
 		case "directory":
-			err = ix.populateDir(fetcher, blob, mm)
+			err = ix.populateDir(ctx, fetcher, blob, mm)
 		}
 	}
 	if err != nil && err != errMissingDep {
@@ -358,8 +390,8 @@ type missTrackFetcher struct {
 	missing []blob.Ref
 }
 
-func (f *missTrackFetcher) Fetch(br blob.Ref) (blob io.ReadCloser, size uint32, err error) {
-	blob, size, err = f.fetcher.Fetch(br)
+func (f *missTrackFetcher) Fetch(ctx context.Context, br blob.Ref) (blob io.ReadCloser, size uint32, err error) {
+	blob, size, err = f.fetcher.Fetch(ctx, br)
 	if err == os.ErrNotExist {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -376,8 +408,8 @@ type trackErrorsFetcher struct {
 	f blob.Fetcher
 }
 
-func (tf *trackErrorsFetcher) Fetch(br blob.Ref) (blob io.ReadCloser, size uint32, err error) {
-	blob, size, err = tf.f.Fetch(br)
+func (tf *trackErrorsFetcher) Fetch(ctx context.Context, br blob.Ref) (blob io.ReadCloser, size uint32, err error) {
+	blob, size, err = tf.f.Fetch(ctx, br)
 	if err != nil {
 		tf.mu.Lock()
 		defer tf.mu.Unlock()
@@ -424,11 +456,17 @@ func readPrefixOrFile(prefix []byte, fetcher blob.Fetcher, b *schema.Blob, fn fu
 	return err
 }
 
-var exifDebug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG_IMAGES"))
+const msdosEpoch = "1980-01-01T00:00:00Z"
+
+var (
+	exifDebug, _   = strconv.ParseBool(os.Getenv("CAMLI_DEBUG_IMAGES"))
+	debugEnv, _    = strconv.ParseBool(os.Getenv("CAMLI_DEBUG"))
+	msdosEpochTime time.Time
+)
 
 // b: the parsed file schema blob
 // mm: keys to populate
-func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutationMap) (err error) {
+func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *schema.Blob, mm *mutationMap) (err error) {
 	var times []time.Time // all creation or mod times seen; may be zero
 	times = append(times, b.ModTime())
 
@@ -444,8 +482,8 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		mimeType = magic.MIMETypeByExtension(filepath.Ext(b.FileName()))
 	}
 
-	sha1 := sha1.New()
-	var copyDest io.Writer = sha1
+	h := blob.NewHash()
+	var copyDest io.Writer = h
 	var imageBuf *keepFirstN // or nil
 	if strings.HasPrefix(mimeType, "image/") {
 		imageBuf = &keepFirstN{N: 512 << 10}
@@ -458,7 +496,7 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		}
 		return err
 	}
-	wholeRef := blob.RefFromHash(sha1)
+	wholeRef := blob.RefFromHash(h)
 
 	if imageBuf != nil {
 		var conf images.Config
@@ -468,15 +506,25 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		}
 		if err := readPrefixOrFile(imageBuf.Bytes, fetcher, b, decodeConfig); err == nil {
 			mm.Set(keyImageSize.Key(blobRef), keyImageSize.Val(fmt.Sprint(conf.Width), fmt.Sprint(conf.Height)))
+		} else if debugEnv {
+			log.Printf("index: WARNING: image decodeConfig: %v", err)
 		}
 
+		exifData := imageBuf.Bytes
+		if conf.HEICEXIF != nil {
+			exifData = conf.HEICEXIF
+		}
 		var ft time.Time
 		fileTime := func(r filePrefixReader) error {
 			ft, err = schema.FileTime(r)
 			return err
 		}
-		if err = readPrefixOrFile(imageBuf.Bytes, fetcher, b, fileTime); err == nil {
+
+		if err = readPrefixOrFile(exifData, fetcher, b, fileTime); err == nil {
 			times = append(times, ft)
+		} else if debugEnv {
+			log.Printf("index: WARNING: image fileTime: %v", err)
+
 		}
 		if exifDebug {
 			log.Printf("filename %q exif = %v, %v", b.FileName(), ft, err)
@@ -486,7 +534,7 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		indexEXIFData := func(r filePrefixReader) error {
 			return indexEXIF(wholeRef, r, mm)
 		}
-		if err = readPrefixOrFile(imageBuf.Bytes, fetcher, b, indexEXIFData); err != nil {
+		if err = readPrefixOrFile(exifData, fetcher, b, indexEXIFData); err != nil {
 			if exifDebug {
 				log.Printf("error parsing EXIF: %v", err)
 			}
@@ -506,7 +554,14 @@ func (ix *Index) populateFile(fetcher blob.Fetcher, b *schema.Blob, mm *mutation
 		time3339s = types.Time3339(sortTimes[0]).String()
 	case len(sortTimes) >= 2:
 		oldest, newest := sortTimes[0], sortTimes[len(sortTimes)-1]
-		time3339s = types.Time3339(oldest).String() + "," + types.Time3339(newest).String()
+		// Common enough exception: unset creation time from an MSDOS
+		// system (which is the default in zip files). So if we have
+		// another time to use, just ignore the MSDOS epoch one.
+		if oldest.After(msdosEpochTime) {
+			time3339s = types.Time3339(oldest).String() + "," + types.Time3339(newest).String()
+		} else {
+			time3339s = types.Time3339(newest).String()
+		}
 	}
 
 	mm.Set(keyWholeToFileRef.Key(wholeRef, blobRef), "1")
@@ -667,9 +722,9 @@ func indexMusic(r readerutil.SizeReaderAt, wholeRef blob.Ref, mm *mutationMap) {
 	// Generate a hash of the audio portion of the file (i.e. excluding ID3v1 and v2 tags).
 	audioStart := int64(tag.TagSize())
 	audioSize := r.Size() - audioStart - footerLength
-	hash := sha1.New()
+	hash := blob.NewHash()
 	if _, err := io.Copy(hash, io.NewSectionReader(r, audioStart, audioSize)); err != nil {
-		log.Print("index: error generating SHA1 from audio data: ", err)
+		log.Print("index: error generating hash of audio data: ", err)
 		return
 	}
 	mediaRef := blob.RefFromHash(hash)
@@ -719,13 +774,13 @@ func indexMusic(r readerutil.SizeReaderAt, wholeRef blob.Ref, mm *mutationMap) {
 
 // b: the parsed file schema blob
 // mm: keys to populate
-func (ix *Index) populateDir(fetcher blob.Fetcher, b *schema.Blob, mm *mutationMap) error {
+func (ix *Index) populateDir(ctx context.Context, fetcher blob.Fetcher, b *schema.Blob, mm *mutationMap) error {
 	blobRef := b.BlobRef()
 	// TODO(bradfitz): move the NewDirReader and FileName method off *schema.Blob and onto
 	// StaticFile/StaticDirectory or something.
 
 	tf := &trackErrorsFetcher{f: fetcher.(*missTrackFetcher)}
-	dr, err := b.NewDirReader(tf)
+	dr, err := b.NewDirReader(ctx, tf)
 	if err != nil {
 		// TODO(bradfitz): propagate up a transient failure
 		// error type, so we can retry indexing files in the
@@ -733,7 +788,7 @@ func (ix *Index) populateDir(fetcher blob.Fetcher, b *schema.Blob, mm *mutationM
 		log.Printf("index: error indexing directory, creating NewDirReader %s: %v", blobRef, err)
 		return nil
 	}
-	sts, err := dr.StaticSet()
+	sts, err := dr.StaticSet(ctx)
 	if err != nil {
 		if tf.hasErrNotExist() {
 			return errMissingDep
@@ -801,19 +856,19 @@ func (ix *Index) populateClaim(ctx context.Context, fetcher *missTrackFetcher, b
 
 	tf := &trackErrorsFetcher{f: fetcher}
 	vr := jsonsign.NewVerificationRequest(b.JSON(), blob.NewSerialFetcher(ix.KeyFetcher, tf))
-	if !vr.Verify() {
+	_, err := vr.Verify(ctx)
+	if err != nil {
 		// TODO(bradfitz): ask if the vr.Err.(jsonsign.Error).IsPermanent() and retry
 		// later if it's not permanent? or maybe do this up a level?
-		if vr.Err != nil {
-			if tf.hasErrNotExist() {
-				return errMissingDep
-			}
-			return vr.Err
+		if tf.hasErrNotExist() {
+			return errMissingDep
 		}
-		return errors.New("index: populateClaim verification failure")
+		return err
 	}
 	verifiedKeyId := vr.SignerKeyId
-	mm.Set("signerkeyid:"+vr.CamliSigner.String(), verifiedKeyId)
+	mm.signerID = verifiedKeyId
+	mm.signerBlobRef = vr.CamliSigner
+	mm.Set(keySignerKeyID.name+":"+vr.CamliSigner.String(), verifiedKeyId)
 
 	if claim.ClaimType() == string(schema.DeleteClaim) {
 		if err := ix.populateDeleteClaim(ctx, claim, vr, mm); err != nil {
@@ -879,19 +934,19 @@ func (ix *Index) populateClaim(ctx context.Context, fetcher *missTrackFetcher, b
 
 // updateDeletesCache updates the index deletes cache with the cl delete claim.
 // deleteClaim is trusted to be a valid delete Claim.
-func (x *Index) updateDeletesCache(deleteClaim schema.Claim) error {
+func (ix *Index) updateDeletesCache(deleteClaim schema.Claim) error {
 	target := deleteClaim.Target()
 	deleter := deleteClaim.Blob()
 	when, err := deleter.ClaimDate()
 	if err != nil {
 		return fmt.Errorf("Could not get date of delete claim %v: %v", deleteClaim, err)
 	}
-	targetDeletions := append(x.deletes.m[target],
+	targetDeletions := append(ix.deletes.m[target],
 		deletion{
 			deleter: deleter.BlobRef(),
 			when:    when,
 		})
 	sort.Sort(sort.Reverse(byDeletionDate(targetDeletions)))
-	x.deletes.m[target] = targetDeletions
+	ix.deletes.m[target] = targetDeletions
 	return nil
 }

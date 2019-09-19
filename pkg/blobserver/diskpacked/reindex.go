@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package diskpacked
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -26,16 +27,15 @@ import (
 	"os"
 	"strconv"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/sorted"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/sorted"
 
 	// possible index formats
-	_ "camlistore.org/pkg/sorted/kvfile"
-	_ "camlistore.org/pkg/sorted/leveldb"
-	_ "camlistore.org/pkg/sorted/sqlite"
+	_ "perkeep.org/pkg/sorted/kvfile"
+	_ "perkeep.org/pkg/sorted/leveldb"
+	_ "perkeep.org/pkg/sorted/sqlite"
 )
 
 // Reindex rewrites the index files of the diskpacked .pack files

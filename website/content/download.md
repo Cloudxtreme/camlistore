@@ -1,10 +1,11 @@
-# Download Camlistore
+# Download Perkeep
 
-The latest release is [2017-05-05](docs/release/monthly/2017-05-05).
+The latest release is [0.10 ("Bellingham")](/doc/release/0.10), released 2018-05-02.
 
-Or, the canonical git repo is:
+Or, using the latest code from git:
 
-    $ git clone https://camlistore.googlesource.com/camlistore
+    $ cd $GOPATH/src
+    $ git clone https://github.com/perkeep/perkeep.git perkeep.org
 
 ## Build
 
@@ -13,28 +14,32 @@ Windows), skip this section.
 
 [Download and install Go](http://golang.org/doc/install) if you don't
 have that installed already. As of revision
-[c35cd68b5c](https://github.com/camlistore/camlistore/commit/c35cd68b5c9e914ef78811e88338ffd02f378a1c),
-Camlistore requires [Go 1.8 or newer](https://golang.org/dl/).
+[2e46fca5cc](https://github.com/perkeep/perkeep/commit/2e46fca5cc1179dbd90bec49fec3870e6eca6c45),
+Perkeep requires [Go 1.10 or newer](https://golang.org/dl/).
 
-Build Camlistore by running this command in the folder you downloaded or
-checked out:
+Build Perkeep by making sure you git cloned it to a directory named
+"`perkeep.org`" and that directory is in the right place in your
+`$GOPATH`. If you haven't set `$GOPATH` explicitly, then Go uses
+`$HOME/go` by default, which means your `perkeep.org` directory should
+be at `$HOME/go/src/perkeep.org`. Then from that `perkeep.org`
+directory, run:
 
     $ go run make.go
 
 ## Getting started
 
-Once you've successfully built the Camlistore components, you can run
+Once you've successfully built the Perkeep components, you can run
 the server with:
 
-    $ ./bin/camlistored
+    $ ./bin/perkeepd
 
 This will create [configuration](/doc/server-config) and public/private
-key information in `$HOME/.config/camlistore/` (or where
-`camtool env configdir` points). You can start and stop camlistored as
+key information in `$HOME/.config/perkeep/` (or where
+`pk env configdir` points). You can start and stop perkeepd as
 you see fit.
 
-You're done setting up! Running camlistored should open a new browser
-window pointed at your camlistore where you can start uploading and
+You're done setting up! Running perkeepd should open a new browser
+window pointed at your keep where you can start uploading and
 interacting with data.
 
 Developers typically use the `./bin/devcam` wrapper to isolate their
@@ -42,10 +47,24 @@ test environment from their production instance and to simplify common
 development tasks. If you have questions, you can ask the [mailing
 list](https://groups.google.com/group/camlistore).
 
+## Synology
+
+We are also starting to [provide packages](/doc/synology) for Synology appliances.
+
+## Mobile
+
+The project also has an Android app to upload your files (mainly photos) to a
+Perkeep instance. The official build is on
+[Google Play](https://play.google.com/store/apps/details?id=org.camlistore).
+A [debug version](https://storage.googleapis.com/camlistore-release/android/app-debug.apk)
+is regularly built and uploaded.
+
 ## Release Notes
 
 Previous release notes:
 
+-   [0.10 ("Bellingham")](/doc/release/0.10), 2018-05-02
+-   [2017-05-05](docs/release/monthly/2017-05-05.html)
 -   [2017-03-01](docs/release/monthly/2017-03-01.html)
 -   [0.9 ("Astrakhan")](/doc/release/0.9), 2015-12-30
 -   [0.8 ("Tokyo")](/doc/release/0.8), 2014-08-03

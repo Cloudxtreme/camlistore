@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,31 +16,34 @@ limitations under the License.
 
 /*
 Package remote registers the "remote" blobserver storage type, storing
-and fetching blobs from a remote Camlistore server, speaking the HTTP
-protocol.
+and fetching blobs from a remote Perkeep server over HTTPS.
 
 Example low-level config:
 
      "/peer/": {
          "handler": "storage-remote",
          "handlerArgs": {
-             "url": "http://10.0.0.17/base",
+             "url": "https://some-other-server/base",
              "auth": "userpass:user:pass",
              "skipStartupCheck": false
           }
      },
 
+The "handlerArgs" may also contain an optional "trustedCert" option to
+trust a self-signed TLS certificate. The value is the 20 byte hex prefix
+of the SHA-256 of the cert, as printed by the perkeepd server
+on start-up.
 */
-package remote // import "camlistore.org/pkg/blobserver/remote"
+package remote // import "perkeep.org/pkg/blobserver/remote"
 
 import (
+	"context"
 	"io"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/client"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/client"
 )
 
 // remoteStorage is a blobserver.Storage proxy for a remote camlistore
@@ -49,10 +52,13 @@ type remoteStorage struct {
 	client *client.Client
 }
 
-var _ = blobserver.Storage((*remoteStorage)(nil))
+var (
+	_ blobserver.Storage = (*remoteStorage)(nil)
+	_ io.Closer          = (*remoteStorage)(nil)
+)
 
 // NewFromClient returns a new Storage implementation using the
-// provided Camlistore client.
+// provided Perkeep client.
 func NewFromClient(c *client.Client) blobserver.Storage {
 	return &remoteStorage{client: c}
 }
@@ -61,11 +67,18 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserv
 	url := config.RequiredString("url")
 	auth := config.RequiredString("auth")
 	skipStartupCheck := config.OptionalBool("skipStartupCheck", false)
+	trustedCert := config.OptionalString("trustedCert", "")
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 
-	client := client.New(url)
+	client, err := client.New(
+		client.OptionServer(url),
+		client.OptionTrustedCert(trustedCert),
+	)
+	if err != nil {
+		return nil, err
+	}
 	if err = client.SetupAuthFromString(auth); err != nil {
 		return nil, err
 	}
@@ -85,25 +98,29 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserv
 	return sto, nil
 }
 
-func (sto *remoteStorage) RemoveBlobs(blobs []blob.Ref) error {
-	return sto.client.RemoveBlobs(blobs)
+func (sto *remoteStorage) Close() error {
+	return sto.client.Close()
 }
 
-func (sto *remoteStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (sto *remoteStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
+	return sto.client.RemoveBlobs(ctx, blobs)
+}
+
+func (sto *remoteStorage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	// TODO: cache the stat response's uploadUrl to save a future
 	// stat later?  otherwise clients will just Stat + Upload, but
 	// Upload will also Stat.  should be smart and make sure we
 	// avoid ReceiveBlob's Stat whenever it would be redundant.
-	return sto.client.StatBlobs(dest, blobs)
+	return sto.client.StatBlobs(ctx, blobs, fn)
 }
 
-func (sto *remoteStorage) ReceiveBlob(blob blob.Ref, source io.Reader) (outsb blob.SizedRef, outerr error) {
+func (sto *remoteStorage) ReceiveBlob(ctx context.Context, blob blob.Ref, source io.Reader) (outsb blob.SizedRef, outerr error) {
 	h := &client.UploadHandle{
 		BlobRef:  blob,
 		Size:     0, // size isn't known; 0 is fine, but TODO: ask source if it knows its size
 		Contents: source,
 	}
-	pr, err := sto.client.Upload(h)
+	pr, err := sto.client.Upload(ctx, h)
 	if err != nil {
 		outerr = err
 		return
@@ -111,8 +128,8 @@ func (sto *remoteStorage) ReceiveBlob(blob blob.Ref, source io.Reader) (outsb bl
 	return pr.SizedBlobRef(), nil
 }
 
-func (sto *remoteStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
-	return sto.client.Fetch(b)
+func (sto *remoteStorage) Fetch(ctx context.Context, b blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	return sto.client.Fetch(ctx, b)
 }
 
 func (sto *remoteStorage) MaxEnumerate() int { return 1000 }

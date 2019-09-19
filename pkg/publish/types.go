@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ limitations under the License.
 
 // Package publish exposes the types and functions that can be used
 // from a Go template, for publishing.
-package publish // import "camlistore.org/pkg/publish"
+package publish // import "perkeep.org/pkg/publish"
 
 import (
 	"html/template"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/search"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/search"
 )
 
 // SubjectPage is the data structure used when serving a
@@ -48,8 +48,8 @@ type PageHeader struct {
 	// subject. e.g. "/pics/foo/-/h341b133369" or "/pics/foo/-" if the subject
 	// is the published root itself.
 	SubjectBasePath string
-	// PathPrefix is the publisher app handler prefix on Camlistore, e.g.
-	// "/pics/", or "/" if the request was not proxied through Camlistore.
+	// PathPrefix is the publisher app handler prefix on Perkeep, e.g.
+	// "/pics/", or "/" if the request was not proxied through Perkeep.
 	PathPrefix string
 	Host       string
 }

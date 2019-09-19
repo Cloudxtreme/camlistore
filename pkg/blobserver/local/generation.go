@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ limitations under the License.
 Package local implements functionality common to both the "localdisk" and
 "diskpacked" storage mechanisms.
 */
-package local // import "camlistore.org/pkg/blobserver/local"
+package local // import "perkeep.org/pkg/blobserver/local"
 
 import (
 	"bytes"
@@ -91,7 +91,7 @@ paranoia facility for clients.
 If the client sees the same random string in multiple upload sessions,
 it assumes that the blobserver still has all the same blobs, and also
 it's the same server.  This mechanism is not fundamental to
-Camlistore's operation: the client could also check each blob before
+Perkeep's operation: the client could also check each blob before
 uploading, or enumerate all blobs from the server too.  This is purely
 an optimization so clients can mix this value into their "is this file
 uploaded?" local cache keys.

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Camlistore Authors
+Copyright 2016 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package b2
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,15 +27,14 @@ import (
 	"path"
 	"strings"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/memory"
-	"camlistore.org/pkg/constants"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/memory"
+	"perkeep.org/pkg/constants"
 
 	"github.com/FiloSottile/b2"
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 )
 
 type Storage struct {
@@ -116,7 +116,7 @@ func (s *Storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef,
 		}
 		br, ok := blob.Parse(file)
 		if !ok {
-			return fmt.Errorf("b2: non-Camlistore object named %q found in bucket", file)
+			return fmt.Errorf("b2: non-Perkeep object named %q found in bucket", file)
 		}
 		select {
 		case dest <- blob.SizedRef{Ref: br, Size: uint32(fi.ContentLength)}:
@@ -127,7 +127,8 @@ func (s *Storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef,
 	return l.Err()
 }
 
-func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (s *Storage) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+	// TODO: pass ctx to b2 library, once github.com/FiloSottile/b2 supports it.
 	var buf bytes.Buffer
 	size, err := io.Copy(&buf, source)
 	if err != nil {
@@ -150,47 +151,40 @@ func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, err
 	if s.cache != nil {
 		// NoHash because it's already verified if we read it without
 		// errors from the source, and uploaded it without mismatch.
-		blobserver.ReceiveNoHash(s.cache, br, &buf)
+		blobserver.ReceiveNoHash(ctx, s.cache, br, &buf)
 	}
 	return blob.SizedRef{Ref: br, Size: uint32(size)}, nil
 }
 
-func (s *Storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (s *Storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	// TODO: use cache
-	var grp syncutil.Group
 	gate := syncutil.NewGate(5) // arbitrary cap
-	for i := range blobs {
-		br := blobs[i]
-		gate.Start()
-		grp.Go(func() error {
-			defer gate.Done()
-			fi, err := s.b.GetFileInfoByName(s.dirPrefix + br.String())
-			if err == b2.FileNotFoundError {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if br.HashName() == "sha1" && fi.ContentSHA1 != br.Digest() {
-				return errors.New("b2: remote ContentSHA1 mismatch")
-			}
-			size := fi.ContentLength
-			if size > constants.MaxBlobSize {
-				return fmt.Errorf("blob %s stat size too large (%d)", br, size)
-			}
-			dest <- blob.SizedRef{Ref: br, Size: uint32(size)}
-			return nil
-		})
-	}
-	return grp.Err()
+	return blobserver.StatBlobsParallelHelper(ctx, blobs, fn, gate, func(br blob.Ref) (sb blob.SizedRef, err error) {
+		fi, err := s.b.GetFileInfoByName(s.dirPrefix + br.String())
+		if err == b2.FileNotFoundError {
+			return sb, nil
+		}
+		if err != nil {
+			return sb, err
+		}
+		if br.HashName() == "sha1" && fi.ContentSHA1 != br.Digest() {
+			return sb, errors.New("b2: remote ContentSHA1 mismatch")
+		}
+		size := fi.ContentLength
+		if size > constants.MaxBlobSize {
+			return sb, fmt.Errorf("blob %s stat size too large (%d)", br, size)
+		}
+		return blob.SizedRef{Ref: br, Size: uint32(size)}, nil
+	})
 }
 
-func (s *Storage) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
+func (s *Storage) Fetch(ctx context.Context, br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	if s.cache != nil {
-		if rc, size, err = s.cache.Fetch(br); err == nil {
+		if rc, size, err = s.cache.Fetch(ctx, br); err == nil {
 			return
 		}
 	}
+	// TODO: pass ctx to b2 library, once github.com/FiloSottile/b2 supports it.
 	r, fi, err := s.cl.DownloadFileByName(s.b.Name, s.dirPrefix+br.String())
 	if err, ok := b2.UnwrapError(err); ok && err.Status == 404 {
 		return nil, 0, os.ErrNotExist
@@ -215,9 +209,9 @@ func (s *Storage) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) 
 	return r, size, nil
 }
 
-func (s *Storage) RemoveBlobs(blobs []blob.Ref) error {
+func (s *Storage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	if s.cache != nil {
-		s.cache.RemoveBlobs(blobs)
+		s.cache.RemoveBlobs(ctx, blobs)
 	}
 	gate := syncutil.NewGate(5) // arbitrary
 	var grp syncutil.Group

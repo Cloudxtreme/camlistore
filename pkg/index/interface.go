@@ -1,12 +1,12 @@
 package index
 
 import (
+	"context"
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/types/camtypes"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 type Interface interface {
@@ -37,7 +37,8 @@ type Interface interface {
 	KeyId(context.Context, blob.Ref) (string, error)
 
 	// AppendClaims appends to dst claims on the given permanode.
-	// The signerFilter and attrFilter are both optional.  If non-zero,
+	// The signerFilter - a GPG key ID (e.g. "2931A67C26F5ABDA) -
+	// and attrFilter are both optional.  If non-zero,
 	// they filter the return items to only claims made by the given signer
 	// or claims about the given attribute, respectively.
 	// Deleted claims are never returned.
@@ -49,7 +50,7 @@ type Interface interface {
 	// take the context too, so the channel send's select can read
 	// from the Done channel.
 	AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
-		signerFilter blob.Ref,
+		signerFilter string,
 		attrFilter string) ([]camtypes.Claim, error)
 
 	// TODO(bradfitz): methods below this line are slated for a redesign
@@ -95,14 +96,14 @@ type Interface interface {
 	// can be avoided if at least one of the returned schemaRefs
 	// can be validated (with a validating HEAD request) to still
 	// all exist on the blob server.
-	ExistingFileSchemas(wholeFileRef blob.Ref) (schemaRefs []blob.Ref, err error)
+	ExistingFileSchemas(wholeFileRef ...blob.Ref) (schemaRefs WholeRefToFile, err error)
 
 	// GetDirMembers sends on dest the children of the static
 	// directory dirRef. It returns os.ErrNotExist if dirRef
 	// is nil.
 	// dest must be closed, even when returning an error.
 	// limit <= 0 means unlimited.
-	GetDirMembers(dirRef blob.Ref, dest chan<- blob.Ref, limit int) error
+	GetDirMembers(ctx context.Context, dirRef blob.Ref, dest chan<- blob.Ref, limit int) error
 
 	// Given an owner key, a camliType 'claim', 'attribute' name,
 	// and specific 'value', find the most recent permanode that has

@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package index_test
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -27,15 +28,56 @@ import (
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/camtypes"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/test"
+	"perkeep.org/pkg/types/camtypes"
 )
+
+var ctxbg = context.Background()
+
+var (
+	chunk1, chunk2, chunk3, fileBlob, staticSetBlob, dirBlob *test.Blob
+	chunk1ref, chunk2ref, chunk3ref, fileBlobRef             blob.Ref
+)
+
+func init() {
+	testhooks.SetUseSHA1(true)
+
+	chunk1 = &test.Blob{Contents: "foo"}
+	chunk2 = &test.Blob{Contents: "bar"}
+	chunk3 = &test.Blob{Contents: "baz"}
+
+	chunk1ref = chunk1.BlobRef()
+	chunk2ref = chunk2.BlobRef()
+	chunk3ref = chunk3.BlobRef()
+
+	fileBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
+"camliType": "file",
+"fileName": "stuff.txt",
+"parts": [
+  {"blobRef": "%s", "size": 3},
+  {"blobRef": "%s", "size": 3},
+  {"blobRef": "%s", "size": 3}
+]}`, chunk1ref, chunk2ref, chunk3ref)}
+	fileBlobRef = fileBlob.BlobRef()
+
+	staticSetBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
+"camliType": "static-set",
+"members": [
+  "%s"
+]}`, fileBlobRef)}
+
+	dirBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
+"camliType": "directory",
+"fileName": "someDir",
+"entries": "%s"
+}`, staticSetBlob.BlobRef())}
+}
 
 func TestReverseTimeString(t *testing.T) {
 	in := "2011-11-27T01:23:45Z"
@@ -109,7 +151,7 @@ func hasAllRequiredTests(name string, t *testing.T) error {
 		switch x := n.(type) {
 		case *ast.FuncDecl:
 			name := x.Name.Name
-			for k, _ := range tests {
+			for k := range tests {
 				if strings.HasPrefix(name, k) {
 					tests[k] = true
 				}
@@ -191,38 +233,6 @@ func TestMergeFileInfoRow(t *testing.T) {
 	testMergeFileInfoRow(t, "sha1-142b504945338158e0149d4ed25a41a522a28e88")
 }
 
-var (
-	chunk1 = &test.Blob{Contents: "foo"}
-	chunk2 = &test.Blob{Contents: "bar"}
-	chunk3 = &test.Blob{Contents: "baz"}
-
-	chunk1ref = chunk1.BlobRef()
-	chunk2ref = chunk2.BlobRef()
-	chunk3ref = chunk3.BlobRef()
-
-	fileBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
-"camliType": "file",
-"fileName": "stuff.txt",
-"parts": [
-  {"blobRef": "%s", "size": 3},
-  {"blobRef": "%s", "size": 3},
-  {"blobRef": "%s", "size": 3}
-]}`, chunk1ref, chunk2ref, chunk3ref)}
-	fileBlobRef = fileBlob.BlobRef()
-
-	staticSetBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
-"camliType": "static-set",
-"members": [
-  "%s"
-]}`, fileBlobRef)}
-
-	dirBlob = &test.Blob{fmt.Sprintf(`{"camliVersion": 1,
-"camliType": "directory",
-"fileName": "someDir",
-"entries": "%s"
-}`, staticSetBlob.BlobRef())}
-)
-
 func TestInitNeededMaps(t *testing.T) {
 	s := sorted.NewMemoryKeyValue()
 
@@ -245,12 +255,12 @@ func TestInitNeededMaps(t *testing.T) {
 	{
 		needs, neededBy, _ := ix.NeededMapsForTest()
 		needsWant := map[blob.Ref][]blob.Ref{
-			fileBlobRef: []blob.Ref{chunk1ref, chunk2ref, chunk3ref},
+			fileBlobRef: {chunk1ref, chunk2ref, chunk3ref},
 		}
 		neededByWant := map[blob.Ref][]blob.Ref{
-			chunk1ref: []blob.Ref{fileBlobRef},
-			chunk2ref: []blob.Ref{fileBlobRef},
-			chunk3ref: []blob.Ref{fileBlobRef},
+			chunk1ref: {fileBlobRef},
+			chunk2ref: {fileBlobRef},
+			chunk3ref: {fileBlobRef},
 		}
 		if !reflect.DeepEqual(needs, needsWant) {
 			t.Errorf("needs = %v; want %v", needs, needsWant)
@@ -265,11 +275,11 @@ func TestInitNeededMaps(t *testing.T) {
 	{
 		needs, neededBy, ready := ix.NeededMapsForTest()
 		needsWant := map[blob.Ref][]blob.Ref{
-			fileBlobRef: []blob.Ref{chunk1ref, chunk3ref},
+			fileBlobRef: {chunk1ref, chunk3ref},
 		}
 		neededByWant := map[blob.Ref][]blob.Ref{
-			chunk1ref: []blob.Ref{fileBlobRef},
-			chunk3ref: []blob.Ref{fileBlobRef},
+			chunk1ref: {fileBlobRef},
+			chunk3ref: {fileBlobRef},
 		}
 		if !reflect.DeepEqual(needs, needsWant) {
 			t.Errorf("needs = %v; want %v", needs, needsWant)
@@ -287,10 +297,10 @@ func TestInitNeededMaps(t *testing.T) {
 	{
 		needs, neededBy, ready := ix.NeededMapsForTest()
 		needsWant := map[blob.Ref][]blob.Ref{
-			fileBlobRef: []blob.Ref{chunk3ref},
+			fileBlobRef: {chunk3ref},
 		}
 		neededByWant := map[blob.Ref][]blob.Ref{
-			chunk3ref: []blob.Ref{fileBlobRef},
+			chunk3ref: {fileBlobRef},
 		}
 		if !reflect.DeepEqual(needs, needsWant) {
 			t.Errorf("needs = %v; want %v", needs, needsWant)
@@ -360,7 +370,7 @@ func testOutOfOrderIndexing(t *testing.T, sequence []testSequence) {
 
 	add := func(b *test.Blob) {
 		tf.AddBlob(b)
-		if _, err := ix.ReceiveBlob(b.BlobRef(), b.Reader()); err != nil {
+		if _, err := ix.ReceiveBlob(ctxbg, b.BlobRef(), b.Reader()); err != nil {
 			t.Fatalf("ReceiveBlob(%v): %v", b.BlobRef(), err)
 		}
 	}
@@ -483,12 +493,12 @@ func TestIndexingClaimMissingPubkey(t *testing.T) {
 }
 
 func copyBlob(br blob.Ref, dst blobserver.BlobReceiver, src blob.Fetcher) error {
-	rc, _, err := src.Fetch(br)
+	rc, _, err := src.Fetch(ctxbg, br)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	_, err = dst.ReceiveBlob(br, rc)
+	_, err = dst.ReceiveBlob(ctxbg, br, rc)
 	return err
 }
 
@@ -508,7 +518,7 @@ func TestFixMissingWholeref(t *testing.T) {
 	// populate with a file
 	add := func(b *test.Blob) {
 		tf.AddBlob(b)
-		if _, err := ix.ReceiveBlob(b.BlobRef(), b.Reader()); err != nil {
+		if _, err := ix.ReceiveBlob(ctxbg, b.BlobRef(), b.Reader()); err != nil {
 			t.Fatalf("ReceiveBlob(%v): %v", b.BlobRef(), err)
 		}
 	}

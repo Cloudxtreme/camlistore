@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,131 +17,212 @@ limitations under the License.
 package search_test
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
+	"path/filepath"
 	"testing"
+	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/camtypes"
-
-	"golang.org/x/net/context"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/test"
 )
 
-func addPermanode(fi *test.FakeIndex, pnStr string, attrs ...string) {
-	pn := blob.MustParse(pnStr)
-	fi.AddMeta(pn, "permanode", 123)
-	for len(attrs) > 0 {
-		k, v := attrs[0], attrs[1]
-		attrs = attrs[2:]
-		fi.AddClaim(owner, pn, "add-attribute", k, v)
+func init() {
+	testhooks.SetUseSHA1(true)
+}
+
+var describedBlobs = map[string]blob.Ref{
+	"abc-123":            blob.MustParse("sha1-39606e3c1730123c1cd80857b41a721ea5e6d4c5"),
+	"abc-123c":           blob.MustParse("sha1-d2ec7f86e73d2434df7736bcab47e9cc1507faeb"),
+	"abc-123c1":          blob.MustParse("sha1-6caf362b90f7713558860ef2b43c1bfa1af4d54b"),
+	"abc-123cc":          blob.MustParse("sha1-4542245a5739f14ef5df3e3578603cb5599e979d"),
+	"abc-888":            blob.MustParse("sha1-7a37eadfe010128b452cb950932c408149a0b6aa"),
+	"abc-8881":           blob.MustParse("sha1-0b0fec9002df13dad544e303b932ab7900fe651f"),
+	"fourcheckin-0":      blob.MustParse("sha1-5efbaa0911510dbfd9a3e527de821c9c4aaa1451"),
+	"fourvenue-123":      blob.MustParse("sha1-2bc38525b7f5cb33657079f176b81dfc688a761a"),
+	"venuepicset-123":    blob.MustParse("sha1-14b788811dcbf39aba11d06a7f4c3a85e158372e"),
+	"venuepic-1":         blob.MustParse("sha1-322e19e5e2ff273b0e726817180d4e7a65fd18a6"),
+	"somevenuepic-0":     blob.MustParse("sha1-6293628cff5169c577fa2c27b191827e5537dc2d"),
+	"venuepic-2":         blob.MustParse("sha1-931e6fa5904f8ddb3dab7d6107f4d4acd5dc2c0c"),
+	"somevenuepic-2":     blob.MustParse("sha1-eaa4c47801c00ea55bcca508cd9ac6aef224f8e4"),
+	"homedir-0":          blob.MustParse("sha1-9c8c65b7cdd94fce2162492740a596c44ca87869"),
+	"homedir-1":          blob.MustParse("sha1-5b906a7c5ff14c219fe2a58f97b8cf73814273c4"),
+	"homedir-2":          blob.MustParse("sha1-d5f182577613cd4a0b75e23d461c6ea93c637e85"),
+	"set-0":              blob.MustParse("sha1-db75da7350c909cc24640eff5fcd4613a235d57a"),
+	"location-0":         blob.MustParse("sha1-94618fac5f1257bf0ac52fb07e391295ddb89e3a"),
+	"locationpriority-1": blob.MustParse("sha1-d8d3f7e4a74a7fb29435c6d708f683bf330863a6"),
+	"locationpriority-2": blob.MustParse("sha1-1841d4ee4c6edab302b1f13c78a6d3ee1a09fb38"),
+	"locationoverride-1": blob.MustParse("sha1-6f245d8bd5b18d110d305f33b64cb1be190d43ff"),
+	"locationoverride-2": blob.MustParse("sha1-51271c4962df329d4c32d5c56eccbe996de668b4"),
+	"filewithloc-0":      blob.MustParse("sha1-24c572c7cf48de8c32298b9ac00c7cb7b9922d60"),
+}
+
+func searchDescribeSetup(t *testing.T) indexAndOwner {
+	idx := index.NewMemoryIndex()
+	tf := new(test.Fetcher)
+	idx.InitBlobSource(tf)
+	idx.KeyFetcher = tf
+	fi := &fetcherIndex{
+		tf:  tf,
+		idx: idx,
+	}
+
+	lastModtime = test.ClockOrigin
+	checkErr(t, fi.addBlob(ownerRef))
+	checkErr(t, fi.addPermanode("abc-123",
+		"camliContent", dbRefStr("abc-123c"),
+		"camliImageContent", dbRefStr("abc-888"),
+	))
+
+	checkErr(t, fi.addPermanode("abc-123c",
+		"camliContent", dbRefStr("abc-123cc"),
+		"camliImageContent", dbRefStr("abc-123c1"),
+	))
+
+	checkErr(t, fi.addPermanode("abc-123c1",
+		"some", "image",
+	))
+
+	checkErr(t, fi.addPermanode("abc-123cc",
+		"name", "leaf",
+	))
+
+	checkErr(t, fi.addPermanode("abc-888",
+		"camliContent", dbRefStr("abc-8881"),
+	))
+
+	checkErr(t, fi.addPermanode("abc-8881",
+		"name", "leaf8881",
+	))
+
+	checkErr(t, fi.addPermanode("fourcheckin-0",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", dbRefStr("fourvenue-123"),
+	))
+	checkErr(t, fi.addPermanode("fourvenue-123",
+		"camliNodeType", "foursquare.com:venue",
+		"camliPath:photos", dbRefStr("venuepicset-123"),
+		"latitude", "12",
+		"longitude", "34",
+	))
+
+	checkErr(t, fi.addPermanode("venuepicset-123",
+		"camliPath:1.jpg", dbRefStr("venuepic-1"),
+	))
+
+	checkErr(t, fi.addPermanode("venuepic-1",
+		"camliContent", dbRefStr("somevenuepic-0"),
+	))
+
+	checkErr(t, fi.addPermanode("somevenuepic-0",
+		"foo", "bar",
+	))
+
+	checkErr(t, fi.addPermanode("venuepic-2",
+		"camliContent", dbRefStr("somevenuepic-2"),
+	))
+
+	checkErr(t, fi.addPermanode("somevenuepic-2",
+		"foo", "baz",
+	))
+
+	checkErr(t, fi.addPermanode("homedir-0",
+		"camliPath:subdir.1", dbRefStr("homedir-1"),
+	))
+
+	checkErr(t, fi.addPermanode("homedir-1",
+		"camliPath:subdir.2", dbRefStr("homedir-2"),
+	))
+
+	checkErr(t, fi.addPermanode("homedir-2",
+		"foo", "bar",
+	))
+
+	checkErr(t, fi.addPermanode("set-0",
+		"camliMember", dbRefStr("venuepic-1"),
+		"camliMember", dbRefStr("venuepic-2"),
+	))
+
+	uploadFile := func(file string) blob.Ref {
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
+		if err != nil {
+			t.Fatalf("looking up perkeep.org location in $GOPATH: %v", err)
+		}
+		fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
+		contents, err := ioutil.ReadFile(fileName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb := &test.Blob{Contents: string(contents)}
+		checkErr(t, fi.addBlob(tb))
+		m := schema.NewFileMap(fileName)
+		m.PopulateParts(int64(len(contents)), []schema.BytesPart{
+			{
+				Size:    uint64(len(contents)),
+				BlobRef: tb.BlobRef(),
+			}})
+		lastModtime = lastModtime.Add(time.Second).UTC()
+		m.SetModTime(lastModtime)
+		fjson, err := m.JSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fb := &test.Blob{Contents: fjson}
+		checkErr(t, fi.addBlob(fb))
+		return fb.BlobRef()
+	}
+	uploadFile("dude-gps.jpg")
+
+	checkErr(t, fi.addPermanode("location-0",
+		"camliContent", dbRefStr("filewithloc-0"),
+	))
+
+	checkErr(t, fi.addPermanode("locationpriority-1",
+		"latitude", "67",
+		"longitude", "78",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", dbRefStr("fourvenue-123"),
+		"camliContent", dbRefStr("filewithloc-0"),
+	))
+
+	checkErr(t, fi.addPermanode("locationpriority-2",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", dbRefStr("fourvenue-123"),
+		"camliContent", dbRefStr("filewithloc-0"),
+	))
+
+	checkErr(t, fi.addPermanode("locationoverride-1",
+		"latitude", "67",
+		"longitude", "78",
+		"camliContent", dbRefStr("filewithloc-0"),
+	))
+
+	checkErr(t, fi.addPermanode("locationoverride-2",
+		"latitude", "67",
+		"longitude", "78",
+		"camliNodeType", "foursquare.com:checkin",
+		"foursquareVenuePermanode", dbRefStr("fourvenue-123"),
+	))
+
+	return indexAndOwner{
+		index: idx,
+		owner: owner.BlobRef(),
 	}
 }
 
-func addFileWithLocation(fi *test.FakeIndex, fileStr string, lat, long float64) {
-	fileRef := blob.MustParse(fileStr)
-	fi.AddFileLocation(fileRef, camtypes.Location{Latitude: lat, Longitude: long})
-	fi.AddMeta(fileRef, "file", 123)
-}
-
-func searchDescribeSetup(fi *test.FakeIndex) index.Interface {
-	addPermanode(fi, "abc-123",
-		"camliContent", "abc-123c",
-		"camliImageContent", "abc-888",
-	)
-	addPermanode(fi, "abc-123c",
-		"camliContent", "abc-123cc",
-		"camliImageContent", "abc-123c1",
-	)
-	addPermanode(fi, "abc-123c1",
-		"some", "image",
-	)
-	addPermanode(fi, "abc-123cc",
-		"name", "leaf",
-	)
-	addPermanode(fi, "abc-888",
-		"camliContent", "abc-8881",
-	)
-	addPermanode(fi, "abc-8881",
-		"name", "leaf8881",
-	)
-
-	addPermanode(fi, "fourcheckin-0",
-		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-	)
-	addPermanode(fi, "fourvenue-123",
-		"camliNodeType", "foursquare.com:venue",
-		"camliPath:photos", "venuepicset-123",
-		"latitude", "12",
-		"longitude", "34",
-	)
-	addPermanode(fi, "venuepicset-123",
-		"camliPath:1.jpg", "venuepic-1",
-	)
-	addPermanode(fi, "venuepic-1",
-		"camliContent", "somevenuepic-0",
-	)
-	addPermanode(fi, "somevenuepic-0",
-		"foo", "bar",
-	)
-	addPermanode(fi, "venuepic-2",
-		"camliContent", "somevenuepic-2",
-	)
-	addPermanode(fi, "somevenuepic-2",
-		"foo", "baz",
-	)
-
-	addPermanode(fi, "homedir-0",
-		"camliPath:subdir.1", "homedir-1",
-	)
-	addPermanode(fi, "homedir-1",
-		"camliPath:subdir.2", "homedir-2",
-	)
-	addPermanode(fi, "homedir-2",
-		"foo", "bar",
-	)
-
-	addPermanode(fi, "set-0",
-		"camliMember", "venuepic-1",
-		"camliMember", "venuepic-2",
-	)
-
-	addFileWithLocation(fi, "filewithloc-0", 45, 56)
-	addPermanode(fi, "location-0",
-		"camliContent", "filewithloc-0",
-	)
-
-	addPermanode(fi, "locationpriority-1",
-		"latitude", "67",
-		"longitude", "78",
-		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-		"camliContent", "filewithloc-0",
-	)
-
-	addPermanode(fi, "locationpriority-2",
-		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-		"camliContent", "filewithloc-0",
-	)
-
-	addPermanode(fi, "locationoverride-1",
-		"latitude", "67",
-		"longitude", "78",
-		"camliContent", "filewithloc-0",
-	)
-
-	addPermanode(fi, "locationoverride-2",
-		"latitude", "67",
-		"longitude", "78",
-		"camliNodeType", "foursquare.com:checkin",
-		"foursquareVenuePermanode", "fourvenue-123",
-	)
-
-	return fi
+func dbRefStr(name string) string {
+	ref, ok := describedBlobs[name]
+	if !ok {
+		panic(name + " not found")
+	}
+	return ref.String()
 }
 
 var searchDescribeTests = []handlerTest{
@@ -154,30 +235,32 @@ var searchDescribeTests = []handlerTest{
 	},
 
 	{
-		name: "single",
+		name:  "single",
+		setup: searchDescribeSetup,
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("abc-123"),
+			BlobRef: describedBlobs["abc-123"],
 		}),
-		wantDescribed: []string{"abc-123"},
+		wantDescribed: []string{dbRefStr("abc-123")},
 	},
 
 	{
-		name: "follow all camliContent",
+		name:  "follow all camliContent",
+		setup: searchDescribeSetup,
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("abc-123"),
+			BlobRef: describedBlobs["abc-123"],
 			Rules: []*search.DescribeRule{
 				{
 					Attrs: []string{"camliContent"},
 				},
 			},
 		}),
-		wantDescribed: []string{"abc-123", "abc-123c", "abc-123cc"},
+		wantDescribed: []string{dbRefStr("abc-123"), dbRefStr("abc-123c"), dbRefStr("abc-123cc")},
 	},
 
 	{
 		name: "follow only root camliContent",
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("abc-123"),
+			BlobRef: describedBlobs["abc-123"],
 			Rules: []*search.DescribeRule{
 				{
 					IfResultRoot: true,
@@ -185,13 +268,13 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"abc-123", "abc-123c"},
+		wantDescribed: []string{dbRefStr("abc-123"), dbRefStr("abc-123c")},
 	},
 
 	{
 		name: "follow all root, substring",
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("abc-123"),
+			BlobRef: describedBlobs["abc-123"],
 			Rules: []*search.DescribeRule{
 				{
 					IfResultRoot: true,
@@ -199,13 +282,13 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"abc-123", "abc-123c", "abc-888"},
+		wantDescribed: []string{dbRefStr("abc-123"), dbRefStr("abc-123c"), dbRefStr("abc-888")},
 	},
 
 	{
 		name: "two rules, two attrs",
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("abc-123"),
+			BlobRef: describedBlobs["abc-123"],
 			Rules: []*search.DescribeRule{
 				{
 					IfResultRoot: true,
@@ -216,15 +299,15 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"abc-123", "abc-123c", "abc-123cc", "abc-888", "abc-8881"},
+		wantDescribed: []string{dbRefStr("abc-123"), dbRefStr("abc-123c"), dbRefStr("abc-123cc"), dbRefStr("abc-888"), dbRefStr("abc-8881")},
 	},
 
 	{
 		name: "foursquare venue photos, but not recursive camliPath explosion",
 		postBody: marshalJSON(&search.DescribeRequest{
 			BlobRefs: []blob.Ref{
-				blob.MustParse("homedir-0"),
-				blob.MustParse("fourcheckin-0"),
+				describedBlobs["homedir-0"],
+				describedBlobs["fourcheckin-0"],
 			},
 			Rules: []*search.DescribeRule{
 				{
@@ -245,14 +328,14 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"homedir-0", "fourcheckin-0", "fourvenue-123", "venuepicset-123", "venuepic-1", "somevenuepic-0"},
+		wantDescribed: []string{dbRefStr("homedir-0"), dbRefStr("fourcheckin-0"), dbRefStr("fourvenue-123"), dbRefStr("venuepicset-123"), dbRefStr("venuepic-1"), dbRefStr("somevenuepic-0")},
 	},
 
 	{
 		name: "home dirs forever",
 		postBody: marshalJSON(&search.DescribeRequest{
 			BlobRefs: []blob.Ref{
-				blob.MustParse("homedir-0"),
+				describedBlobs["homedir-0"],
 			},
 			Rules: []*search.DescribeRule{
 				{
@@ -260,13 +343,13 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"homedir-0", "homedir-1", "homedir-2"},
+		wantDescribed: []string{dbRefStr("homedir-0"), dbRefStr("homedir-1"), dbRefStr("homedir-2")},
 	},
 
 	{
 		name: "find members",
 		postBody: marshalJSON(&search.DescribeRequest{
-			BlobRef: blob.MustParse("set-0"),
+			BlobRef: describedBlobs["set-0"],
 			Rules: []*search.DescribeRule{
 				{
 					IfResultRoot: true,
@@ -277,7 +360,7 @@ var searchDescribeTests = []handlerTest{
 				},
 			},
 		}),
-		wantDescribed: []string{"set-0", "venuepic-1", "venuepic-2", "somevenuepic-0", "somevenuepic-2"},
+		wantDescribed: []string{dbRefStr("set-0"), dbRefStr("venuepic-1"), dbRefStr("venuepic-2"), dbRefStr("somevenuepic-0"), dbRefStr("somevenuepic-2")},
 	},
 }
 
@@ -309,7 +392,7 @@ func TestDescribeRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error slurping index to memory: %v", err)
 	}
-	h := search.NewHandler(idx, idxd.SignerBlobRef)
+	h := search.NewHandler(idx, owner)
 	h.SetCorpus(corpus)
 	donec := make(chan struct{})
 	headstart := 500
@@ -356,20 +439,21 @@ func TestDescribeRace(t *testing.T) {
 
 func TestDescribeLocation(t *testing.T) {
 	tests := []struct {
-		ref       string
+		ref       blob.Ref
 		lat, long float64
 		hasNoLoc  bool
 	}{
-		{ref: "filewithloc-0", lat: 45, long: 56},
-		{ref: "location-0", lat: 45, long: 56},
-		{ref: "locationpriority-1", lat: 67, long: 78},
-		{ref: "locationpriority-2", lat: 12, long: 34},
-		{ref: "locationoverride-1", lat: 67, long: 78},
-		{ref: "locationoverride-2", lat: 67, long: 78},
-		{ref: "homedir-0", hasNoLoc: true},
+		{ref: describedBlobs["filewithloc-0"], lat: 42.45, long: 18.76},
+		{ref: describedBlobs["location-0"], lat: 42.45, long: 18.76},
+		{ref: describedBlobs["locationpriority-1"], lat: 67, long: 78},
+		{ref: describedBlobs["locationpriority-2"], lat: 12, long: 34},
+		{ref: describedBlobs["locationoverride-1"], lat: 67, long: 78},
+		{ref: describedBlobs["locationoverride-2"], lat: 67, long: 78},
+		{ref: describedBlobs["homedir-0"], hasNoLoc: true},
 	}
 
-	ix := searchDescribeSetup(test.NewFakeIndex())
+	ixo := searchDescribeSetup(t)
+	ix := ixo.index
 	ctx := context.Background()
 	h := search.NewHandler(ix, owner)
 
@@ -378,7 +462,7 @@ func TestDescribeLocation(t *testing.T) {
 
 	for _, tt := range tests {
 		var err error
-		br := blob.MustParse(tt.ref)
+		br := tt.ref
 		res, err := h.Describe(ctx, &search.DescribeRequest{
 			BlobRef: br,
 			Depth:   1,
@@ -437,5 +521,36 @@ func TestDescribePermNoAttr(t *testing.T) {
 	db := res.Meta[br.String()]
 	if db == nil {
 		t.Fatalf("Describe result for %v is missing", br)
+	}
+}
+
+// To make sure we don't regress into https://github.com/perkeep/perkeep/issues/1152
+func TestDescribeEmptyDir(t *testing.T) {
+	ix := index.NewMemoryIndex()
+	ctx := context.Background()
+	h := search.NewHandler(ix, owner)
+	corpus, err := ix.KeepInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetCorpus(corpus)
+	id := indextest.NewIndexDeps(ix)
+
+	dir := id.UploadDir("empty", nil, time.Now().UTC())
+	pn := id.NewPlannedPermanode("empty_dir")
+	id.SetAttribute(pn, "camliContent", dir.String())
+
+	ix.RLock()
+	defer ix.RUnlock()
+
+	if _, err := h.Describe(ctx, &search.DescribeRequest{
+		BlobRef: pn,
+		Rules: []*search.DescribeRule{
+			{
+				Attrs: []string{"camliContent"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Describe for %v failed: %v", pn, err)
 	}
 }

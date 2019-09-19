@@ -1,5 +1,5 @@
 /*
-Copyright 2012 The Camlistore Authors.
+Copyright 2012 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package sqlite provides an implementation of sorted.KeyValue
 // using an SQLite database file.
-package sqlite // import "camlistore.org/pkg/sorted/sqlite"
+package sqlite // import "perkeep.org/pkg/sorted/sqlite"
 
 import (
 	"database/sql"
@@ -24,11 +24,11 @@ import (
 	"fmt"
 	"os"
 
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/sqlkv"
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/sqlkv"
 )
 
 func init() {
@@ -53,7 +53,7 @@ func newKeyValueFromConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 
 	fi, err := os.Stat(file)
 	if os.IsNotExist(err) || (err == nil && fi.Size() == 0) {
-		if err := initDB(file); err != nil {
+		if err := InitDB(file); err != nil {
 			return nil, fmt.Errorf("could not initialize sqlite DB at %s: %v", file, err)
 		}
 	}
@@ -108,7 +108,7 @@ func CompiledIn() bool {
 	return compiled
 }
 
-var ErrNotCompiled = errors.New("camlistored was not built with SQLite support. If you built with make.go, use go run make.go --sqlite=true. If you used go get or get install, use go {get,install} --tags=with_sqlite" + compileHint())
+var ErrNotCompiled = errors.New("perkeepd was not built with SQLite support. If you built with make.go, use go run make.go --sqlite=true. If you used go get or get install, use go {get,install} --tags=with_sqlite" + compileHint())
 
 func compileHint() string {
 	if _, err := os.Stat("/etc/apt"); err == nil {

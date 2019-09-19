@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore Authors
+Copyright 2015 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ import (
 
 	"go4.org/cloud/google/gceutil"
 
+	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
@@ -194,10 +195,13 @@ func (c *Config) MaybeDeploy() {
 }
 
 func (c *Config) restartLoop() {
+	if !metadata.OnGCE() {
+		return
+	}
 	if c.RestartPolicy == RestartNever {
 		return
 	}
-	url := "https://storage.googleapis.com/" + c.BinaryBucket + "/" + c.binaryObject()
+	url := c.binaryURL()
 	var lastEtag string
 	for {
 		res, err := http.Head(url + "?" + fmt.Sprint(time.Now().Unix()))

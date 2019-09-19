@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 // The publisher command is a server application to publish items from a
-// Camlistore server. See also https://camlistore.org/doc/publishing
+// Perkeep server. See also https://camlistore.org/doc/publishing
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -41,29 +42,28 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/app"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/localdisk"
-	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/cacher"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/fileembed"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/netutil"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/publish"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/server"
-	"camlistore.org/pkg/sorted"
-	_ "camlistore.org/pkg/sorted/kvfile"
-	"camlistore.org/pkg/types/camtypes"
-	"camlistore.org/pkg/webserver"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/magic"
+	"perkeep.org/internal/netutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/app"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/localdisk"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/cacher"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/fileembed"
+	"perkeep.org/pkg/publish"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/server"
+	"perkeep.org/pkg/sorted"
+	_ "perkeep.org/pkg/sorted/kvfile"
+	"perkeep.org/pkg/types/camtypes"
+	"perkeep.org/pkg/webserver"
 
 	"go4.org/syncutil"
 	"golang.org/x/crypto/acme/autocert"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -76,11 +76,11 @@ var (
 )
 
 // config is used to unmarshal the application configuration JSON
-// that we get from Camlistore when we request it at $CAMLI_APP_CONFIG_URL.
+// that we get from Perkeep when we request it at $CAMLI_APP_CONFIG_URL.
 type config struct {
 	HTTPSCert      string `json:"httpsCert,omitempty"`      // Path to the HTTPS certificate file.
 	HTTPSKey       string `json:"httpsKey,omitempty"`       // Path to the HTTPS key file.
-	CertManager    bool   `json:"certManager,omitempty"`    // Use Camlistore's Let's Encrypt cache to get a certificate.
+	CertManager    bool   `json:"certManager,omitempty"`    // Use Perkeep's Let's Encrypt cache to get a certificate.
 	RootName       string `json:"camliRoot"`                // Publish root name (i.e. value of the camliRoot attribute on the root permanode).
 	MaxResizeBytes int64  `json:"maxResizeBytes,omitempty"` // See constants.DefaultMaxResizeMem
 	SourceRoot     string `json:"sourceRoot,omitempty"`     // Path to the app's resources dir, such as html and css files.
@@ -103,7 +103,7 @@ func appConfig() (*config, error) {
 	pause := time.Second
 	giveupTime := time.Now().Add(time.Hour)
 	for {
-		err := cl.GetJSON(configURL, conf)
+		err := cl.GetJSON(context.TODO(), configURL, conf)
 		if err == nil {
 			break
 		}
@@ -218,15 +218,15 @@ func setupTLS(ws *webserver.Server, conf *config) error {
 		return nil
 	}
 
-	// As all requests to the publisher are proxied through Camlistore's app
-	// handler, it makes sense to assume that both Camlistore and the publisher
+	// As all requests to the publisher are proxied through Perkeep's app
+	// handler, it makes sense to assume that both Perkeep and the publisher
 	// are behind the same domain name. Therefore, it follows that
-	// camlistored's autocert is the one actually getting a cert (and answering
+	// perkeepd's autocert is the one actually getting a cert (and answering
 	// the challenge) for the both of them. Plus, if they run on the same host
 	// (default setup), they can't both listen on 443 to answer the TLS-SNI
 	// challenge.
-	// TODO(mpl): however, camlistored and publisher could be running on
-	// different hosts, in which case we need to find a way for camlistored to
+	// TODO(mpl): however, perkeepd and publisher could be running on
+	// different hosts, in which case we need to find a way for perkeepd to
 	// share its autocert cache with publisher. But I think that can wait a
 	// later CL.
 	hostname := os.Getenv("CAMLI_API_HOST")
@@ -239,7 +239,7 @@ func setupTLS(ws *webserver.Server, conf *config) error {
 	logger.Print("TLS enabled, with Let's Encrypt")
 
 	// TODO(mpl): we only want publisher to use the same cache as
-	// camlistored, and we don't actually need an autocert.Manager.
+	// perkeepd, and we don't actually need an autocert.Manager.
 	// So we could just instantiate an autocert.DirCache, and generate
 	// from there a *tls.Certificate, but it looks like it would mean
 	// extracting quite a bit of code from the autocert pkg to do it properly.
@@ -270,11 +270,11 @@ func main() {
 
 	if *flagVersion {
 		fmt.Fprintf(os.Stderr, "publisher version: %s\nGo version: %s (%s/%s)\n",
-			buildinfo.Version(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			buildinfo.Summary(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return
 	}
 
-	logf("Starting publisher version %s; Go %s (%s/%s)", buildinfo.Version(), runtime.Version(),
+	logf("Starting publisher version %s; Go %s (%s/%s)", buildinfo.Summary(), runtime.Version(),
 		runtime.GOOS, runtime.GOARCH)
 
 	listenAddr, err := app.ListenAddress()
@@ -301,7 +301,7 @@ func main() {
 	ws := webserver.New()
 	ws.Logger = logger
 	if err := setupTLS(ws, conf); err != nil {
-		logger.Fatal("could not setup TLS: %v", err)
+		logger.Fatalf("could not setup TLS: %v", err)
 	}
 	ws.Handle("/", ph)
 	if err := ws.Listen(listenAddr); err != nil {
@@ -436,8 +436,8 @@ func goTemplate(files *fileembed.Files, templateFile string) (*template.Template
 // a *client.Client, so we can use a fake client in tests.
 type client interface {
 	search.QueryDescriber
-	GetJSON(url string, data interface{}) error
-	Post(url string, bodyType string, body io.Reader) error
+	GetJSON(ctx context.Context, url string, data interface{}) error
+	Post(ctx context.Context, url string, bodyType string, body io.Reader) error
 	blob.Fetcher
 }
 
@@ -520,7 +520,7 @@ func (ph *publishHandler) initRootNode() error {
 func (ph *publishHandler) camliRootQuery() (*search.SearchResult, error) {
 	// TODO(mpl): I've voluntarily omitted the owner because it's not clear to
 	// me that we actually care about that. Same for signer in lookupPathTarget.
-	return ph.cl.Query(&search.SearchQuery{
+	return ph.cl.Query(context.TODO(), &search.SearchQuery{
 		Limit: 1,
 		Constraint: &search.Constraint{
 			Permanode: &search.PermanodeConstraint{
@@ -535,8 +535,8 @@ func (ph *publishHandler) lookupPathTarget(root blob.Ref, suffix string) (blob.R
 	if suffix == "" {
 		return root, nil
 	}
-	// TODO: verify it's optimized: http://camlistore.org/issue/405
-	result, err := ph.cl.Query(&search.SearchQuery{
+	// TODO: verify it's optimized: http://perkeep.org/issue/405
+	result, err := ph.cl.Query(context.TODO(), &search.SearchQuery{
 		Limit: 1,
 		Constraint: &search.Constraint{
 			Permanode: &search.PermanodeConstraint{
@@ -624,7 +624,7 @@ func (ph *publishHandler) describe(br blob.Ref) (*search.DescribedBlob, error) {
 }
 
 func (ph *publishHandler) deepDescribe(br blob.Ref) (*search.DescribeResponse, error) {
-	res, err := ph.cl.Query(&search.SearchQuery{
+	res, err := ph.cl.Query(context.TODO(), &search.SearchQuery{
 		Constraint: &search.Constraint{
 			BlobRefPrefix: br.String(),
 			CamliType:     "permanode",
@@ -1166,7 +1166,7 @@ func (pr *publishRequest) subjectMembers(resMap map[string]*search.DescribedBlob
 }
 
 func (ph *publishHandler) describeMembers(br blob.Ref) (*search.SearchResult, error) {
-	res, err := ph.cl.Query(&search.SearchQuery{
+	res, err := ph.cl.Query(context.TODO(), &search.SearchQuery{
 		Constraint: &search.Constraint{
 			Permanode: &search.PermanodeConstraint{
 				Relation: &search.RelationConstraint{

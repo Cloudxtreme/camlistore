@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ package handlers
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,12 +28,12 @@ import (
 	"path"
 	"strings"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/protocol"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/jsonsign/signhandler"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/protocol"
+	"perkeep.org/pkg/jsonsign/signhandler"
+	"perkeep.org/pkg/schema"
 
 	"go4.org/readerutil"
 )
@@ -51,6 +51,7 @@ func CreateBatchUploadHandler(storage blobserver.BlobReceiveConfiger) http.Handl
 // doc/protocol/blob-upload-protocol.txt.
 func CreatePutUploadHandler(storage blobserver.BlobReceiver) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
 		if req.Method != "PUT" {
 			log.Printf("Inconfigured upload handler.")
 			httputil.BadRequestError(rw, "Inconfigured handler.")
@@ -73,7 +74,7 @@ func CreatePutUploadHandler(storage blobserver.BlobReceiver) http.Handler {
 			httputil.BadRequestError(rw, "unsupported object hash function")
 			return
 		}
-		_, err := blobserver.Receive(storage, br, req.Body)
+		_, err := blobserver.Receive(ctx, storage, br, req.Body)
 		if err == blobserver.ErrCorruptBlob {
 			httputil.BadRequestError(rw, "data doesn't match declared digest")
 			return
@@ -89,18 +90,18 @@ func CreatePutUploadHandler(storage blobserver.BlobReceiver) http.Handler {
 // vivify verifies that all the chunks for the file described by fileblob are on the blobserver.
 // It makes a planned permanode, signs it, and uploads it. It finally makes a camliContent claim
 // on that permanode for fileblob, signs it, and uploads it to the blobserver.
-func vivify(blobReceiver blobserver.BlobReceiveConfiger, fileblob blob.SizedRef) error {
+func vivify(ctx context.Context, blobReceiver blobserver.BlobReceiveConfiger, fileblob blob.SizedRef) error {
 	sf, ok := blobReceiver.(blob.Fetcher)
 	if !ok {
 		return fmt.Errorf("BlobReceiver is not a Fetcher")
 	}
-	fr, err := schema.NewFileReader(sf, fileblob.Ref)
+	fr, err := schema.NewFileReader(ctx, sf, fileblob.Ref)
 	if err != nil {
 		return fmt.Errorf("Filereader error for blobref %v: %v", fileblob.Ref.String(), err)
 	}
 	defer fr.Close()
 
-	h := sha1.New()
+	h := blob.NewHash()
 	n, err := io.Copy(h, fr)
 	if err != nil {
 		return fmt.Errorf("Could not read all file of blobref %v: %v", fileblob.Ref.String(), err)
@@ -142,12 +143,12 @@ func vivify(blobReceiver blobserver.BlobReceiveConfiger, fileblob blob.SizedRef)
 	permanodeBB := schema.NewHashPlannedPermanode(h)
 	permanodeBB.SetSigner(publicKeyBlobRef)
 	permanodeBB.SetClaimDate(claimDate)
-	permanodeSigned, err := sigHelper.Sign(permanodeBB)
+	permanodeSigned, err := sigHelper.Sign(ctx, permanodeBB)
 	if err != nil {
 		return fmt.Errorf("signing permanode %v: %v", permanodeSigned, err)
 	}
-	permanodeRef := blob.SHA1FromString(permanodeSigned)
-	_, err = blobserver.ReceiveNoHash(blobReceiver, permanodeRef, strings.NewReader(permanodeSigned))
+	permanodeRef := blob.RefFromString(permanodeSigned)
+	_, err = blobserver.ReceiveNoHash(ctx, blobReceiver, permanodeRef, strings.NewReader(permanodeSigned))
 	if err != nil {
 		return fmt.Errorf("while uploading signed permanode %v, %v: %v", permanodeRef, permanodeSigned, err)
 	}
@@ -155,12 +156,12 @@ func vivify(blobReceiver blobserver.BlobReceiveConfiger, fileblob blob.SizedRef)
 	contentClaimBB := schema.NewSetAttributeClaim(permanodeRef, "camliContent", fileblob.Ref.String())
 	contentClaimBB.SetSigner(publicKeyBlobRef)
 	contentClaimBB.SetClaimDate(claimDate)
-	contentClaimSigned, err := sigHelper.Sign(contentClaimBB)
+	contentClaimSigned, err := sigHelper.Sign(ctx, contentClaimBB)
 	if err != nil {
 		return fmt.Errorf("signing camliContent claim: %v", err)
 	}
-	contentClaimRef := blob.SHA1FromString(contentClaimSigned)
-	_, err = blobserver.ReceiveNoHash(blobReceiver, contentClaimRef, strings.NewReader(contentClaimSigned))
+	contentClaimRef := blob.RefFromString(contentClaimSigned)
+	_, err = blobserver.ReceiveNoHash(ctx, blobReceiver, contentClaimRef, strings.NewReader(contentClaimSigned))
 	if err != nil {
 		return fmt.Errorf("while uploading signed camliContent claim %v, %v: %v", contentClaimRef, contentClaimSigned, err)
 	}
@@ -168,6 +169,7 @@ func vivify(blobReceiver blobserver.BlobReceiveConfiger, fileblob blob.SizedRef)
 }
 
 func handleMultiPartUpload(rw http.ResponseWriter, req *http.Request, blobReceiver blobserver.BlobReceiveConfiger) {
+	ctx := req.Context()
 	res := new(protocol.UploadResponse)
 
 	if !(req.Method == "POST" && strings.Contains(req.URL.Path, "/camli/upload")) {
@@ -224,7 +226,7 @@ func handleMultiPartUpload(rw http.ResponseWriter, req *http.Request, blobReceiv
 
 		var tooBig int64 = blobserver.MaxBlobSize + 1
 		var readBytes int64
-		blobGot, err := blobserver.Receive(blobReceiver, ref, &readerutil.CountingReader{
+		blobGot, err := blobserver.Receive(ctx, blobReceiver, ref, &readerutil.CountingReader{
 			io.LimitReader(mimePart, tooBig),
 			&readBytes,
 		})
@@ -249,7 +251,7 @@ func handleMultiPartUpload(rw http.ResponseWriter, req *http.Request, blobReceiv
 		// Or I suppose we could document that a file schema blob that
 		// wants to be vivified should always be sent alone.
 		for _, got := range receivedBlobs {
-			err := vivify(blobReceiver, got)
+			err := vivify(ctx, blobReceiver, got)
 			if err != nil {
 				addError(fmt.Sprintf("Error vivifying blob %v: %v\n", got.Ref.String(), err))
 			} else {

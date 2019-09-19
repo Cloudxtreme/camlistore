@@ -1,7 +1,7 @@
 // +build !js
 
 /*
-Copyright 2017 The Camlistore Authors
+Copyright 2017 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ import (
 // generated javascript breaks as soon as we import things such as
 // "cloud.google.com/go/compute/metadata", which is why this whole file exists
 // under this build tag.
-// Keeping https://github.com/camlistore/camlistore/issues/904 open until this
+// Keeping https://github.com/perkeep/perkeep/issues/904 open until this
 // is reported.
 
 // OnGCE reports whether this process is running in a Google Compute

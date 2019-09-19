@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,12 +28,11 @@ import (
 	"strconv"
 	"strings"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/types/serverconfig"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/types/serverconfig"
 
 	"go4.org/wkfs"
 )
@@ -44,7 +43,7 @@ var (
 )
 
 type tlsOpts struct {
-	autoCert  bool // use Camlistore's Let's Encrypt cache. but httpsCert takes precedence, if set.
+	autoCert  bool // use Perkeep's Let's Encrypt cache. but httpsCert takes precedence, if set.
 	httpsCert string
 	httpsKey  string
 }
@@ -89,25 +88,87 @@ func (b *lowBuilder) hasPrefix(p string) bool {
 func (b *lowBuilder) runIndex() bool          { return b.high.RunIndex.Get() }
 func (b *lowBuilder) copyIndexToMemory() bool { return b.high.CopyIndexToMemory.Get() }
 
-// dbName returns which database to use for the provided user ("of").
-// The user should be a key as described in pkg/types/serverconfig/config.go's
-// description of DBNames: "index", "queue-sync-to-index", etc.
-func (b *lowBuilder) dbName(of string) string {
-	if v, ok := b.high.DBNames[of]; ok && v != "" {
-		return v
+type dbname string
+
+// possible arguments to dbName
+const (
+	dbIndex           dbname = "index"
+	dbBlobpackedIndex dbname = "blobpacked-index"
+	dbDiskpackedIndex dbname = "diskpacked-index"
+	dbUIThumbcache    dbname = "ui-thumbcache"
+	dbSyncQueue       dbname = "queue-sync-to-" // only a prefix. the last part is the sync destination, e.g. "index".
+)
+
+// dbUnique returns the uniqueness string that is used in databases names to
+// differentiate them from databases used by other Perkeep instances on the same
+// DBMS.
+func (b *lowBuilder) dbUnique() string {
+	if b.high.DBUnique != "" {
+		return b.high.DBUnique
 	}
-	if of == "index" {
+	if b.high.Identity != "" {
+		return strings.ToLower(b.high.Identity)
+	}
+	return osutil.Username() // may be empty, if $USER unset
+}
+
+// dbName returns which database to use for the provided user ("of"), which can
+// only be one of the const defined above. Returned values all follow the same name
+// scheme for consistency:
+// -prefixed with "pk_", so as to distinguish them from databases for other programs
+// -followed by a username-based uniqueness string
+// -last part says which component/part of perkeep it is about
+func (b *lowBuilder) dbName(of dbname) string {
+	unique := b.dbUnique()
+	if unique == "" {
+		log.Printf("Could not define uniqueness for database of %q. Do not use the same index DBMS with other Perkeep instances.", of)
+	}
+	if unique == useDBNamesConfig {
+		// this is the hint that we should revert to the old style DBNames, so this
+		// instance can reuse its existing databases
+		return b.oldDBNames(of)
+	}
+	prefix := "pk_"
+	if unique != "" {
+		prefix += unique + "_"
+	}
+	switch of {
+	case dbIndex:
 		if b.high.DBName != "" {
 			return b.high.DBName
 		}
-		username := osutil.Username()
-		if username == "" {
-			return "camlistore_index"
-		}
-		return "camli" + username
+		return prefix + "index"
+	case dbBlobpackedIndex:
+		return prefix + "blobpacked"
+	case dbDiskpackedIndex:
+		return prefix + "diskpacked"
+	case dbUIThumbcache:
+		return prefix + "uithumbmeta"
 	}
-	if of == "blobpacked_index" {
-		return of
+	asString := string(of)
+	if strings.HasPrefix(asString, string(dbSyncQueue)) {
+		return prefix + "syncto_" + strings.TrimPrefix(asString, string(dbSyncQueue))
+	}
+	return ""
+}
+
+// As of rev 7eda9fd5027fda88166d6c03b6490cffbf2de5fb, we changed how the
+// databases names were defined. But we wanted the existing GCE instances to keep
+// on working with the old names, so that nothing would break for existing users,
+// without any intervention needed. Through the help of the perkeep-config-version
+// variable, set by the GCE launcher, we can know whether an instance is such an
+// "old" one, and in that case we keep on using the old database names. oldDBNames
+// returns these names.
+func (b *lowBuilder) oldDBNames(of dbname) string {
+	switch of {
+	case dbIndex:
+		return "camlistore_index"
+	case dbBlobpackedIndex:
+		return "blobpacked_index"
+	case "queue-sync-to-index":
+		return "sync_index_queue"
+	case dbUIThumbcache:
+		return "ui_thumbmeta_cache"
 	}
 	return ""
 }
@@ -115,19 +176,42 @@ func (b *lowBuilder) dbName(of string) string {
 var errNoOwner = errors.New("no owner")
 
 // Error is errNoOwner if no identity configured
-func (b *lowBuilder) searchOwner() (br blob.Ref, err error) {
+func (b *lowBuilder) searchOwner() (owner *serverconfig.Owner, err error) {
 	if b.high.Identity == "" {
-		return br, errNoOwner
+		return nil, errNoOwner
 	}
-	entity, err := jsonsign.EntityFromSecring(b.high.Identity, b.high.IdentitySecretRing)
+	if b.high.IdentitySecretRing == "" {
+		return nil, errNoOwner
+	}
+	return &serverconfig.Owner{
+		Identity:    b.high.Identity,
+		SecringFile: b.high.IdentitySecretRing,
+	}, nil
+}
+
+// longIdentity returns the long form (16 chars) of the GPG key ID, in case the
+// user provided the short form (8 chars) in the config.
+func (b *lowBuilder) longIdentity() (string, error) {
+	if b.high.Identity == "" {
+		return "", errNoOwner
+	}
+	if strings.ToUpper(b.high.Identity) != b.high.Identity {
+		return "", fmt.Errorf("identity %q is not all upper-case", b.high.Identity)
+	}
+	if len(b.high.Identity) == 16 {
+		return b.high.Identity, nil
+	}
+	if b.high.IdentitySecretRing == "" {
+		return "", errNoOwner
+	}
+	keyID, err := jsonsign.KeyIdFromRing(b.high.IdentitySecretRing)
 	if err != nil {
-		return br, err
+		return "", fmt.Errorf("could not find any keyID in file %q: %v", b.high.IdentitySecretRing, err)
 	}
-	armoredPublicKey, err := jsonsign.ArmoredPublicKey(entity)
-	if err != nil {
-		return br, err
+	if !strings.HasSuffix(keyID, b.high.Identity) {
+		return "", fmt.Errorf("%q identity not found in secret ring %v", b.high.Identity, b.high.IdentitySecretRing)
 	}
-	return blob.SHA1FromString(armoredPublicKey), nil
+	return keyID, nil
 }
 
 func addAppConfig(config map[string]interface{}, appConfig *serverconfig.App, low jsonconfig.Obj) {
@@ -156,10 +240,10 @@ func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 			v.App = &serverconfig.App{}
 		}
 		if v.CamliRoot == "" {
-			return fmt.Errorf("Missing \"camliRoot\" key in configuration for %s.", k)
+			return fmt.Errorf("missing \"camliRoot\" key in configuration for %s", k)
 		}
 		if v.GoTemplate == "" {
-			return fmt.Errorf("Missing \"goTemplate\" key in configuration for %s.", k)
+			return fmt.Errorf("missing \"goTemplate\" key in configuration for %s", k)
 		}
 		appConfig := map[string]interface{}{
 			"camliRoot":  v.CamliRoot,
@@ -174,7 +258,7 @@ func (b *lowBuilder) addPublishedConfig(tlsO *tlsOpts) error {
 			appConfig["httpsCert"] = v.HTTPSCert
 			appConfig["httpsKey"] = v.HTTPSKey
 		} else {
-			// default to Camlistore parameters, if any
+			// default to Perkeep parameters, if any
 			if tlsO != nil {
 				if tlsO.autoCert {
 					appConfig["certManager"] = tlsO.autoCert
@@ -211,7 +295,7 @@ func (b *lowBuilder) addScanCabConfig(tlsO *tlsOpts) error {
 		scancab.App = &serverconfig.App{}
 	}
 	if scancab.Prefix == "" {
-		return errors.New("Missing \"prefix\" key in configuration for scanning cabinet.")
+		return errors.New("missing \"prefix\" key in configuration for scanning cabinet")
 	}
 
 	program := "scanningcabinet"
@@ -230,7 +314,7 @@ func (b *lowBuilder) addScanCabConfig(tlsO *tlsOpts) error {
 		appConfig["httpsCert"] = scancab.HTTPSCert
 		appConfig["httpsKey"] = scancab.HTTPSKey
 	} else {
-		// default to Camlistore parameters, if any
+		// default to Perkeep parameters, if any
 		if tlsO != nil {
 			appConfig["httpsCert"] = tlsO.httpsCert
 			appConfig["httpsKey"] = tlsO.httpsKey
@@ -296,7 +380,7 @@ func (b *lowBuilder) addUIConfig() {
 		}
 	}
 	if thumbCache == nil {
-		sorted, err := b.sortedStorage("ui_thumbcache")
+		sorted, err := b.sortedStorage(dbUIThumbcache)
 		if err == nil {
 			thumbCache = sorted
 		}
@@ -307,7 +391,7 @@ func (b *lowBuilder) addUIConfig() {
 	b.addPrefix("/ui/", "ui", args)
 }
 
-func (b *lowBuilder) mongoIndexStorage(confStr, sortedType string) (map[string]interface{}, error) {
+func (b *lowBuilder) mongoIndexStorage(confStr string, sortedType dbname) (map[string]interface{}, error) {
 	dbName := b.dbName(sortedType)
 	if dbName == "" {
 		return nil, fmt.Errorf("no database name configured for sorted store %q", sortedType)
@@ -356,7 +440,7 @@ func parseUserHostPass(v string) (user, host, password string, ok bool) {
 	return
 }
 
-func (b *lowBuilder) dbIndexStorage(rdbms string, confStr string, sortedType string) (map[string]interface{}, error) {
+func (b *lowBuilder) dbIndexStorage(rdbms, confStr string, sortedType dbname) (map[string]interface{}, error) {
 	dbName := b.dbName(sortedType)
 	if dbName == "" {
 		return nil, fmt.Errorf("no database name configured for sorted store %q", sortedType)
@@ -370,27 +454,40 @@ func (b *lowBuilder) dbIndexStorage(rdbms string, confStr string, sortedType str
 		"host":     host,
 		"user":     user,
 		"password": password,
-		"database": b.dbName(sortedType),
+		"database": dbName,
 	}, nil
 }
 
-func (b *lowBuilder) sortedStorage(sortedType string) (map[string]interface{}, error) {
+func (b *lowBuilder) sortedStorage(sortedType dbname) (map[string]interface{}, error) {
 	return b.sortedStorageAt(sortedType, "")
+}
+
+// sortedDBMS returns the configuration for a name database on one of the
+// DBMS, if any was found in the configuration. It returns nil otherwise.
+func (b *lowBuilder) sortedDBMS(named dbname) (map[string]interface{}, error) {
+	if b.high.MySQL != "" {
+		return b.dbIndexStorage("mysql", b.high.MySQL, named)
+	}
+	if b.high.PostgreSQL != "" {
+		return b.dbIndexStorage("postgres", b.high.PostgreSQL, named)
+	}
+	if b.high.Mongo != "" {
+		return b.mongoIndexStorage(b.high.Mongo, named)
+	}
+	return nil, nil
 }
 
 // filePrefix gives a file path of where to put the database. It can be omitted by
 // some sorted implementations, but is required by others.
 // The filePrefix should be to a file, not a directory, and should not end in a ".ext" extension.
 // An extension like ".kv" or ".sqlite" will be added.
-func (b *lowBuilder) sortedStorageAt(sortedType, filePrefix string) (map[string]interface{}, error) {
-	if b.high.MySQL != "" {
-		return b.dbIndexStorage("mysql", b.high.MySQL, sortedType)
+func (b *lowBuilder) sortedStorageAt(sortedType dbname, filePrefix string) (map[string]interface{}, error) {
+	dbms, err := b.sortedDBMS(sortedType)
+	if err != nil {
+		return nil, err
 	}
-	if b.high.PostgreSQL != "" {
-		return b.dbIndexStorage("postgres", b.high.PostgreSQL, sortedType)
-	}
-	if b.high.Mongo != "" {
-		return b.mongoIndexStorage(b.high.Mongo, sortedType)
+	if dbms != nil {
+		return dbms, nil
 	}
 	if b.high.MemoryIndex {
 		return map[string]interface{}{
@@ -429,6 +526,7 @@ func (b *lowBuilder) sortedStorageAt(sortedType, filePrefix string) (map[string]
 }
 
 func (b *lowBuilder) thatQueueUnlessMemory(thatQueue map[string]interface{}) (queue map[string]interface{}) {
+	// TODO(mpl): what about if b.high.MemoryIndex ?
 	if b.high.MemoryStorage {
 		return map[string]interface{}{
 			"type": "memory",
@@ -476,7 +574,7 @@ func (b *lowBuilder) addS3Config(s3 string) error {
 	}
 
 	// TODO(mpl): s3CacheBucket
-	// See https://camlistore.org/issue/85
+	// See https://perkeep.org/issue/85
 	b.addPrefix("/cache/", "storage-filesystem", args{
 		"path": filepath.Join(tempDir(), "camli-cache"),
 	})
@@ -501,12 +599,10 @@ func (b *lowBuilder) addS3Config(s3 string) error {
 	b.addPrefix("/bs-loose/", "storage-s3", packedS3Args(path.Join(bucket, "loose")))
 	b.addPrefix("/bs-packed/", "storage-s3", packedS3Args(path.Join(bucket, "packed")))
 
-	// If index is DBMS, then blobPackedIndex is in DBMS too, with
-	// whatever dbname is defined for "blobpacked_index", or defaulting
-	// to "blobpacked_index". Otherwise blobPackedIndex is same
-	// file-based DB as the index, in same dir, but named
-	// packindex.dbtype.
-	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
+	// If index is DBMS, then blobPackedIndex is in DBMS too.
+	// Otherwise blobPackedIndex is same file-based DB as the index,
+	// in same dir, but named packindex.dbtype.
+	blobPackedIndex, err := b.sortedStorageAt(dbBlobpackedIndex, filepath.Join(b.indexFileDir(), "packindex"))
 	if err != nil {
 		return err
 	}
@@ -576,12 +672,10 @@ func (b *lowBuilder) addB2Config(b2 string) error {
 	b.addPrefix("/bs-loose/", "storage-b2", packedB2Args(path.Join(bucket, "loose")))
 	b.addPrefix("/bs-packed/", "storage-b2", packedB2Args(path.Join(bucket, "packed")))
 
-	// If index is DBMS, then blobPackedIndex is in DBMS too, with
-	// whatever dbname is defined for "blobpacked_index", or defaulting
-	// to "blobpacked_index". Otherwise blobPackedIndex is same
-	// file-based DB as the index, in same dir, but named
-	// packindex.dbtype.
-	blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
+	// If index is DBMS, then blobPackedIndex is in DBMS too.
+	// Otherwise blobPackedIndex is same file-based DB as the index,
+	// in same dir, but named packindex.dbtype.
+	blobPackedIndex, err := b.sortedStorageAt(dbBlobpackedIndex, filepath.Join(b.indexFileDir(), "packindex"))
 	if err != nil {
 		return err
 	}
@@ -702,12 +796,10 @@ func (b *lowBuilder) addGoogleCloudStorageConfig(v string) error {
 				"refresh_token": refreshToken,
 			},
 		})
-		// If index is DBMS, then blobPackedIndex is in DBMS too, with
-		// whatever dbname is defined for "blobpacked_index", or defaulting
-		// to "blobpacked_index". Otherwise blobPackedIndex is same
-		// file-based DB as the index, in same dir, but named
-		// packindex.dbtype.
-		blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.indexFileDir(), "packindex"))
+		// If index is DBMS, then blobPackedIndex is in DBMS too.
+		// Otherwise blobPackedIndex is same file-based DB as the index,
+		// in same dir, but named packindex.dbtype.
+		blobPackedIndex, err := b.sortedStorageAt(dbBlobpackedIndex, filepath.Join(b.indexFileDir(), "packindex"))
 		if err != nil {
 			return err
 		}
@@ -750,14 +842,23 @@ func (b *lowBuilder) syncToIndexArgs() (map[string]interface{}, error) {
 		"to":   "/index/",
 	}
 
+	// TODO(mpl): see if we want to have the same logic with all the other queues. probably.
 	const sortedType = "queue-sync-to-index"
 	if dbName := b.dbName(sortedType); dbName != "" {
-		qj, err := b.sortedStorage(sortedType)
+		qj, err := b.sortedDBMS(sortedType)
 		if err != nil {
 			return nil, err
 		}
-		a["queue"] = qj
-		return a, nil
+		if qj == nil && b.high.MemoryIndex {
+			qj = map[string]interface{}{
+				"type": "memory",
+			}
+		}
+		if qj != nil {
+			// i.e. the index is configured on a DBMS, so we put the queue there too
+			a["queue"] = qj
+			return a, nil
+		}
 	}
 
 	// TODO: currently when using s3, the index must be
@@ -766,7 +867,7 @@ func (b *lowBuilder) syncToIndexArgs() (map[string]interface{}, error) {
 	if !b.high.MemoryStorage && b.high.BlobPath == "" && b.indexFileDir() == "" {
 		// We don't actually have a working sync handler, but we keep a stub registered
 		// so it can be referred to from other places.
-		// See http://camlistore.org/issue/201
+		// See http://perkeep.org/issue/201
 		a["idle"] = true
 		return a, nil
 	}
@@ -828,6 +929,11 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 			"clientSecret": b.high.Picasa,
 		}
 	}
+	if b.high.Instapaper != "" {
+		importerArgs["instapaper"] = map[string]interface{}{
+			"clientSecret": b.high.Instapaper,
+		}
+	}
 	if b.runIndex() {
 		b.addPrefix("/importer/", "importer", importerArgs)
 	}
@@ -850,7 +956,7 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 			b.addPrefix("/bs-packed/", "storage-filesystem", args{
 				"path": filepath.Join(b.high.BlobPath, "packed"),
 			})
-			blobPackedIndex, err := b.sortedStorageAt("blobpacked_index", filepath.Join(b.high.BlobPath, "packed", "packindex"))
+			blobPackedIndex, err := b.sortedStorageAt(dbBlobpackedIndex, filepath.Join(b.high.BlobPath, "packed", "packindex"))
 			if err != nil {
 				return err
 			}
@@ -860,7 +966,7 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 				"metaIndex":  blobPackedIndex,
 			})
 		} else if b.high.PackBlobs {
-			diskpackedIndex, err := b.sortedStorageAt("diskpacked_index", filepath.Join(b.high.BlobPath, "diskpacked-index"))
+			diskpackedIndex, err := b.sortedStorageAt(dbDiskpackedIndex, filepath.Join(b.high.BlobPath, "diskpacked-index"))
 			if err != nil {
 				return err
 			}
@@ -917,7 +1023,10 @@ func (b *lowBuilder) genLowLevelPrefixes() error {
 		}
 		searchArgs := args{
 			"index": "/index/",
-			"owner": owner.String(),
+			"owner": map[string]interface{}{
+				"identity":    owner.Identity,
+				"secringFile": owner.SecringFile,
+			},
 		}
 		if b.copyIndexToMemory() {
 			searchArgs["slurpToMemory"] = true
@@ -935,7 +1044,7 @@ func (b *lowBuilder) build() (*Config, error) {
 			return nil, errors.New("CamliNetIP requires HTTPS")
 		}
 		if conf.HTTPSCert != "" || conf.HTTPSKey != "" || conf.Listen != "" || conf.BaseURL != "" {
-			return nil, errors.New("CamliNetIP is mutually exclusive with HTTPSCert, HTTPSKey, Listen, and BaseURL.")
+			return nil, errors.New("CamliNetIP is mutually exclusive with HTTPSCert, HTTPSKey, Listen, and BaseURL")
 		}
 		low["camliNetIP"] = conf.CamliNetIP
 	}
@@ -955,7 +1064,7 @@ func (b *lowBuilder) build() (*Config, error) {
 			return nil, fmt.Errorf("Error parsing baseURL %q as a URL: %v", conf.BaseURL, err)
 		}
 		if u.Path != "" && u.Path != "/" {
-			return nil, fmt.Errorf("baseURL can't have a path, only a scheme, host, and optional port.")
+			return nil, fmt.Errorf("baseURL can't have a path, only a scheme, host, and optional port")
 		}
 		u.Path = ""
 		low["baseURL"] = u.String()
@@ -980,9 +1089,11 @@ func (b *lowBuilder) build() (*Config, error) {
 		log.Printf("Indexer disabled, but %v will be used for other indexes, queues, caches, etc.", b.sortedName())
 	}
 
-	if conf.Identity == "" {
-		return nil, errors.New("no 'identity' in server config")
+	longID, err := b.longIdentity()
+	if err != nil {
+		return nil, err
 	}
+	b.high.Identity = longID
 
 	noLocalDisk := conf.BlobPath == ""
 	if noLocalDisk {
@@ -1015,10 +1126,10 @@ func (b *lowBuilder) build() (*Config, error) {
 
 	var cacheDir string
 	if noLocalDisk {
-		// Whether camlistored is run from EC2 or not, we use
+		// Whether perkeepd is run from EC2 or not, we use
 		// a temp dir as the cache when primary storage is S3.
 		// TODO(mpl): s3CacheBucket
-		// See https://camlistore.org/issue/85
+		// See https://perkeep.org/issue/85
 		cacheDir = filepath.Join(tempDir(), "camli-cache")
 	} else {
 		cacheDir = filepath.Join(conf.BlobPath, "cache")
@@ -1102,7 +1213,7 @@ func (b *lowBuilder) build() (*Config, error) {
 		}
 	}
 
-	return &Config{Obj: b.low}, nil
+	return &Config{jconf: b.low}, nil
 }
 
 func numSet(vv ...interface{}) (num int) {
@@ -1134,16 +1245,24 @@ var defaultBaseConfig = serverconfig.Config{
 // leveldb. If filePath already exists, it is overwritten.
 func WriteDefaultConfigFile(filePath string, useSQLite bool) error {
 	conf := defaultBaseConfig
-	blobDir := osutil.CamliBlobRoot()
+	blobDir, err := osutil.CamliBlobRoot()
+	if err != nil {
+		return err
+	}
+	varDir, err := osutil.CamliVarDir()
+	if err != nil {
+		return err
+	}
 	if err := wkfs.MkdirAll(blobDir, 0700); err != nil {
 		return fmt.Errorf("Could not create default blobs directory: %v", err)
 	}
 	conf.BlobPath = blobDir
 	conf.PackRelated = true
+
 	if useSQLite {
-		conf.SQLite = filepath.Join(osutil.CamliVarDir(), "index.sqlite")
+		conf.SQLite = filepath.Join(varDir, "index.sqlite")
 	} else {
-		conf.LevelDB = filepath.Join(osutil.CamliVarDir(), "index.leveldb")
+		conf.LevelDB = filepath.Join(varDir, "index.leveldb")
 	}
 
 	keyID, secretRing, err := getOrMakeKeyring()

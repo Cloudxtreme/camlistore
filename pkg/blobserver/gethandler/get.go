@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,24 +15,25 @@ limitations under the License.
 */
 
 // Package gethandler implements the HTTP handler for fetching blobs.
-package gethandler // import "camlistore.org/pkg/blobserver/gethandler"
+package gethandler // import "perkeep.org/pkg/blobserver/gethandler"
 
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
 
 	"go4.org/readerutil"
 )
 
-var kGetPattern = regexp.MustCompile(`/camli/` + blob.Pattern + `$`)
+var getPattern = regexp.MustCompile(`/camli/` + blob.Pattern + `$`)
 
 // Handler is the HTTP handler for serving GET requests of blobs.
 type Handler struct {
@@ -44,25 +45,32 @@ func CreateGetHandler(fetcher blob.Fetcher) http.Handler {
 	return &Handler{Fetcher: fetcher}
 }
 
-func (h *Handler) ServeHTTP(conn http.ResponseWriter, req *http.Request) {
+func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == "/camli/sha1-deadbeef00000000000000000000000000000000" {
 		// Test handler.
-		simulatePrematurelyClosedConnection(conn, req)
+		simulatePrematurelyClosedConnection(rw, req)
 		return
 	}
 
 	blobRef := blobFromURLPath(req.URL.Path)
 	if !blobRef.Valid() {
-		http.Error(conn, "Malformed GET URL.", 400)
+		http.Error(rw, "Malformed GET URL.", 400)
 		return
 	}
 
-	ServeBlobRef(conn, req, blobRef, h.Fetcher)
+	ServeBlobRef(rw, req, blobRef, h.Fetcher)
 }
 
 // ServeBlobRef serves a blob.
 func ServeBlobRef(rw http.ResponseWriter, req *http.Request, blobRef blob.Ref, fetcher blob.Fetcher) {
-	rc, size, err := fetcher.Fetch(blobRef)
+	ctx := req.Context()
+	if fetcher == nil {
+		log.Printf("gethandler: no fetcher configured for %s (ref=%v)", req.URL.Path, blobRef)
+		rw.WriteHeader(http.StatusNotFound)
+		io.WriteString(rw, "no fetcher configured")
+		return
+	}
+	rc, size, err := fetcher.Fetch(ctx, blobRef)
 	switch err {
 	case nil:
 		break
@@ -84,19 +92,28 @@ func ServeBlobRef(rw http.ResponseWriter, req *http.Request, blobRef blob.Ref, f
 	if rangeHeader || size < small {
 		// Slurp to memory, so we can actually seek on it (for Range support),
 		// or if we're going to be showing it in the browser (below).
-		b, err = blob.FromReader(blobRef, rc, size)
+		b, err = blob.FromReader(ctx, blobRef, rc, size)
 		if err != nil {
 			httputil.ServeError(rw, req, err)
 			return
 		}
-		content = b.Open()
+		content, err = b.ReadAll(ctx)
+		if err != nil {
+			httputil.ServeError(rw, req, err)
+			return
+		}
 	}
 	if !rangeHeader && size < small {
 		// If it's small and all UTF-8, assume it's text and
 		// just render it in the browser.  This is more for
 		// demos/debuggability than anything else.  It isn't
 		// part of the spec.
-		if b.IsUTF8() {
+		isUTF8, err := b.IsUTF8(ctx)
+		if err != nil {
+			httputil.ServeError(rw, req, err)
+			return
+		}
+		if isUTF8 {
 			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		}
 	}
@@ -106,11 +123,11 @@ func ServeBlobRef(rw http.ResponseWriter, req *http.Request, blobRef blob.Ref, f
 // dummyModTime is an arbitrary point in time that we send as fake modtimes for blobs.
 // Because blobs are content-addressable, they can never change, so it's better to send
 // *some* modtime and let clients do "If-Modified-Since" requests for it.
-// This time is the first commit of the Camlistore project.
+// This time is the first commit of the Perkeep project.
 var dummyModTime = time.Unix(1276213335, 0)
 
 func blobFromURLPath(path string) blob.Ref {
-	matches := kGetPattern.FindStringSubmatch(path)
+	matches := getPattern.FindStringSubmatch(path)
 	if len(matches) != 3 {
 		return blob.Ref{}
 	}
@@ -118,17 +135,17 @@ func blobFromURLPath(path string) blob.Ref {
 }
 
 // For client testing.
-func simulatePrematurelyClosedConnection(conn http.ResponseWriter, req *http.Request) {
-	flusher, ok := conn.(http.Flusher)
+func simulatePrematurelyClosedConnection(rw http.ResponseWriter, req *http.Request) {
+	flusher, ok := rw.(http.Flusher)
 	if !ok {
 		return
 	}
-	hj, ok := conn.(http.Hijacker)
+	hj, ok := rw.(http.Hijacker)
 	if !ok {
 		return
 	}
 	for n := 1; n <= 100; n++ {
-		fmt.Fprintf(conn, "line %d\n", n)
+		fmt.Fprintf(rw, "line %d\n", n)
 		flusher.Flush()
 	}
 	wrc, _, _ := hj.Hijack()

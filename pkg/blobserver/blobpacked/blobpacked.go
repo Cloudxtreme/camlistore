@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore AUTHORS
+Copyright 2014 The Perkeep AUTHORS
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -75,14 +75,14 @@ multiple zip files, each no larger than 16MB. In that case, each part of the
 file will have a different 'wholePartIndex' number, starting at index
 0. Each will have the same 'wholeSize'.
 */
-
-package blobpacked // import "camlistore.org/pkg/blobserver/blobpacked"
+package blobpacked // import "perkeep.org/pkg/blobserver/blobpacked"
 
 // TODO: BlobStreamer using the zip manifests, for recovery.
 
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"errors"
@@ -92,20 +92,20 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/pools"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/sorted"
-	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/pools"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/sorted"
 
+	"go4.org/jsonconfig"
 	"go4.org/strutil"
 	"go4.org/syncutil"
 )
@@ -133,34 +133,47 @@ const (
 	blobMetaPrefix      = "b:"
 	blobMetaPrefixLimit = "b;"
 
-	wholeMetaPrefix = "w:"
+	wholeMetaPrefix      = "w:"
+	wholeMetaPrefixLimit = "w;"
+
+	zipMetaPrefix      = "z:"
+	zipMetaPrefixLimit = "z;"
 )
 
 const (
 	zipManifestPath = "camlistore/camlistore-pack-manifest.json"
 )
 
+// RecoveryMode is the mode in which the blobpacked server starts.
+type RecoveryMode int
+
+// Note: not using iota for these, because they're stored in GCE
+// instance's metadata values.
+const (
+	// NoRecovery means blobpacked does not attempt to repair its index on startup.
+	// It is the default.
+	NoRecovery RecoveryMode = 0
+	// FastRecovery populates the blobpacked index, without erasing any existing one.
+	FastRecovery RecoveryMode = 1
+	// FullRecovery erases the existing blobpacked index, then rebuilds it.
+	FullRecovery RecoveryMode = 2
+)
+
 var (
 	recoveryMu sync.Mutex
-	recovery   bool
+	recovery   = NoRecovery
 )
 
 // TODO(mpl): make SetRecovery a method of type storage if we ever export it.
 
-// SetRecovery notes that the user ran the camlistored binary with the --recovery flag.
-// It means that any blobpacked storage subsequently initialized will
-// automatically start with rebuilding its meta index of zip files.
-func SetRecovery() {
+// SetRecovery sets the recovery mode for the blobpacked package.
+// If set to one of the modes other than NoRecovery, it means that any
+// blobpacked storage subsequently initialized will automatically start with
+// rebuilding its meta index of zip files, in accordance with the selected mode.
+func SetRecovery(mode RecoveryMode) {
 	recoveryMu.Lock()
 	defer recoveryMu.Unlock()
-	recovery = true
-}
-
-// See SetRecovery.
-func UnsetRecovery() {
-	recoveryMu.Lock()
-	defer recoveryMu.Unlock()
-	recovery = false
+	recovery = mode
 }
 
 type subFetcherStorage interface {
@@ -168,21 +181,36 @@ type subFetcherStorage interface {
 	blob.SubFetcher
 }
 
+// TODO(mpl): all a logf method or something to storage so we get the
+// "blobpacked:" prefix automatically to log messages.
+
 type storage struct {
 	small blobserver.Storage
 	large subFetcherStorage
 
 	// meta key -> value rows are:
 	//
-	// For logical blobs packed within a large blog, "b:" prefix:
+	// For logical blobs packed within a large blob, "b:" prefix:
 	//   b:sha1-xxxx -> "<size> <big-blobref> <offset_u32>"
 	//
 	// For wholerefs: (wholeMetaPrefix)
 	//   w:sha1-xxxx(wholeref) -> "<nbytes_total_u64> <nchunks_u32>"
 	// Then for each big nchunk of the file:
+	// The wholeRef and the chunk number as a key to: the blobRef of the zip
+	// file, the position of the data within the zip, the position of the data
+	// within the uploaded whole file, the length of data in this zip.
 	//   w:sha1-xxxx:0 -> "<zipchunk-blobref> <offset-in-zipchunk-blobref> <offset-in-whole_u64> <length_u32>"
 	//   w:sha1-xxxx:...
 	//   w:sha1-xxxx:(nchunks-1)
+	//
+	// For zipRefs: (zipMetaPrefix)
+	// key: blobref of the zip, prefixed by "z:"
+	// value: size of the zip, blobref of the contents of the whole file (which may
+	// span multiple zips, ~15.5 MB of data per zip), size of the whole file, position
+	// in the whole file of the data (first file) in the zip, size of the data in the
+	// zip (== size of the zip's first file).
+	//   z:<zip-blobref> -> "<zip_size_u32> <whole_ref_from_zip_manifest> <whole_size_u64>
+	//   <zip_data_offset_in_whole_u64> <zip_data_bytes_u32>"
 	//
 	// For marking that zips that have blobs (possibly all)
 	// deleted from inside them: (deleted zip)
@@ -246,6 +274,7 @@ func newFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (blobserver.Storag
 		smallPrefix = conf.RequiredString("smallBlobs")
 		largePrefix = conf.RequiredString("largeBlobs")
 		metaConf    = conf.RequiredObject("metaIndex")
+		keepGoing   = conf.OptionalBool("keepGoing", false)
 	)
 	if err := conf.Validate(); err != nil {
 		return nil, err
@@ -276,52 +305,193 @@ func newFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (blobserver.Storag
 
 	recoveryMu.Lock()
 	defer recoveryMu.Unlock()
-	if recovery {
+	condFatalf := func(pattern string, args ...interface{}) {
+		log.Printf(pattern, args...)
+		if !keepGoing {
+			os.Exit(1)
+		}
+	}
+
+	var newKv func() (sorted.KeyValue, error)
+	switch recovery {
+	case FastRecovery:
+		newKv = func() (sorted.KeyValue, error) {
+			return sorted.NewKeyValue(metaConf)
+		}
+	case FullRecovery:
+		newKv = func() (sorted.KeyValue, error) {
+			kv, err := sorted.NewKeyValue(metaConf)
+			if err != nil {
+				return nil, err
+			}
+			wiper, ok := kv.(sorted.Wiper)
+			if !ok {
+				return nil, fmt.Errorf("blobpacked meta index of type %T needs to be wiped, but does not support automatic wiping. It should be removed manually.", kv)
+			}
+			if err := wiper.Wipe(); err != nil {
+				return nil, fmt.Errorf("blobpacked meta index of type %T could not be wiped: %v", kv, err)
+			}
+			return kv, nil
+		}
+	}
+	if newKv != nil {
+		// i.e. we're in one of the recovery modes
 		log.Print("Starting recovery of blobpacked index")
 		if err := meta.Close(); err != nil {
 			return nil, err
 		}
-		if err := sto.reindex(context.TODO(), func() (sorted.KeyValue, error) {
-			return sorted.NewKeyValue(metaConf)
-		}); err != nil {
+		if err := sto.reindex(context.TODO(), newKv); err != nil {
 			return nil, err
+		}
+		if _, err := sto.checkLargeIntegrity(); err != nil {
+			condFatalf("blobpacked: reindexed successfully, but error after validation: %v", err)
 		}
 		return sto, nil
 	}
+
 	// Check for a weird state: zip files exist, but no metadata about them
 	// is recorded. This is probably a corrupt state, and the user likely
 	// wants to recover.
 	if !sto.anyMeta() && sto.anyZipPacks() {
 		if env.OnGCE() {
-			log.Fatal("Error: blobpacked storage detects non-zero packed zips, but no metadata. Please switch to recovery mode: add the \"camlistore-recovery = true\" key/value to the Custom metadata of your instance. And restart the instance.")
+			// TODO(mpl): make web UI page/mode that informs about this error.
+			condFatalf("Error: blobpacked storage detects non-zero packed zips, but no metadata. Please switch to recovery mode: add the \"camlistore-recovery = %d\" key/value to the Custom metadata of your instance. And restart the instance.", FastRecovery)
 		}
-		log.Fatal("Error: blobpacked storage detects non-zero packed zips, but no metadata. Please re-start in recovery mode with -recovery.")
+		condFatalf("Error: blobpacked storage detects non-zero packed zips, but no metadata. Please re-start in recovery mode with -recovery=%d", FastRecovery)
+	}
+
+	if mode, err := sto.checkLargeIntegrity(); err != nil {
+		if mode <= NoRecovery {
+			condFatalf("%v", err)
+		}
+		if env.OnGCE() {
+			// TODO(mpl): make web UI page/mode that informs about this error.
+			condFatalf("Error: %v. Please switch to recovery mode: add the \"camlistore-recovery = %d\" key/value to the Custom metadata of your instance. And restart the instance.", err, mode)
+		}
+		condFatalf("Error: %v. Please re-start in recovery mode with -recovery=%d", err, mode)
 	}
 
 	return sto, nil
 }
 
-// wholeMetaPrefixInfo is the info needed to write the wholeMetaPrefix entries
-// when Reindexing. For a given file, spread over several zips, each zip has a
-// corresponding wholeMetaPrefixInfo. The wholeMetaPrefix entries pertaining to a
-// file can only be written once all the wholeMetaPrefixInfo have been collected
-// and sorted, because a wholeMetaPrefix entry records the total data offset of the
-// corresponding zip relative to beginning the file.
-type wholeMetaPrefixInfo struct {
-	wholePartIndex   int // index of that zip, 0-based
-	zipRef           blob.Ref
-	firstOffset      int64 // position of the data chunk, in the zip.
-	dataBytesWritten int64 // how much (file) data in this zip
-	wholeSize        int64 // not actually needed, but just to check it against what we compute in the end
+// checkLargeIntegrity verifies that all large blobs in the large storage are
+// indexed in meta, and vice-versa, that all rows in meta referring to a large blob
+// correspond to an existing large blob in the large storage. If any of the above
+// is not true, it returns the recovery mode that should be used to fix the
+// problem, as well as the error detailing the problem. It does not perform any
+// check about the contents of the large blobs themselves.
+func (s *storage) checkLargeIntegrity() (RecoveryMode, error) {
+	inLarge := 0
+	var missing []blob.Ref // blobs in large but not in meta
+	var extra []blob.Ref   // blobs in meta but not in large
+	t := s.meta.Find(zipMetaPrefix, zipMetaPrefixLimit)
+	defer t.Close()
+	iterate := true
+	var enumFunc func(sb blob.SizedRef) error
+	enumFunc = func(sb blob.SizedRef) error {
+		if iterate && !t.Next() {
+			// all of the yet to be enumerated are missing from meta
+			missing = append(missing, sb.Ref)
+			return nil
+		}
+		iterate = true
+		wantMetaKey := zipMetaPrefix + sb.Ref.String()
+		metaKey := t.Key()
+		if metaKey != wantMetaKey {
+			if metaKey > wantMetaKey {
+				// zipRef missing from meta
+				missing = append(missing, sb.Ref)
+				iterate = false
+				return nil
+			}
+			// zipRef in meta that actually does not exist in s.large.
+			xbr, ok := blob.Parse(strings.TrimPrefix(metaKey, zipMetaPrefix))
+			if !ok {
+				return fmt.Errorf("boggus key in z: row: %q", metaKey)
+			}
+			extra = append(extra, xbr)
+			// iterate meta once more at the same storage enumeration point
+			return enumFunc(sb)
+		}
+		if _, err := parseZipMetaRow(t.ValueBytes()); err != nil {
+			return fmt.Errorf("error parsing row from meta: %v", err)
+		}
+		inLarge++
+		return nil
+	}
+	log.Printf("blobpacked: checking integrity of packed blobs against index...")
+	if err := blobserver.EnumerateAllFrom(context.Background(), s.large, "", enumFunc); err != nil {
+		return FullRecovery, err
+	}
+	log.Printf("blobpacked: %d large blobs found in index, %d missing from index", inLarge, len(missing))
+	if len(missing) > 0 {
+		printSample(missing, "missing")
+	}
+	if len(extra) > 0 {
+		printSample(extra, "extra")
+		return FullRecovery, fmt.Errorf("%d large blobs in index but not actually in storage", len(extra))
+	}
+	if err := t.Close(); err != nil {
+		return FullRecovery, fmt.Errorf("error reading or closing index: %v", err)
+	}
+	if len(missing) > 0 {
+		return FastRecovery, fmt.Errorf("%d large blobs missing from index", len(missing))
+	}
+	return NoRecovery, nil
 }
 
-type wholeMetaPrefixInfos []wholeMetaPrefixInfo
+func printSample(fromSlice []blob.Ref, sliceName string) {
+	sort.Slice(fromSlice, func(i, j int) bool { return fromSlice[i].Less(fromSlice[j]) })
+	for i, br := range fromSlice {
+		if i == 10 {
+			break
+		}
+		log.Printf("  sample %v large blob: %v", sliceName, br)
+	}
+}
 
-func (w wholeMetaPrefixInfos) Len() int           { return len(w) }
-func (w wholeMetaPrefixInfos) Swap(i, j int)      { w[i], w[j] = w[j], w[i] }
-func (w wholeMetaPrefixInfos) Less(i, j int) bool { return w[i].wholePartIndex < w[j].wholePartIndex }
+// zipMetaInfo is the info needed to write the wholeMetaPrefix and
+// zipMetaPrefix entries when reindexing. For a given file, spread over several
+// zips, each zip has a corresponding zipMetaInfo. The wholeMetaPrefix and
+// zipMetaPrefix rows pertaining to a file can only be written once all the
+// zipMetaInfo have been collected and sorted, because the offset of each zip's
+// data is derived from the size of the other pieces that precede it in the file.
+type zipMetaInfo struct {
+	wholePartIndex int      // index of that zip, 0-based
+	zipRef         blob.Ref // ref of the zip file holding packed data blobs + other schema blobs
+	zipSize        uint32   // size of the zipped file
+	offsetInZip    uint32   // position of the contiguous data blobs, relative to the zip
+	dataSize       uint32   // size of the data in the zip
+	wholeSize      uint64   // size of the whole file that this zip is a part of
+	wholeRef       blob.Ref // ref of the contents of the whole file
+}
+
+// rowValue returns the value of the "z:<zipref>" meta key row
+// based on the contents of zm and the provided arguments.
+func (zm zipMetaInfo) rowValue(offset uint64) string {
+	return fmt.Sprintf("%d %v %d %d %d", zm.zipSize, zm.wholeRef, zm.wholeSize, offset, zm.dataSize)
+}
 
 // TODO(mpl): add client command to call reindex on an "offline" blobpacked. camtool packblobs -reindex maybe?
+
+// fileName returns the name of the (possibly partial) first file in zipRef
+// (i.e. the actual data). It returns a zipOpenError if there was any problem
+// reading the zip, and os.ErrNotExist if the zip could not be fetched or if
+// there was no file in the zip.
+func (s *storage) fileName(ctx context.Context, zipRef blob.Ref) (string, error) {
+	_, size, err := s.large.Fetch(ctx, zipRef)
+	if err != nil {
+		return "", err
+	}
+	zr, err := zip.NewReader(blob.ReaderAt(ctx, s.large, zipRef), int64(size))
+	if err != nil {
+		return "", zipOpenError{zipRef, err}
+	}
+	for _, f := range zr.File {
+		return f.Name, nil
+	}
+	return "", os.ErrNotExist
+}
 
 // reindex rebuilds the meta index for packed blobs. It calls newMeta to create
 // a new KeyValue on which to write the index, and replaces s.meta with it. There
@@ -333,11 +503,26 @@ func (s *storage) reindex(ctx context.Context, newMeta func() (sorted.KeyValue, 
 		return fmt.Errorf("failed to create new blobpacked meta index: %v", err)
 	}
 
-	wholeMetaByWholeRef := make(map[blob.Ref][]wholeMetaPrefixInfo)
+	zipMetaByWholeRef := make(map[blob.Ref][]zipMetaInfo)
 
+	// first a fast full enumerate, so we can report progress afterwards
+	packedTotal := 0
+	blobserver.EnumerateAllFrom(ctx, s.large, "", func(sb blob.SizedRef) error {
+		packedTotal++
+		return nil
+	})
+
+	var packedDone, packedSeen int
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
 	if err := blobserver.EnumerateAllFrom(ctx, s.large, "", func(sb blob.SizedRef) error {
+		select {
+		case <-t.C:
+			log.Printf("blobpacked: %d / %d zip packs seen", packedSeen, packedTotal)
+		default:
+		}
 		zipRef := sb.Ref
-		zr, err := zip.NewReader(blob.ReaderAt(s.large, zipRef), int64(sb.Size))
+		zr, err := zip.NewReader(blob.ReaderAt(ctx, s.large, zipRef), int64(sb.Size))
 		if err != nil {
 			return zipOpenError{zipRef, err}
 		}
@@ -356,7 +541,7 @@ func (s *storage) reindex(ctx context.Context, newMeta func() (sorted.KeyValue, 
 			}
 		}
 		if maniFile == nil {
-			return fmt.Errorf("no camlistore manifest file found in zip %v", zipRef)
+			return fmt.Errorf("no perkeep manifest file found in zip %v", zipRef)
 		}
 		maniRC, err := maniFile.Open()
 		if err != nil {
@@ -379,6 +564,10 @@ func (s *storage) reindex(ctx context.Context, newMeta func() (sorted.KeyValue, 
 			bm.Set(blobMetaPrefix+bp.SizedRef.Ref.String(), fmt.Sprintf("%d %v %d", bp.SizedRef.Size, zipRef, firstOff+bp.Offset))
 			dataBytesWritten += int64(bp.SizedRef.Size)
 		}
+		if dataBytesWritten > (1<<32 - 1) {
+			return fmt.Errorf("total data blobs size in zip %v overflows uint32", zipRef)
+		}
+		dataSize := uint32(dataBytesWritten)
 
 		// In this loop, we write all the blobMetaPrefix entries for the schema blobs in this zip
 		for _, f := range zr.File {
@@ -396,47 +585,98 @@ func (s *storage) reindex(ctx context.Context, newMeta func() (sorted.KeyValue, 
 			}
 			bm.Set(blobMetaPrefix+br.String(), fmt.Sprintf("%d %v %d", f.UncompressedSize64, zipRef, offset))
 		}
+
 		if err := meta.CommitBatch(bm); err != nil {
 			return err
 		}
 
 		// record that info for later, when we got them all, so we can write the wholeMetaPrefix entries.
-		wholeMetas, _ := wholeMetaByWholeRef[mf.WholeRef]
-		wholeMetas = append(wholeMetas, wholeMetaPrefixInfo{
-			wholePartIndex:   mf.WholePartIndex,
-			zipRef:           zipRef,
-			firstOffset:      firstOff,
-			dataBytesWritten: dataBytesWritten,
-			wholeSize:        mf.WholeSize,
+		zipMetaByWholeRef[mf.WholeRef] = append(zipMetaByWholeRef[mf.WholeRef], zipMetaInfo{
+			wholePartIndex: mf.WholePartIndex,
+			zipRef:         zipRef,
+			zipSize:        sb.Size,
+			offsetInZip:    uint32(firstOff),
+			dataSize:       dataSize,
+			wholeSize:      uint64(mf.WholeSize),
+			wholeRef:       mf.WholeRef, // redundant with zipMetaByWholeRef key for now.
 		})
-		wholeMetaByWholeRef[mf.WholeRef] = wholeMetas
+		packedSeen++
 		return nil
-
 	}); err != nil {
 		return err
 	}
 
 	// finally, write the wholeMetaPrefix entries
+	foundDups := false
+	packedFiles := 0
+	tt := time.NewTicker(2 * time.Second)
+	defer tt.Stop()
 	bm := meta.BeginBatch()
-	for wholeRef, wholeMetas := range wholeMetaByWholeRef {
-		wm := wholeMetaPrefixInfos(wholeMetas)
-		sort.Sort(wm)
-		var wholeBytesWritten int64
-		for _, w := range wm {
-			bm.Set(fmt.Sprintf("%s%s:%d", wholeMetaPrefix, wholeRef, w.wholePartIndex),
-				fmt.Sprintf("%s %d %d %d", w.zipRef, w.firstOffset, wholeBytesWritten, w.dataBytesWritten))
-			wholeBytesWritten += w.dataBytesWritten
+	for wholeRef, zipMetas := range zipMetaByWholeRef {
+		select {
+		case <-t.C:
+			log.Printf("blobpacked: %d files reindexed", packedFiles)
+		default:
 		}
-		if wm[0].wholeSize != wholeBytesWritten {
-			return fmt.Errorf("Sum of all zips (%d bytes) does not match manifest's WholeSize (%d bytes) for %v",
-				wholeBytesWritten, wm[0].wholeSize, wholeRef)
+		sort.Slice(zipMetas, func(i, j int) bool { return zipMetas[i].wholePartIndex < zipMetas[j].wholePartIndex })
+		hasDup := hasDups(zipMetas)
+		if hasDup {
+			foundDups = true
+		}
+		offsets := wholeOffsets(zipMetas)
+		for _, z := range zipMetas {
+			offset := offsets[z.wholePartIndex]
+			// write the w:row
+			bm.Set(fmt.Sprintf("%s%s:%d", wholeMetaPrefix, wholeRef, z.wholePartIndex),
+				fmt.Sprintf("%s %d %d %d", z.zipRef, z.offsetInZip, offset, z.dataSize))
+			// write the z: row
+			bm.Set(fmt.Sprintf("%s%v", zipMetaPrefix, z.zipRef), z.rowValue(offset))
+			packedDone++
+		}
+		if hasDup {
+			if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); debug {
+				printDuplicates(zipMetas)
+			}
+		}
+
+		wholeBytesWritten := offsets[len(offsets)-1]
+		if zipMetas[0].wholeSize != wholeBytesWritten {
+			// Any corrupted zip should have been found earlier, so this error means we're
+			// missing at least one full zip for the whole file to be complete.
+			fileName, err := s.fileName(ctx, zipMetas[0].zipRef)
+			if err != nil {
+				return fmt.Errorf("could not get filename of file in zip %v: %v", zipMetas[0].zipRef, err)
+			}
+			log.Printf(
+				"blobpacked: file %q (wholeRef %v) is incomplete: sum of all zips (%d bytes) does not match manifest's WholeSize (%d bytes)",
+				fileName, wholeRef, wholeBytesWritten, zipMetas[0].wholeSize)
+			var allParts []blob.Ref
+			for _, z := range zipMetas {
+				allParts = append(allParts, z.zipRef)
+			}
+			log.Printf("blobpacked: known parts of %v: %v", wholeRef, allParts)
+			// we skip writing the w: row for the full file, and we don't count the file
+			// as complete.
+			continue
 		}
 		bm.Set(fmt.Sprintf("%s%s", wholeMetaPrefix, wholeRef),
-			fmt.Sprintf("%d %d", wholeBytesWritten, wm[len(wholeMetas)-1].wholePartIndex+1))
+			fmt.Sprintf("%d %d", wholeBytesWritten, zipMetas[len(zipMetas)-1].wholePartIndex+1))
+		packedFiles++
 	}
-
 	if err := meta.CommitBatch(bm); err != nil {
 		return err
+	}
+
+	log.Printf("blobpacked: %d / %d zip packs successfully reindexed", packedDone, packedTotal)
+	if packedFiles < len(zipMetaByWholeRef) {
+		log.Printf("blobpacked: %d files reindexed, and %d incomplete file(s) found.", packedFiles, len(zipMetaByWholeRef)-packedFiles)
+	} else {
+		log.Printf("blobpacked: %d files reindexed.", packedFiles)
+	}
+	if foundDups {
+		if debug, _ := strconv.ParseBool(os.Getenv("CAMLI_DEBUG")); !debug {
+			log.Print("blobpacked: zip blobs with duplicate contents were found. Re-run with CAMLI_DEBUG=true for more detail.")
+		}
 	}
 
 	// TODO(mpl): take into account removed blobs. I can't be done for now
@@ -447,20 +687,78 @@ func (s *storage) reindex(ctx context.Context, newMeta func() (sorted.KeyValue, 
 	return nil
 }
 
-func WipeMeta(s blobserver.Storage) error {
-	bps, ok := s.(*storage)
-	if !ok {
-		return fmt.Errorf("argument is not blobpacked storage but a %T", s)
+// hasDups reports whether zm contains successive zipRefs which have the same
+// wholePartIndex, which we assume means they have the same data contents. It
+// panics if that assumption seems wrong, i.e. if the data within assumed
+// duplicates is not the same size in all of them. zm must be sorted by
+// wholePartIndex.
+// See https://github.com/perkeep/perkeep/issues/1079
+func hasDups(zm []zipMetaInfo) bool {
+	i := 0
+	var dataSize uint32
+	var firstDup blob.Ref
+	dupFound := false
+	for _, z := range zm {
+		if z.wholePartIndex == i {
+			firstDup = z.zipRef
+			dataSize = z.dataSize
+			i++
+			continue
+		}
+		// we could return true right now, but we want to go through it all, to make
+		// sure our assumption that "same part index -> duplicate" is true, using at least
+		// the dataSize to confirm. For a better effort, we should use DataBlobsOrigin.
+		if z.dataSize != dataSize {
+			panic(fmt.Sprintf("%v and %v looked like duplicates at first, but don't actually have the same dataSize. TODO: add DataBlobsOrigin checking.", firstDup, z.zipRef))
+		}
+		dupFound = true
 	}
-	wiper, ok := bps.meta.(sorted.Wiper)
-	if !ok {
-		return fmt.Errorf("blobpacked meta storage type %T doesn't support sorted.Wiper", bps.meta)
+	return dupFound
+}
+
+// wholeOffsets returns the offset for each part of a file f, in order, assuming
+// zm are all the (wholePartIndex) ordered zip parts that constitute that file. If
+// zm seems to contain duplicates, they are skipped. The additional last item of
+// the returned slice is the sum of all the parts, i.e. the whole size of f.
+func wholeOffsets(zm []zipMetaInfo) []uint64 {
+	i := 0
+	var offsets []uint64
+	var currentOffset uint64
+	for _, z := range zm {
+		if i != z.wholePartIndex {
+			continue
+		}
+		offsets = append(offsets, currentOffset)
+		currentOffset += uint64(z.dataSize)
+		i++
 	}
-	log.Printf("Wiping blobpacked meta type %T ...", bps.meta)
-	if err := wiper.Wipe(); err != nil {
-		return fmt.Errorf("error wiping blobpacked meta sorted key/value type %T: %v", bps.meta, err)
+	// add the last computed offset to the slice, as it's useful info too: it's the
+	// size of all the data in the zip.
+	offsets = append(offsets, currentOffset)
+	return offsets
+}
+
+func printDuplicates(zm []zipMetaInfo) {
+	i := 0
+	byPartIndex := make(map[int][]zipMetaInfo)
+	for _, z := range zm {
+		if i == z.wholePartIndex {
+			byPartIndex[z.wholePartIndex] = []zipMetaInfo{z}
+			i++
+			continue
+		}
+		byPartIndex[z.wholePartIndex] = append(byPartIndex[z.wholePartIndex], z)
 	}
-	return nil
+	for _, zm := range byPartIndex {
+		if len(zm) <= 1 {
+			continue
+		}
+		br := make([]blob.Ref, 0, len(zm))
+		for _, z := range zm {
+			br = append(br, z.zipRef)
+		}
+		log.Printf("zip blobs with same data contents: %v", br)
+	}
 }
 
 func (s *storage) anyMeta() (v bool) {
@@ -489,7 +787,7 @@ func (s *storage) anyZipPacks() (v bool) {
 }
 
 func (s *storage) Close() error {
-	return nil
+	return s.meta.Close()
 }
 
 func (s *storage) StorageGeneration() (initTime time.Time, random string, err error) {
@@ -599,7 +897,56 @@ func parseMetaRowSizeOnly(v []byte) (size uint32, err error) {
 	return uint32(size64), nil
 }
 
-func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sb blob.SizedRef, err error) {
+// parses:
+// "<zip_size_u32> <whole_ref_from_zip_manifest> <whole_size_u64> <zip_data_offset_in_whole_u64> <zip_data_bytes_u32>"
+func parseZipMetaRow(v []byte) (m zipMetaInfo, err error) {
+	row := v
+	sp := bytes.IndexByte(v, ' ')
+	if sp < 1 || sp == len(v)-1 {
+		return zipMetaInfo{}, fmt.Errorf("invalid z: meta row %q", row)
+	}
+	if bytes.Count(v, singleSpace) != 4 {
+		return zipMetaInfo{}, fmt.Errorf("wrong number of spaces in z: meta row %q", row)
+	}
+	zipSize, err := strutil.ParseUintBytes(v[:sp], 10, 32)
+	if err != nil {
+		return zipMetaInfo{}, fmt.Errorf("invalid zipSize %q in z: meta row: %q", v[:sp], row)
+	}
+	m.zipSize = uint32(zipSize)
+
+	v = v[sp+1:]
+	sp = bytes.IndexByte(v, ' ')
+	wholeRef, ok := blob.ParseBytes(v[:sp])
+	if !ok {
+		return zipMetaInfo{}, fmt.Errorf("invalid wholeRef %q in z: meta row: %q", v[:sp], row)
+	}
+	m.wholeRef = wholeRef
+
+	v = v[sp+1:]
+	sp = bytes.IndexByte(v, ' ')
+	wholeSize, err := strutil.ParseUintBytes(v[:sp], 10, 64)
+	if err != nil {
+		return zipMetaInfo{}, fmt.Errorf("invalid wholeSize %q in z: meta row: %q", v[:sp], row)
+	}
+	m.wholeSize = uint64(wholeSize)
+
+	v = v[sp+1:]
+	sp = bytes.IndexByte(v, ' ')
+	if _, err := strutil.ParseUintBytes(v[:sp], 10, 64); err != nil {
+		return zipMetaInfo{}, fmt.Errorf("invalid offset %q in z: meta row: %q", v[:sp], row)
+	}
+
+	v = v[sp+1:]
+	dataSize, err := strutil.ParseUintBytes(v, 10, 32)
+	if err != nil {
+		return zipMetaInfo{}, fmt.Errorf("invalid dataSize %q in z: meta row: %q", v, row)
+	}
+	m.dataSize = uint32(dataSize)
+
+	return m, nil
+}
+
+func (s *storage) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (sb blob.SizedRef, err error) {
 	buf := pools.BytesBuffer()
 	defer pools.PutBuffer(buf)
 
@@ -619,7 +966,7 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sb blob.SizedRef, 
 	if meta.exists {
 		sb = blob.SizedRef{Size: size, Ref: br}
 	} else {
-		sb, err = s.small.ReceiveBlob(br, buf)
+		sb, err = s.small.ReceiveBlob(ctx, br, buf)
 		if err != nil {
 			return sb, err
 		}
@@ -634,19 +981,19 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sb blob.SizedRef, 
 	// We ignore the return value from packFile since we can't
 	// really recover. At least be happy that we have all the
 	// data on 'small' already. packFile will log at least.
-	s.packFile(br)
+	s.packFile(ctx, br)
 	return sb, nil
 }
 
-func (s *storage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
+func (s *storage) Fetch(ctx context.Context, br blob.Ref) (io.ReadCloser, uint32, error) {
 	m, err := s.getMetaRow(br)
 	if err != nil {
 		return nil, 0, err
 	}
 	if !m.exists || !m.isPacked() {
-		return s.small.Fetch(br)
+		return s.small.Fetch(ctx, br)
 	}
-	rc, err := s.large.SubFetch(m.largeRef, int64(m.largeOff), int64(m.size))
+	rc, err := s.large.SubFetch(ctx, m.largeRef, int64(m.largeOff), int64(m.size))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -655,7 +1002,7 @@ func (s *storage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
 
 const removeLookups = 50 // arbitrary
 
-func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
+func (s *storage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	// Plan:
 	//  -- delete from small (if it's there)
 	//  -- if in big, update the meta index to note that it's there, but deleted.
@@ -697,7 +1044,7 @@ func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
 	}
 	if len(unpacked) > 0 {
 		grp.Go(func() error {
-			return s.small.RemoveBlobs(unpacked)
+			return s.small.RemoveBlobs(ctx, unpacked)
 		})
 	}
 	if len(packed) > 0 {
@@ -716,44 +1063,35 @@ func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
 	return grp.Err()
 }
 
-func (s *storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
-	if len(blobs) == 0 {
-		return nil
-	}
+var statGate = syncutil.NewGate(50) // arbitrary
 
+func (s *storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	var (
-		grp        syncutil.Group
 		trySmallMu sync.Mutex
 		trySmall   []blob.Ref
 	)
-	statGate := syncutil.NewGate(50) // arbitrary
-	for _, br := range blobs {
-		br := br
-		statGate.Start()
-		grp.Go(func() error {
-			defer statGate.Done()
-			m, err := s.getMetaRow(br)
-			if err != nil {
-				return err
-			}
-			if m.exists {
-				dest <- blob.SizedRef{Ref: br, Size: m.size}
-			} else {
-				trySmallMu.Lock()
-				trySmall = append(trySmall, br)
-				// Assume append cannot fail or panic
-				trySmallMu.Unlock()
-			}
-			return nil
-		})
-	}
-	if err := grp.Err(); err != nil {
+
+	err := blobserver.StatBlobsParallelHelper(ctx, blobs, fn, statGate, func(br blob.Ref) (sb blob.SizedRef, err error) {
+		m, err := s.getMetaRow(br)
+		if err != nil {
+			return sb, err
+		}
+		if m.exists {
+			return blob.SizedRef{Ref: br, Size: m.size}, nil
+		}
+		// Try it in round two against the small blobs:
+		trySmallMu.Lock()
+		trySmall = append(trySmall, br)
+		trySmallMu.Unlock()
+		return sb, nil
+	})
+	if err != nil {
 		return err
 	}
 	if len(trySmall) == 0 {
 		return nil
 	}
-	return s.small.StatBlobs(dest, trySmall)
+	return s.small.StatBlobs(ctx, trySmall, fn)
 }
 
 func (s *storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
@@ -802,7 +1140,7 @@ func (s enumerator) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRe
 	return nil
 }
 
-func (s *storage) packFile(fileRef blob.Ref) (err error) {
+func (s *storage) packFile(ctx context.Context, fileRef blob.Ref) (err error) {
 	s.Logf("Packing file %s ...", fileRef)
 	defer func() {
 		if err == nil {
@@ -812,11 +1150,11 @@ func (s *storage) packFile(fileRef blob.Ref) (err error) {
 		}
 	}()
 
-	fr, err := schema.NewFileReader(s, fileRef)
+	fr, err := schema.NewFileReader(ctx, s, fileRef)
 	if err != nil {
 		return err
 	}
-	return newPacker(s, fileRef, fr).pack()
+	return newPacker(s, fileRef, fr).pack(ctx)
 }
 
 func newPacker(s *storage, fileRef blob.Ref, fr *schema.FileReader) *packer {
@@ -844,7 +1182,7 @@ type packer struct {
 
 	schemaRefs   []blob.Ref // in order, but irrelevant
 	schemaBlob   map[blob.Ref]*blob.Blob
-	schemaParent map[blob.Ref][]blob.Ref // data blob -> its parent/ancestor schema blob(s)
+	schemaParent map[blob.Ref][]blob.Ref // data blob -> its parent/ancestor schema blob(s), all the way up to fileRef included
 
 	chunksRemain      []blob.Ref
 	zips              []writtenZip
@@ -861,8 +1199,8 @@ var (
 	testHookStopBeforeOverflowing func()
 )
 
-func (pk *packer) pack() error {
-	if err := pk.scanChunks(); err != nil {
+func (pk *packer) pack(ctx context.Context) error {
+	if err := pk.scanChunks(ctx); err != nil {
 		return err
 	}
 
@@ -896,7 +1234,7 @@ func (pk *packer) pack() error {
 	var trunc blob.Ref
 MakingZips:
 	for len(pk.chunksRemain) > 0 {
-		if err := pk.writeAZip(trunc); err != nil {
+		if err := pk.writeAZip(ctx, trunc); err != nil {
 			if needTrunc, ok := err.(needsTruncatedAfterError); ok {
 				trunc = needTrunc.Ref
 				if fn := testHookSawTruncate; fn != nil {
@@ -918,16 +1256,16 @@ MakingZips:
 	return nil
 }
 
-func (pk *packer) scanChunks() error {
+func (pk *packer) scanChunks(ctx context.Context) error {
 	schemaSeen := map[blob.Ref]bool{}
-	return pk.fr.ForeachChunk(func(schemaPath []blob.Ref, p schema.BytesPart) error {
+	return pk.fr.ForeachChunk(ctx, func(schemaPath []blob.Ref, p schema.BytesPart) error {
 		if !p.BlobRef.Valid() {
 			return errors.New("sparse files are not packed")
 		}
 		if p.Offset != 0 {
 			// TODO: maybe care about this later, if we ever start making
 			// these sorts of files.
-			return errors.New("file uses complicated schema. not packing.")
+			return errors.New("file uses complicated schema. not packing")
 		}
 		pk.schemaParent[p.BlobRef] = append([]blob.Ref(nil), schemaPath...) // clone it
 		pk.dataSize[p.BlobRef] = uint32(p.Size)
@@ -937,7 +1275,7 @@ func (pk *packer) scanChunks() error {
 			}
 			schemaSeen[schemaRef] = true
 			pk.schemaRefs = append(pk.schemaRefs, schemaRef)
-			if b, err := blob.FromFetcher(pk.s, schemaRef); err != nil {
+			if b, err := blob.FromFetcher(ctx, pk.s, schemaRef); err != nil {
 				return err
 			} else {
 				pk.schemaBlob[schemaRef] = b
@@ -969,7 +1307,7 @@ func check(err error) {
 // If the returned error is of type 'needsTruncatedAfterError', then
 // the zip should be attempted to be written again, but truncating the
 // data after the listed blob.
-func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
+func (pk *packer) writeAZip(ctx context.Context, trunc blob.Ref) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			if v, ok := e.(error); ok && err == nil {
@@ -1043,7 +1381,7 @@ func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
 		}
 
 		// Copy the data to the zip.
-		rc, size, err := pk.s.Fetch(dr)
+		rc, size, err := pk.s.Fetch(ctx, dr)
 		check(err)
 		if size != thisSize {
 			rc.Close()
@@ -1083,9 +1421,12 @@ func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
 		check(zw.Flush())
 		b := pk.schemaBlob[br]
 		zipBlobs = append(zipBlobs, BlobAndPos{blob.SizedRef{Ref: br, Size: b.Size()}, cw.n})
-		rc := b.Open()
-		n, err := io.Copy(fw, rc)
-		rc.Close()
+		r, err := b.ReadAll(ctx)
+		if err != nil {
+			return err
+		}
+		n, err := io.Copy(fw, r)
+
 		check(err)
 		if n != int64(b.Size()) {
 			return fmt.Errorf("failed to write all of schema blob %v: %d bytes, not wanted %d", br, n, b.Size())
@@ -1115,8 +1456,8 @@ func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
 		return errors.New("file is unpackable; first blob is too big to fit")
 	}
 
-	zipRef := blob.SHA1FromBytes(zbuf.Bytes())
-	zipSB, err := blobserver.ReceiveNoHash(pk.s.large, zipRef, bytes.NewReader(zbuf.Bytes()))
+	zipRef := blob.RefFromBytes(zbuf.Bytes())
+	zipSB, err := blobserver.ReceiveNoHash(ctx, pk.s.large, zipRef, bytes.NewReader(zbuf.Bytes()))
 	if err != nil {
 		return err
 	}
@@ -1126,6 +1467,13 @@ func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
 		fmt.Sprintf("%s %d %d %d",
 			zipRef,
 			dataStart,
+			pk.wholeBytesWritten,
+			dataBytesWritten))
+	bm.Set(fmt.Sprintf("%s%v", zipMetaPrefix, zipRef),
+		fmt.Sprintf("%d %v %d %d %d",
+			zipSB.Size,
+			pk.wholeRef,
+			pk.wholeSize,
 			pk.wholeBytesWritten,
 			dataBytesWritten))
 
@@ -1147,7 +1495,7 @@ func (pk *packer) writeAZip(trunc blob.Ref) (err error) {
 		toDelete := make([]blob.Ref, 0, len(dataRefsWritten)+len(schemaBlobs))
 		toDelete = append(toDelete, dataRefsWritten...)
 		toDelete = append(toDelete, schemaBlobs...)
-		if err := pk.s.small.RemoveBlobs(toDelete); err != nil {
+		if err := pk.s.small.RemoveBlobs(ctx, toDelete); err != nil {
 			// Can't really do anything about it and doesn't really matter, so
 			// just log for now.
 			pk.s.Logf("Error removing blobs from %s: %v", pk.s.small, err)
@@ -1171,12 +1519,12 @@ func (ze zipOpenError) Error() string {
 // foreachZipBlob calls fn for each blob in the zip pack blob
 // identified by zipRef.  If fn returns a non-nil error,
 // foreachZipBlob stops enumerating with that error.
-func (s *storage) foreachZipBlob(zipRef blob.Ref, fn func(BlobAndPos) error) error {
-	sb, err := blobserver.StatBlob(s.large, zipRef)
+func (s *storage) foreachZipBlob(ctx context.Context, zipRef blob.Ref, fn func(BlobAndPos) error) error {
+	sb, err := blobserver.StatBlob(ctx, s.large, zipRef)
 	if err != nil {
 		return err
 	}
-	zr, err := zip.NewReader(blob.ReaderAt(s.large, zipRef), int64(sb.Size))
+	zr, err := zip.NewReader(blob.ReaderAt(ctx, s.large, zipRef), int64(sb.Size))
 	if err != nil {
 		return zipOpenError{zipRef, err}
 	}
@@ -1223,6 +1571,7 @@ func (s *storage) foreachZipBlob(zipRef blob.Ref, fn func(BlobAndPos) error) err
 		return err
 	}
 	defer maniRC.Close()
+
 	var mf Manifest
 	if err := json.NewDecoder(maniRC).Decode(&mf); err != nil {
 		return err
@@ -1242,28 +1591,28 @@ func (s *storage) foreachZipBlob(zipRef blob.Ref, fn func(BlobAndPos) error) err
 
 // deleteZipPack deletes the zip pack file br, but only if that zip
 // file's parts are deleted already from the meta index.
-func (s *storage) deleteZipPack(br blob.Ref) error {
-	inUse, err := s.zipPartsInUse(br)
+func (s *storage) deleteZipPack(ctx context.Context, br blob.Ref) error {
+	inUse, err := s.zipPartsInUse(ctx, br)
 	if err != nil {
 		return err
 	}
 	if len(inUse) > 0 {
 		return fmt.Errorf("can't delete zip pack %v: %d parts in use: %v", br, len(inUse), inUse)
 	}
-	if err := s.large.RemoveBlobs([]blob.Ref{br}); err != nil {
+	if err := s.large.RemoveBlobs(ctx, []blob.Ref{br}); err != nil {
 		return err
 	}
 	return s.meta.Delete("d:" + br.String())
 }
 
-func (s *storage) zipPartsInUse(br blob.Ref) ([]blob.Ref, error) {
+func (s *storage) zipPartsInUse(ctx context.Context, br blob.Ref) ([]blob.Ref, error) {
 	var (
 		mu    sync.Mutex
 		inUse []blob.Ref
 	)
 	var grp syncutil.Group
 	gate := syncutil.NewGate(20) // arbitrary constant
-	err := s.foreachZipBlob(br, func(bap BlobAndPos) error {
+	err := s.foreachZipBlob(ctx, br, func(bap BlobAndPos) error {
 		gate.Start()
 		grp.Go(func() error {
 			defer gate.Done()
@@ -1323,8 +1672,9 @@ type Manifest struct {
 	WholePartIndex int `json:"wholePartIndex"`
 
 	// DataBlobsOrigin is the blobref of the contents of the first
-	// file in the zip pack file. It is the origin of all the logical data
-	// blobs referenced in DataBlobs.
+	// file in the zip pack file. This first file is the actual data,
+	// or a part of it, that the rest of this zip is describing or
+	// referencing.
 	DataBlobsOrigin blob.Ref `json:"dataBlobsOrigin"`
 
 	// DataBlobs describes all the logical blobs that are

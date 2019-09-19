@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,18 +28,19 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/buildinfo"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/server/app"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/buildinfo"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/server/app"
+	"perkeep.org/pkg/types/camtypes"
 
 	"cloud.google.com/go/compute/metadata"
 	"go4.org/jsonconfig"
@@ -155,7 +156,7 @@ type storageStatus struct {
 
 func (sh *StatusHandler) currentStatus() *status {
 	res := &status{
-		Version: buildinfo.Version(),
+		Version: buildinfo.Summary(),
 		GoInfo:  fmt.Sprintf("%s %s/%s cgo=%v", runtime.Version(), runtime.GOOS, runtime.GOARCH, cgoEnabled),
 		Storage: make(map[string]storageStatus),
 		Sync:    make(map[string]syncStatus),
@@ -235,17 +236,17 @@ func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Reque
 			fmt.Fprintf(rw, p, a...)
 		}
 	}
-	f("<html><head><title>camlistored status</title></head>")
+	f("<html><head><title>perkeepd status</title></head>")
 	f("<body>")
 
-	f("<h1>camlistored status</h1>")
+	f("<h1>perkeepd status</h1>")
 
 	f("<h2>Versions</h2><ul>")
 	var envStr string
 	if env.OnGCE() {
 		envStr = " (on GCE)"
 	}
-	f("<li><b>Camlistore</b>: %s%s</li>", html.EscapeString(buildinfo.Version()), envStr)
+	f("<li><b>Perkeep</b>: %s%s</li>", html.EscapeString(buildinfo.Summary()), envStr)
 	f("<li><b>Go</b>: %s/%s %s, cgo=%v</li>", runtime.GOOS, runtime.GOARCH, runtime.Version(), cgoEnabled)
 	f("<li><b>djpeg</b>: %s", html.EscapeString(buildinfo.DjpegStatus()))
 	f("</ul>")
@@ -253,22 +254,27 @@ func (sh *StatusHandler) serveStatusHTML(rw http.ResponseWriter, req *http.Reque
 	f("<h2>Logs</h2><ul>")
 	f("  <li><a href='/debug/config'>/debug/config</a> - server config</li>\n")
 	if env.OnGCE() {
-		f("  <li><a href='/debug/logs/camlistored'>camlistored logs on Google Cloud Logging</a></li>\n")
+		f("  <li><a href='/debug/logs/perkeepd'>perkeepd logs on Google Cloud Logging</a></li>\n")
 		f("  <li><a href='/debug/logs/system'>system logs from Google Compute Engine</a></li>\n")
 	}
 	f("</ul>")
 
 	f("<h2>Admin</h2>")
 	f("<ul>")
-	f("  <li><form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button>")
-	f("<input type='checkbox' name='reindex'> reindex <input type='checkbox' name='recovery'> recovery</form></li>")
+	f("  <li><form method='post' action='restart' onsubmit='return confirm(\"Really restart now?\")'><button>restart server</button> ")
+	f("<input type='checkbox' name='reindex' id='reindex'><label for='reindex'> reindex </label>")
+	f("<select name='recovery'><option selected='true' disabled='disabled'>select recovery mode</option>")
+	f("<option value='0'>no recovery</option>")
+	f("<option value='1'>fast recovery</option>")
+	f("<option value='2'>full recovery</option>")
+	f("</select>")
 	f("</form></li>")
 	if env.OnGCE() {
 		console, err := sh.googleCloudConsole()
 		if err != nil {
 			log.Printf("error getting Google Cloud Console URL: %v", err)
 		} else {
-			f("   <li><b>Updating:</b> When a new image for Camlistore on GCE is available, you can update by hitting \"Reset\" (or \"Stop\", then \"Start\") for your instance on your <a href='%s'>Google Cloud Console</a>.<br>Alternatively, you can ssh to your instance and restart the Camlistore service with: <b>sudo systemctl restart camlistored</b>.</li>", console)
+			f("   <li><b>Updating:</b> When a new image for Perkeep on GCE is available, you can update by hitting \"Reset\" (or \"Stop\", then \"Start\") for your instance on your <a href='%s'>Google Cloud Console</a>.<br>Alternatively, you can ssh to your instance and restart the Perkeep service with: <b>sudo systemctl restart perkeepd</b>.</li>", console)
 		}
 	}
 	f("</ul>")
@@ -314,15 +320,15 @@ func (sh *StatusHandler) serveRestart(rw http.ResponseWriter, req *http.Request)
 	}
 
 	reindex := (req.FormValue("reindex") == "on")
-	recovery := (req.FormValue("recovery") == "on")
+	recovery, _ := strconv.Atoi(req.FormValue("recovery"))
 
-	log.Println("Restarting camlistored")
+	log.Println("Restarting perkeepd")
 	rw.Header().Set("Connection", "close")
 	http.Redirect(rw, req, sh.prefix, http.StatusFound)
 	if f, ok := rw.(http.Flusher); ok {
 		f.Flush()
 	}
-	osutil.RestartProcess(fmt.Sprintf("-reindex=%t", reindex), fmt.Sprintf("-recovery=%t", recovery))
+	osutil.RestartProcess(fmt.Sprintf("-reindex=%t", reindex), fmt.Sprintf("-recovery=%d", recovery))
 }
 
 var cgoEnabled bool

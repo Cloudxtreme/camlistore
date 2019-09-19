@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,8 @@ import (
 	"net/url"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 var urle = url.QueryEscape
@@ -48,17 +47,10 @@ func (s *dupSkipper) Dup(v string) bool {
 	return false
 }
 
-// ClaimsAttrValue returns the value of attr from claims,
-// or the empty string if not found.
-// Claims should be sorted by claim.Date.
-func ClaimsAttrValue(claims []camtypes.Claim, attr string, at time.Time, signerFilter blob.Ref) string {
-	return claimsIntfAttrValue(claimSlice(claims), attr, at, signerFilter)
-}
-
 // claimPtrsAttrValue returns the value of attr from claims,
 // or the empty string if not found.
 // Claims should be sorted by claim.Date.
-func claimPtrsAttrValue(claims []*camtypes.Claim, attr string, at time.Time, signerFilter blob.Ref) string {
+func claimPtrsAttrValue(claims []*camtypes.Claim, attr string, at time.Time, signerFilter SignerRefSet) string {
 	return claimsIntfAttrValue(claimPtrSlice(claims), attr, at, signerFilter)
 }
 
@@ -79,7 +71,9 @@ func (s claimPtrSlice) Claim(i int) *camtypes.Claim { return s[i] }
 
 // claimsIntfAttrValue finds the value of an attribute in a list of claims
 // or empty string if not found. claims must be non-nil.
-func claimsIntfAttrValue(claims claimsIntf, attr string, at time.Time, signerFilter blob.Ref) string {
+// If signerFilter contains any refs, a claim is only taken into account if it
+// has been signed by one of the given signer refs.
+func claimsIntfAttrValue(claims claimsIntf, attr string, at time.Time, signerFilter SignerRefSet) string {
 	if claims == nil {
 		panic("nil claims argument in claimsIntfAttrValue")
 	}
@@ -99,9 +93,13 @@ func claimsIntfAttrValue(claims claimsIntf, attr string, at time.Time, signerFil
 		if cl.Attr != attr || cl.Date.After(at) {
 			continue
 		}
-		if signerFilter.Valid() && signerFilter != cl.Signer {
-			continue
+
+		if len(signerFilter) > 0 {
+			if !signerFilter.blobMatches(cl.Signer) {
+				continue
+			}
 		}
+
 		switch cl.Type {
 		case string(schema.DelAttributeClaim):
 			if cl.Value == "" {

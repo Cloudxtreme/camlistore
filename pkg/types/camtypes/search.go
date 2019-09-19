@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/magic"
+	"perkeep.org/internal/magic"
+	"perkeep.org/pkg/blob"
 
 	"go4.org/types"
 )
@@ -93,10 +93,8 @@ type FileInfo struct {
 	// FileName is the base name of the file or directory.
 	FileName string `json:"fileName"`
 
-	// TODO(mpl): I've noticed that Size is actually set to the
-	// number of entries in the dir. fix the doc or the behaviour?
-
-	// Size is the size of file. It is not set for directories.
+	// Size is the size of file, or if a directory, the number of
+	// its children.
 	Size int64 `json:"size"`
 
 	// MIMEType may be set for files, but never for directories.
@@ -139,7 +137,7 @@ func (fi *FileInfo) IsVideo() bool {
 		return true
 	}
 
-	if magic.HasExtension(fi.FileName, magic.VideoExtensions) {
+	if magic.IsVideoFileName(fi.FileName) {
 		return true
 	}
 
@@ -214,7 +212,7 @@ type BlobMeta struct {
 	Ref  blob.Ref
 	Size uint32
 
-	// CamliType is non-empty if this blob is a Camlistore JSON
+	// CamliType is non-empty if this blob is a Perkeep JSON
 	// schema blob. If so, this is its "camliType" attribute.
 	CamliType string
 
@@ -231,7 +229,8 @@ type SearchErrorResponse struct {
 type FileSearchResponse struct {
 	SearchErrorResponse
 
-	Files []blob.Ref `json:"files"` // Refs of the result files. Never nil.
+	// Files maps a requested wholeRef to the files found for it. Never nil.
+	Files map[string][]blob.Ref `json:"files"`
 }
 
 // Location describes a file or permanode that has a location.
@@ -279,27 +278,29 @@ type LocationBounds struct {
 	East  float64 `json:"east"`
 }
 
-func (l LocationBounds) isEmpty() bool {
-	return l == (LocationBounds{}) ||
-		l.North == 0 &&
-			l.South == 0 &&
-			l.West == 0 &&
-			l.East == 0
+// SpansDateLine reports whether b spans the antimeridian international date line.
+func (b LocationBounds) SpansDateLine() bool { return b.East < b.West }
+
+// Contains reports whether loc is in the bounds b.
+func (b LocationBounds) Contains(loc Location) bool {
+	if b.SpansDateLine() {
+		return loc.Longitude >= b.West || loc.Longitude <= b.East
+	}
+	return loc.Longitude >= b.West && loc.Longitude <= b.East
 }
 
-func (l *LocationBounds) isWithinLongitude(loc Location) bool {
-	if l.East < l.West {
-		// l is spanning over antimeridian
-		return loc.Longitude >= l.West || loc.Longitude <= l.East
+func (b LocationBounds) Width() float64 {
+	if !b.SpansDateLine() {
+		return b.East - b.West
 	}
-	return loc.Longitude >= l.West && loc.Longitude <= l.East
+	return b.East - b.West + 360
 }
 
 // Expand returns a new LocationBounds nb. If either of loc coordinates is
 // outside of b, nb is the dimensions of b expanded as little as possible in
 // order to include loc. Otherwise, nb is just a copy of b.
 func (b LocationBounds) Expand(loc Location) LocationBounds {
-	if b.isEmpty() {
+	if b == (LocationBounds{}) {
 		return LocationBounds{
 			North: loc.Latitude,
 			South: loc.Latitude,
@@ -318,7 +319,7 @@ func (b LocationBounds) Expand(loc Location) LocationBounds {
 	} else if loc.Latitude < nb.South {
 		nb.South = loc.Latitude
 	}
-	if nb.isWithinLongitude(loc) {
+	if nb.Contains(loc) {
 		return nb
 	}
 	center := nb.center()

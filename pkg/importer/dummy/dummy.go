@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package dummy is an example importer for development purposes.
-package dummy // import "camlistore.org/pkg/importer/dummy"
+package dummy // import "perkeep.org/pkg/importer/dummy"
 
 import (
 	"fmt"
@@ -26,11 +26,11 @@ import (
 	"strconv"
 	"strings"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/schema"
 )
 
 func init() {
@@ -59,25 +59,26 @@ type imp struct {
 	// resources. Some importers (e.g. Foursquare) use this space
 	// to cache mappings from site-specific global resource URLs
 	// (e.g. category icons) to the fileref once it's been copied
-	// into Camlistore.
+	// into Perkeep.
 
 }
 
-func (*imp) SupportsIncremental() bool {
-	// SupportsIncremental signals to the importer host that this
-	// importer has been optimized to be run regularly (e.g. every 5
-	// minutes or half hour).  If it returns false, the user must
-	// manually start imports.
-	return false
-}
+func (*imp) Properties() importer.Properties {
+	return importer.Properties{
+		// NeedsAPIKey tells the importer framework that this
+		// importer will be calling the
+		// {RunContext,SetupContext}.Credentials method to get
+		// the OAuth client ID & client secret, which may be
+		// either configured on the importer permanode, or
+		// statically in the server's config file.
+		NeedsAPIKey: true,
 
-func (*imp) NeedsAPIKey() bool {
-	// This tells the importer framework that we our importer will
-	// be calling the {RunContext,SetupContext}.Credentials method
-	// to get the OAuth client ID & client secret, which may be
-	// either configured on the importer permanode, or statically
-	// in the server's config file.
-	return true
+		// SupportsIncremental signals to the importer host that this
+		// importer has been optimized to be run regularly (e.g. every 5
+		// minutes or half hour).  If it returns false, the user must
+		// manually start imports.
+		SupportsIncremental: false,
+	}
 }
 
 const (
@@ -158,7 +159,7 @@ func (im *imp) Run(ctx *importer.RunContext) (err error) {
 		log.Printf("Dummy importer returned: %v", err)
 	}()
 	root := ctx.RootNode()
-	fileRef, err := schema.WriteFileFromReader(ctx.Host.Target(), "foo.txt", strings.NewReader("Some file.\n"))
+	fileRef, err := schema.WriteFileFromReader(ctx.Context(), ctx.Host.Target(), "foo.txt", strings.NewReader("Some file.\n"))
 	if err != nil {
 		return err
 	}

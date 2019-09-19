@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,18 +29,18 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/test"
 	"github.com/gorilla/websocket"
+	"perkeep.org/pkg/test"
 )
 
 // Test that running:
-//   $ camput permanode
-// ... creates and uploads a permanode, and that we can camget it back.
+//   $ pk-put permanode
+// ... creates and uploads a permanode, and that we can pk-get it back.
 func TestCamputPermanode(t *testing.T) {
 	w := test.GetWorld(t)
 	br := w.NewPermanode(t)
 
-	out := test.MustRunCmd(t, w.Cmd("camget", br.String()))
+	out := test.MustRunCmd(t, w.Cmd("pk-get", br.String()))
 	mustHave := []string{
 		`{"camliVersion": 1,`,
 		`"camliSigner": "`,
@@ -59,23 +58,27 @@ func TestCamputPermanode(t *testing.T) {
 func TestWebsocketQuery(t *testing.T) {
 	w := test.GetWorld(t)
 	pn := w.NewPermanode(t)
-	test.MustRunCmd(t, w.Cmd("camput", "attr", pn.String(), "tag", "foo"))
+	test.MustRunCmd(t, w.Cmd("pk-put", "attr", pn.String(), "tag", "foo"))
 
 	check := func(err error) {
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%v", err)
 		}
 	}
 
 	const bufSize = 1 << 20
 
-	c, err := net.Dial("tcp", w.Addr())
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
+	dialer := websocket.Dialer{
+		ReadBufferSize:  bufSize,
+		WriteBufferSize: bufSize,
 	}
-	defer c.Close()
 
-	wc, _, err := websocket.NewClient(c, &url.URL{Host: w.Addr(), Path: w.SearchHandlerPath() + "ws"}, nil, bufSize, bufSize)
+	searchURL := (&url.URL{Scheme: "ws", Host: w.Addr(), Path: w.SearchHandlerPath() + "ws"}).String()
+	wsHeaders := http.Header{
+		"Origin": {"http://" + w.Addr()},
+	}
+
+	wc, _, err := dialer.Dial(searchURL, wsHeaders)
 	check(err)
 
 	msg, err := wc.NextWriter(websocket.TextMessage)
@@ -120,10 +123,11 @@ func TestWebsocketQuery(t *testing.T) {
 func TestInternalHandler(t *testing.T) {
 	w := test.GetWorld(t)
 	tests := map[string]int{
-		"/no-http-storage/":                                                    401,
-		"/no-http-handler/":                                                    401,
-		"/good-status/":                                                        200,
-		"/bs-and-maybe-also-index/camli":                                       400,
+		"/":                                   200,
+		"/test-that-root-handler-returns-404": 404,
+		"/no-http-storage/":                   401,
+		"/no-http-handler/":                   401,
+		"/bs-and-maybe-also-index/camli":      400,
 		"/bs/camli/sha1-b2201302e129a4396a323cb56283cddeef11bbe8":              404,
 		"/no-http-storage/camli/sha1-b2201302e129a4396a323cb56283cddeef11bbe8": 401,
 	}
@@ -146,13 +150,13 @@ func TestNoTestingLinking(t *testing.T) {
 	}
 	help, err := w.Help()
 	if err != nil {
-		t.Fatalf("Error running camlistored -help: %v, %v", string(help), err)
+		t.Fatalf("Error running perkeepd -help: %v, %v", string(help), err)
 	}
 	sc := bufio.NewScanner(bytes.NewReader(help))
 	for sc.Scan() {
 		l := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(l, "-test.") {
-			t.Fatal("test flag detected in help output of camlistored, because testing pkg got linked into binary")
+			t.Fatal("test flag detected in help output of perkeepd, because testing pkg got linked into binary")
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -175,8 +179,8 @@ func mustWriteFile(t *testing.T, path, contents string) {
 	}
 }
 
-// Run camput in the environment it runs in under the Android app.
-// This matches how camput is used in UploadThread.java.
+// Run pk-put in the environment it runs in under the Android app.
+// This matches how pk-put is used in UploadThread.java.
 func TestAndroidCamputFile(t *testing.T) {
 	w := test.GetWorld(t)
 	// UploadThread.java sets:
@@ -186,11 +190,11 @@ func TestAndroidCamputFile(t *testing.T) {
 	//   CAMPUT_ANDROID_OUTPUT=1
 	cacheDir, clean := mustTempDir(t)
 	defer clean()
-	env := []string{
+	env := append(os.Environ(),
 		"CAMPUT_ANDROID_OUTPUT=1",
-		"CAMLI_CACHE_DIR=" + cacheDir,
-	}
-	cmd := w.CmdWithEnv("camput",
+		"CAMLI_CACHE_DIR="+cacheDir,
+	)
+	cmd := w.CmdWithEnv("pk-put",
 		env,
 		"--server="+w.ServerBaseURL(),
 		"file",
@@ -256,10 +260,10 @@ func TestAndroidCamputFile(t *testing.T) {
 	}()
 	select {
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for camput to end")
+		t.Fatal("timeout waiting for pk-put to end")
 	case err := <-waitc:
 		if err != nil {
-			t.Errorf("camput exited uncleanly: %v", err)
+			t.Errorf("pk-put exited uncleanly: %v", err)
 		}
 	}
 }

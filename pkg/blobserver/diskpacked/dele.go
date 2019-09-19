@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"os"
 	"strconv"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
 var errNoPunch = errors.New("punchHole not supported")
@@ -54,7 +54,7 @@ func (s *storage) delete(br blob.Ref) error {
 		return fmt.Errorf("delete: cannot find header surroundings, found %q", b)
 	}
 	b = b[1 : k-1] // "sha1-xxxxxxxxxxxxxxxxxx nnnn" - everything between []
-	off += 1
+	off++
 
 	// Replace b with "xxxx-000000000"
 	dash := bytes.IndexByte(b, '-')

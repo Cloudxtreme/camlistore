@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,16 +24,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/jsonsign"
 )
 
 const (
 	// default secret ring used in tests and in devcam commands
 	defaultSecring = "pkg/jsonsign/testdata/test-secring.gpg"
 	// public ID of the GPG key in defaultSecring
-	defaultIdentity = "26F5ABDA"
+	defaultIdentity = "2931A67C26F5ABDA"
 )
 
 var (
@@ -146,7 +146,7 @@ func setCamdevVarsFor(e *Env, altkey bool) {
 	if err != nil {
 		panic(err)
 	}
-	pubKeyRef := blob.SHA1FromString(armoredPublicKey)
+	pubKeyRef := blob.RefFromString(armoredPublicKey)
 
 	setenv("CAMLI_SECRET_RING", secring)
 	setenv("CAMLI_KEYID", identity)

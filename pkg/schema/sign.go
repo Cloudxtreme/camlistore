@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package schema
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -25,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonsign"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/jsonsign"
 
 	"golang.org/x/crypto/openpgp"
 )
@@ -34,7 +35,7 @@ import (
 // A Signer signs the JSON schema blobs that require signing, such as claims
 // and permanodes.
 type Signer struct {
-	keyId      string // short one; 8 capital hex digits
+	keyID      string // short one; 8 capital hex digits
 	pubref     blob.Ref
 	privEntity *openpgp.Entity
 
@@ -44,12 +45,22 @@ type Signer struct {
 }
 
 func (s *Signer) String() string {
-	return fmt.Sprintf("[*schema.Signer for key=%s pubkey=%s]", s.keyId, s.pubref)
+	return fmt.Sprintf("[*schema.Signer for key=%s pubkey=%s]", s.keyID, s.pubref)
 }
 
-// KeyID returns the short 8 capital hex digit GPG key ID
+// KeyID returns the short (8 digit) capital hex GPG key ID.
 func (s *Signer) KeyID() string {
-	return s.keyId
+	return s.keyID
+}
+
+// KeyIDLong returns the long (16 digit) capital hex GPG key ID.
+func (s *Signer) KeyIDLong() string {
+	return s.privEntity.PrivateKey.KeyIdString()
+}
+
+// Entity returns the signer's entity, which includes its public and private keys.
+func (s *Signer) Entity() *openpgp.Entity {
+	return s.privEntity
 }
 
 // NewSigner returns an Signer given an armored public key's blobref,
@@ -57,7 +68,7 @@ func (s *Signer) KeyID() string {
 // The privateKeySource must be either an *openpgp.Entity or a string filename to a secret key.
 func NewSigner(pubKeyRef blob.Ref, armoredPubKey io.Reader, privateKeySource interface{}) (*Signer, error) {
 	hash := pubKeyRef.Hash()
-	keyId, armoredPubKeyString, err := jsonsign.ParseArmoredPublicKey(io.TeeReader(armoredPubKey, hash))
+	keyID, armoredPubKeyString, err := jsonsign.ParseArmoredPublicKey(io.TeeReader(armoredPubKey, hash))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +81,7 @@ func NewSigner(pubKeyRef blob.Ref, armoredPubKey io.Reader, privateKeySource int
 	case *openpgp.Entity:
 		privateKey = v
 	case string:
-		privateKey, err = jsonsign.EntityFromSecring(keyId, v)
+		privateKey, err = jsonsign.EntityFromSecring(keyID, v)
 		if err != nil {
 			return nil, err
 		}
@@ -82,7 +93,7 @@ func NewSigner(pubKeyRef blob.Ref, armoredPubKey io.Reader, privateKeySource int
 	}
 
 	return &Signer{
-		keyId:      keyId,
+		keyID:      keyID,
 		pubref:     pubKeyRef,
 		privEntity: privateKey,
 		baseSigReq: jsonsign.SignRequest{
@@ -95,8 +106,8 @@ func NewSigner(pubKeyRef blob.Ref, armoredPubKey io.Reader, privateKeySource int
 			EntityFetcher: entityFetcherFunc(func(wantKeyId string) (*openpgp.Entity, error) {
 				if privateKey.PrivateKey.KeyIdString() != wantKeyId &&
 					privateKey.PrivateKey.KeyIdShortString() != wantKeyId {
-					return nil, fmt.Errorf("jsonsign code unexpectedly requested keyId %q; only have %q",
-						wantKeyId, keyId)
+					return nil, fmt.Errorf("jsonsign code unexpectedly requested keyID %q; only have %q",
+						wantKeyId, keyID)
 				}
 				return privateKey, nil
 			}),
@@ -106,16 +117,16 @@ func NewSigner(pubKeyRef blob.Ref, armoredPubKey io.Reader, privateKeySource int
 
 // SignJSON signs the provided json at the optional time t.
 // If t is the zero Time, the current time is used.
-func (s *Signer) SignJSON(json string, t time.Time) (string, error) {
+func (s *Signer) SignJSON(ctx context.Context, json string, t time.Time) (string, error) {
 	sr := s.baseSigReq
 	sr.UnsignedJSON = json
 	sr.SignatureTime = t
-	return sr.Sign()
+	return sr.Sign(ctx)
 }
 
 type memoryBlobFetcher map[blob.Ref]func() (size uint32, rc io.ReadCloser)
 
-func (m memoryBlobFetcher) Fetch(br blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (m memoryBlobFetcher) Fetch(ctx context.Context, br blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	fn, ok := m[br]
 	if !ok {
 		return nil, 0, os.ErrNotExist
@@ -124,8 +135,8 @@ func (m memoryBlobFetcher) Fetch(br blob.Ref) (file io.ReadCloser, size uint32, 
 	return
 }
 
-type entityFetcherFunc func(keyId string) (*openpgp.Entity, error)
+type entityFetcherFunc func(keyID string) (*openpgp.Entity, error)
 
-func (f entityFetcherFunc) FetchEntity(keyId string) (*openpgp.Entity, error) {
-	return f(keyId)
+func (f entityFetcherFunc) FetchEntity(keyID string) (*openpgp.Entity, error) {
+	return f(keyID)
 }

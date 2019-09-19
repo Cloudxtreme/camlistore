@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ limitations under the License.
 // Package asserts provides a bad implementation of test predicate
 // helpers. This package should either go away or dramatically
 // improve.
-package asserts // import "camlistore.org/pkg/test/asserts"
+package asserts // import "perkeep.org/pkg/test/asserts"
 
 import (
 	"strings"

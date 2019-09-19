@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ package client
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,20 +29,18 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/protocol"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/hashutil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/protocol"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/schema"
 )
-
-// multipartOverhead is how many extra bytes mime/multipart's
-// Writer adds around content
-var multipartOverhead = calculateMultipartOverhead()
 
 // UploadHandle contains the parameters is a request to upload a blob.
 type UploadHandle struct {
@@ -90,16 +88,26 @@ type statResponse struct {
 
 type ResponseFormatError error
 
-func calculateMultipartOverhead() int64 {
-	var b bytes.Buffer
-	w := multipart.NewWriter(&b)
-	part, _ := w.CreateFormFile("0", "0")
+var (
+	multipartOnce     sync.Once
+	multipartOverhead int64
+)
 
-	dummyContents := []byte("0")
-	part.Write(dummyContents)
+// multipartOverhead is how many extra bytes mime/multipart's
+// Writer adds around content
+func getMultipartOverhead() int64 {
+	multipartOnce.Do(func() {
+		var b bytes.Buffer
+		w := multipart.NewWriter(&b)
+		part, _ := w.CreateFormFile("0", "0")
 
-	w.Close()
-	return int64(b.Len()) - 3 // remove what was added
+		dummyContents := []byte("0")
+		part.Write(dummyContents)
+
+		w.Close()
+		multipartOverhead = int64(b.Len()) - 3 // remove what was added
+	})
+	return multipartOverhead
 }
 
 func parseStatResponse(res *http.Response) (*statResponse, error) {
@@ -122,7 +130,7 @@ func parseStatResponse(res *http.Response) (*statResponse, error) {
 
 // NewUploadHandleFromString returns an upload handle
 func NewUploadHandleFromString(data string) *UploadHandle {
-	bref := blob.SHA1FromString(data)
+	bref := blob.RefFromString(data)
 	r := strings.NewReader(data)
 	return &UploadHandle{BlobRef: bref, Size: uint32(len(data)), Contents: r}
 }
@@ -133,7 +141,7 @@ func (c *Client) responseJSONMap(requestName string, resp *http.Response) (map[s
 	if resp.StatusCode != 200 {
 		c.printf("After %s request, failed to JSON from response; status code is %d", requestName, resp.StatusCode)
 		io.Copy(os.Stderr, resp.Body)
-		return nil, fmt.Errorf("After %s request, HTTP response code is %d; no JSON to parse.", requestName, resp.StatusCode)
+		return nil, fmt.Errorf("after %s request, HTTP response code is %d; no JSON to parse", requestName, resp.StatusCode)
 	}
 	jmap := make(map[string]interface{})
 	if err := httputil.DecodeJSON(resp, &jmap); err != nil {
@@ -149,9 +157,9 @@ type statReq struct {
 	errc chan<- error         // written to on both failure and success (after any dest)
 }
 
-func (c *Client) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (c *Client) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	if c.sto != nil {
-		return c.sto.StatBlobs(dest, blobs)
+		return c.sto.StatBlobs(ctx, blobs, fn)
 	}
 	var needStat []blob.Ref
 	for _, br := range blobs {
@@ -159,116 +167,31 @@ func (c *Client) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 			panic("invalid blob")
 		}
 		if size, ok := c.haveCache.StatBlobCache(br); ok {
-			dest <- blob.SizedRef{br, size}
-		} else {
-			if needStat == nil {
-				needStat = make([]blob.Ref, 0, len(blobs))
+			if err := fn(blob.SizedRef{br, size}); err != nil {
+				return err
 			}
+		} else {
 			needStat = append(needStat, br)
 		}
 	}
 	if len(needStat) == 0 {
 		return nil
 	}
-
-	// Here begins all the batching logic. In a SPDY world, this
-	// will all be somewhat useless, so consider detecting SPDY on
-	// the underlying connection and just always calling doStat
-	// instead.  The one thing this code below is also cut up
-	// >1000 stats into smaller batches.  But with SPDY we could
-	// even just do lots of little 1-at-a-time stats.
-
-	var errcs []chan error // one per blob to stat
-
-	c.pendStatMu.Lock()
-	{
-		if c.pendStat == nil {
-			c.pendStat = make(map[blob.Ref][]statReq)
-		}
-		for _, blob := range needStat {
-			errc := make(chan error, 1)
-			errcs = append(errcs, errc)
-			c.pendStat[blob] = append(c.pendStat[blob], statReq{blob, dest, errc})
-		}
-	}
-	c.pendStatMu.Unlock()
-
-	// Kick off at least one worker. It may do nothing and lose
-	// the race, but somebody will handle our requests in
-	// pendStat.
-	go c.doSomeStats()
-
-	for _, errc := range errcs {
-		if err := <-errc; err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-const maxStatPerReq = 1000 // TODO: detect this from client discovery? add it on server side too.
-
-func (c *Client) doSomeStats() {
-	c.httpGate.Start()
-	defer c.httpGate.Done()
-
-	var batch map[blob.Ref][]statReq
-
-	c.pendStatMu.Lock()
-	{
-		if len(c.pendStat) == 0 {
-			// Lost race. Another batch got these.
-			c.pendStatMu.Unlock()
-			return
-		}
-		batch = make(map[blob.Ref][]statReq)
-		for br, reqs := range c.pendStat {
-			batch[br] = reqs
-			delete(c.pendStat, br)
-			if len(batch) == maxStatPerReq {
-				go c.doSomeStats() // kick off next batch
-				break
-			}
-		}
-	}
-	c.pendStatMu.Unlock()
-
-	if env.DebugUploads() {
-		println("doing stat batch of", len(batch))
-	}
-
-	blobs := make([]blob.Ref, 0, len(batch))
-	for br := range batch {
-		blobs = append(blobs, br)
-	}
-
-	ourDest := make(chan blob.SizedRef)
-	errc := make(chan error, 1)
-	go func() {
-		// false for not gated, since we already grabbed the
-		// token at the beginning of this function.
-		errc <- c.doStat(ourDest, blobs, 0, false)
-		close(ourDest)
-	}()
-
-	for sb := range ourDest {
-		for _, req := range batch[sb.Ref] {
-			req.dest <- sb
-		}
-	}
-
-	// Copy the doStat's error to all waiters for all blobrefs in this batch.
-	err := <-errc
-	for _, reqs := range batch {
-		for _, req := range reqs {
-			req.errc <- err
-		}
-	}
+	return blobserver.StatBlobsParallelHelper(ctx, blobs, fn, c.httpGate, func(br blob.Ref) (workerSB blob.SizedRef, err error) {
+		err = c.doStat(ctx, []blob.Ref{br}, 0, false, func(sb blob.SizedRef) error {
+			workerSB = sb
+			c.haveCache.NoteBlobExists(sb.Ref, sb.Size)
+			return fn(sb)
+		})
+		return
+	})
 }
 
 // doStat does an HTTP request for the stat. the number of blobs is used verbatim. No extra splitting
 // or batching is done at this layer.
-func (c *Client) doStat(dest chan<- blob.SizedRef, blobs []blob.Ref, wait time.Duration, gated bool) error {
+// The semantics are the same as blobserver.BlobStatter.
+// gate controls whether it uses httpGate to pause on requests.
+func (c *Client) doStat(ctx context.Context, blobs []blob.Ref, wait time.Duration, gated bool, fn func(blob.SizedRef) error) error {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "camliversion=1")
 	if wait > 0 {
@@ -286,7 +209,7 @@ func (c *Client) doStat(dest chan<- blob.SizedRef, blobs []blob.Ref, wait time.D
 	if err != nil {
 		return err
 	}
-	req := c.newRequest("POST", fmt.Sprintf("%s/camli/stat", pfx), &buf)
+	req := c.newRequest(ctx, "POST", fmt.Sprintf("%s/camli/stat", pfx), &buf)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	var resp *http.Response
@@ -310,9 +233,10 @@ func (c *Client) doStat(dest chan<- blob.SizedRef, blobs []blob.Ref, wait time.D
 	if err != nil {
 		return err
 	}
-
 	for _, sb := range stat.HaveMap {
-		dest <- sb
+		if err := fn(sb); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -332,7 +256,7 @@ func (h *UploadHandle) readerAndSize() (io.Reader, int64, error) {
 }
 
 // Upload uploads a blob, as described by the provided UploadHandle parameters.
-func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
+func (c *Client) Upload(ctx context.Context, h *UploadHandle) (*PutResult, error) {
 	errorf := func(msg string, arg ...interface{}) (*PutResult, error) {
 		err := fmt.Errorf(msg, arg...)
 		c.printf("%v", err)
@@ -356,7 +280,7 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 
 	if c.sto != nil {
 		// TODO: stat first so we can show skipped?
-		_, err := blobserver.Receive(c.sto, h.BlobRef, bodyReader)
+		_, err := blobserver.Receive(ctx, c.sto, h.BlobRef, bodyReader)
 		if err != nil {
 			return nil, err
 		}
@@ -381,7 +305,7 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 
 	if !h.SkipStat {
 		url_ := fmt.Sprintf("%s/camli/stat", pfx)
-		req := c.newRequest("POST", url_, strings.NewReader("camliversion=1&blob1="+blobrefStr))
+		req := c.newRequest(ctx, "POST", url_, strings.NewReader("camliversion=1&blob1="+blobrefStr))
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 		resp, err := c.doReqGated(req)
@@ -442,13 +366,13 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 	}()
 
 	uploadURL := fmt.Sprintf("%s/camli/upload", pfx)
-	req := c.newRequest("POST", uploadURL)
+	req := c.newRequest(ctx, "POST", uploadURL)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	if h.Vivify {
 		req.Header.Add("X-Camlistore-Vivify", "1")
 	}
 	req.Body = ioutil.NopCloser(pipeReader)
-	req.ContentLength = multipartOverhead + bodySize + int64(len(blobrefStr))*2
+	req.ContentLength = getMultipartOverhead() + bodySize + int64(len(blobrefStr))*2
 	resp, err := c.doReqGated(req)
 	if err != nil {
 		return errorf("upload http error: %v", err)
@@ -512,7 +436,7 @@ func (c *Client) Upload(h *UploadHandle) (*PutResult, error) {
 		return pr, nil
 	}
 
-	return nil, errors.New("Server didn't receive blob.")
+	return nil, errors.New("server didn't receive blob")
 }
 
 // FileUploadOptions is optionally provided to UploadFile.
@@ -530,8 +454,8 @@ type FileUploadOptions struct {
 // the server, they're not uploaded.
 //
 // Note: this method is still a work in progress, and might change to accommodate
-// the needs of camput file.
-func (cl *Client) UploadFile(filename string, contents io.Reader, opts *FileUploadOptions) (blob.Ref, error) {
+// the needs of pk-put file.
+func (c *Client) UploadFile(ctx context.Context, filename string, contents io.Reader, opts *FileUploadOptions) (blob.Ref, error) {
 	fileMap := schema.NewFileMap(filename)
 	if opts != nil && opts.FileInfo != nil {
 		fileMap = schema.NewCommonFileMap(filename, opts.FileInfo)
@@ -542,24 +466,20 @@ func (cl *Client) UploadFile(filename string, contents io.Reader, opts *FileUplo
 	}
 	fileMap.SetType("file")
 
-	var wholeRef blob.Ref
+	var wholeRef []blob.Ref
 	if opts != nil && opts.WholeRef.Valid() {
-		wholeRef = opts.WholeRef
+		wholeRef = append(wholeRef, opts.WholeRef)
 	} else {
 		var buf bytes.Buffer
 		var err error
-		wholeRef, err = cl.wholeRef(io.TeeReader(contents, &buf))
+		wholeRef, err = c.wholeRef(io.TeeReader(contents, &buf))
 		if err != nil {
 			return blob.Ref{}, err
 		}
 		contents = io.MultiReader(&buf, contents)
 	}
 
-	// TODO(mpl): should we consider the case (not covered by fileMapFromDuplicate)
-	// where all the parts are there, but the file schema/blob does not exist? Can that
-	// even happen ? I'm naively assuming it can't for now, since that's what camput file
-	// does too.
-	fileRef, err := cl.fileMapFromDuplicate(fileMap, wholeRef)
+	fileRef, err := c.fileMapFromDuplicate(ctx, fileMap, wholeRef)
 	if err != nil {
 		return blob.Ref{}, err
 	}
@@ -567,33 +487,40 @@ func (cl *Client) UploadFile(filename string, contents io.Reader, opts *FileUplo
 		return fileRef, nil
 	}
 
-	return schema.WriteFileMap(cl, fileMap, contents)
+	return schema.WriteFileMap(ctx, c, fileMap, contents)
 }
 
-func (cl *Client) wholeRef(contents io.Reader) (blob.Ref, error) {
-	// TODO(mpl): use a trackDigestReader once pulled from camput.
-	// and allow for different hash type. maybe also move to another pkg.
-	h := sha1.New()
-	_, err := io.Copy(h, contents)
+// TODO(mpl): replace up.wholeFileDigest in pk-put with c.wholeRef maybe.
+
+// wholeRef returns the blob ref(s) of the regular file's contents
+// as if it were one entire blob (ignoring blob size limits).
+// By default, only one ref is returned, unless the server has advertised
+// that it has indexes calculated for other hash functions.
+func (c *Client) wholeRef(contents io.Reader) ([]blob.Ref, error) {
+	hasLegacySHA1, err := c.HasLegacySHA1()
 	if err != nil {
-		return blob.Ref{}, err
+		return nil, fmt.Errorf("cannot discover if server has legacy sha1: %v", err)
 	}
-	s := fmt.Sprintf("sha1-%x", h.Sum(nil))
-	ref, ok := blob.Parse(s)
-	if !ok {
-		return blob.Ref{}, fmt.Errorf("Invalid blobref: %q", s)
+	td := hashutil.NewTrackDigestReader(contents)
+	td.DoLegacySHA1 = hasLegacySHA1
+	if _, err := io.Copy(ioutil.Discard, td); err != nil {
+		return nil, err
 	}
-	return ref, nil
+	refs := []blob.Ref{blob.RefFromHash(td.Hash())}
+	if td.DoLegacySHA1 {
+		refs = append(refs, blob.RefFromHash(td.LegacySHA1Hash()))
+	}
+	return refs, nil
 }
 
 // fileMapFromDuplicate queries the server's search interface for an
-// existing file blob for the file contents of wholeRef.
+// existing file blob for the file contents any of wholeRef.
 // If the server has it, it's validated, and then fileMap (which must
 // already be partially populated) has its "parts" field populated,
 // and then fileMap is uploaded (if necessary).
 // If no file blob is found, a zero blob.Ref (and no error) is returned.
-func (cl *Client) fileMapFromDuplicate(fileMap *schema.Builder, wholeRef blob.Ref) (blob.Ref, error) {
-	dupFileRef, err := cl.SearchExistingFileSchema(wholeRef)
+func (c *Client) fileMapFromDuplicate(ctx context.Context, fileMap *schema.Builder, wholeRef []blob.Ref) (blob.Ref, error) {
+	dupFileRef, err := c.SearchExistingFileSchema(ctx, wholeRef...)
 	if err != nil {
 		return blob.Ref{}, err
 	}
@@ -601,7 +528,7 @@ func (cl *Client) fileMapFromDuplicate(fileMap *schema.Builder, wholeRef blob.Re
 		// because SearchExistingFileSchema returns blob.Ref{}, nil when file is not found.
 		return blob.Ref{}, nil
 	}
-	dupMap, err := cl.FetchSchemaBlob(dupFileRef)
+	dupMap, err := c.FetchSchemaBlob(ctx, dupFileRef)
 	if err != nil {
 		return blob.Ref{}, fmt.Errorf("could not find existing file blob for wholeRef %q: %v", wholeRef, err)
 	}
@@ -610,12 +537,14 @@ func (cl *Client) fileMapFromDuplicate(fileMap *schema.Builder, wholeRef blob.Re
 	if err != nil {
 		return blob.Ref{}, fmt.Errorf("could not write file map for wholeRef %q: %v", wholeRef, err)
 	}
-	bref := blob.SHA1FromString(json)
+	bref := blob.RefFromString(json)
 	if bref == dupFileRef {
 		// Unchanged (same filename, modtime, JSON serialization, etc)
+		// Different signer (e.g. existing file has a sha1 signer, and
+		// we're now using a sha224 signer) means we upload a new file schema.
 		return dupFileRef, nil
 	}
-	sbr, err := cl.ReceiveBlob(bref, strings.NewReader(json))
+	sbr, err := c.ReceiveBlob(ctx, bref, strings.NewReader(json))
 	if err != nil {
 		return blob.Ref{}, err
 	}

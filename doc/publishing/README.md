@@ -1,6 +1,6 @@
 # Publishing
 
-Camlistore delegates publishing to the publisher server application, which
+Perkeep delegates publishing to the publisher server application, which
 uses Go html templates (http://golang.org/pkg/text/template/) to publish
 pages.
 
@@ -15,7 +15,7 @@ there already is a go template (gallery.html), and css file (pics.css) that work
 together to provide publishing for image galleries. The dev server config
 (config/dev-server-config.json) already uses them. Here is how one would
 configure publishing for an image gallery in the server config
-($HOME/.config/camlistore/server-config.json):
+($HOME/.config/perkeep/server-config.json):
 
     "publish": {
       "/pics/": {
@@ -46,28 +46,28 @@ Keeping with the example above, it would serve
 http(s)://«camlihost:port»/pics/foo and http(s)://«camlihost:port»/pics/bar .
 
 The parameters for setting up the app's process ("listen", "backendURL", and
-"apiHost") are derived from the Camlistore server's "listen", and "baseURL", but
+"apiHost") are derived from the Perkeep server's "listen", and "baseURL", but
 should the need arise (e.g. with a proxy setup) they can be specified as well.
-See [serverconfig.Publish](https://camlistore.org/pkg/types/serverconfig/#Publish)
+See [serverconfig.Publish](https://perkeep.org/pkg/types/serverconfig/#Publish)
 type for the details.
 
 If you want to provide your own (Go) template, see
-[camlistore.org/pkg/publish](/pkg/publish) for the data structures and
+[perkeep.org/pkg/publish](/pkg/publish) for the data structures and
 functions available to the template.
 
-## Running Camlistore (and publisher) behind a reverse proxy
+## Running Perkeep (and publisher) behind a reverse proxy
 
-When Camlistore is serving in HTTP mode behind a HTTPS reverse proxy,
+When Perkeep is serving in HTTP mode behind a HTTPS reverse proxy,
 further settings are necessary to set up communication between publisher and
-the parent camlistored process.
+the parent perkeepd process.
 
 The settings are:
 
 * "listen" is the address publisher should listen on
-* "apiHost" URL prefix for publisher to connect to camlistored
-* "backendURL" URL for camlistored to reach publisher
+* "apiHost" URL prefix for publisher to connect to perkeepd
+* "backendURL" URL for perkeepd to reach publisher
 
-Assuming camlistored is serving HTTP on port 3179, and we want the to run publisher
+Assuming perkeepd is serving HTTP on port 3179, and we want the to run publisher
 on port 3155, the following settings can be used:
 
     "publish": {

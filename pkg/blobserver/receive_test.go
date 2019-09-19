@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,24 +18,27 @@ package blobserver_test
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/test"
 )
+
+var ctxbg = context.Background()
 
 func TestReceive(t *testing.T) {
 	sto := new(test.Fetcher)
 	data := []byte("some blob")
-	br := blob.SHA1FromBytes(data)
+	br := blob.RefFromBytes(data)
 
 	hub := blobserver.GetHub(sto)
 	ch := make(chan blob.Ref, 1)
 	hub.RegisterListener(ch)
 
-	sb, err := blobserver.Receive(sto, br, bytes.NewReader(data))
+	sb, err := blobserver.Receive(ctxbg, sto, br, bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,9 +61,9 @@ func TestReceive(t *testing.T) {
 func TestReceiveCorrupt(t *testing.T) {
 	sto := new(test.Fetcher)
 	data := []byte("some blob")
-	br := blob.SHA1FromBytes(data)
+	br := blob.RefFromBytes(data)
 	data[0] = 'X' // corrupt it
-	_, err := blobserver.Receive(sto, br, bytes.NewReader(data))
+	_, err := blobserver.Receive(ctxbg, sto, br, bytes.NewReader(data))
 	if err != blobserver.ErrCorruptBlob {
 		t.Errorf("Receive = %v; want ErrCorruptBlob", err)
 	}

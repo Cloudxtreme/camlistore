@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,13 @@ limitations under the License.
 package mongo
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 
-	"labix.org/v2/mgo"
+	"gopkg.in/mgo.v2"
 )
 
 const (
@@ -31,7 +32,7 @@ const (
 	mgoUniqueKeyErr = 11000
 )
 
-func (m *mongoStorage) ReceiveBlob(ref blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (m *mongoStorage) ReceiveBlob(ctx context.Context, ref blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	blobData, err := ioutil.ReadAll(source)
 	if err != nil {
 		return blob.SizedRef{}, err

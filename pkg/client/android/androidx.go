@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package android contains code specific to running the Camlistore client
+// Package android contains code specific to running the Perkeep client
 // code as a child process on Android. This removes ugly API from the
 // client package itself.
-package android // import "camlistore.org/pkg/client/android"
+package android // import "perkeep.org/pkg/client/android"
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -39,10 +40,10 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/schema"
 )
 
 // TODO(mpl): distinguish CAMPUT, CAMGET, etc
@@ -285,7 +286,7 @@ func TLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
-// NoteFileUploaded is a hook for camput to report that a file
+// NoteFileUploaded is a hook for pk-put to report that a file
 // was uploaded.  TODO: move this to pkg/client/android probably.
 func NoteFileUploaded(fullPath string, uploaded bool) {
 	if !IsChild() {
@@ -299,9 +300,9 @@ func NoteFileUploaded(fullPath string, uploaded bool) {
 	Printf("FILE_UPLOADED %s\n", fullPath)
 }
 
-// androidStatusReceiver is a blobserver.StatReceiver wrapper that
+// StatusReceiver is a blobserver.StatReceiver wrapper that
 // reports the full filename path and size of uploaded blobs.
-// The android app wrapping camput watches stdout for this, for progress bars.
+// The android app wrapping pk-put watches stdout for this, for progress bars.
 type StatusReceiver struct {
 	Sr   blobserver.StatReceiver
 	Path string
@@ -311,12 +312,12 @@ func (asr StatusReceiver) noteChunkOnServer(sb blob.SizedRef) {
 	Printf("CHUNK_UPLOADED %d %s %s\n", sb.Size, sb.Ref, asr.Path)
 }
 
-func (asr StatusReceiver) ReceiveBlob(blob blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (asr StatusReceiver) ReceiveBlob(ctx context.Context, blob blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	// Sniff the first 1KB of it and don't print the stats if it looks like it was just a schema
 	// blob.  We won't update the progress bar for that yet.
 	var buf [1024]byte
 	contents := buf[:0]
-	sb, err := asr.Sr.ReceiveBlob(blob, io.TeeReader(source, writeUntilSliceFull{&contents}))
+	sb, err := asr.Sr.ReceiveBlob(ctx, blob, io.TeeReader(source, writeUntilSliceFull{&contents}))
 	if err == nil && !schema.LikelySchemaBlob(contents) {
 		statBlobUploaded.Incr(1)
 		asr.noteChunkOnServer(sb)
@@ -324,20 +325,12 @@ func (asr StatusReceiver) ReceiveBlob(blob blob.Ref, source io.Reader) (blob.Siz
 	return sb, err
 }
 
-func (asr StatusReceiver) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
-	midc := make(chan blob.SizedRef)
-	errc := make(chan error, 1)
-	go func() {
-		err := asr.Sr.StatBlobs(midc, blobs)
-		errc <- err
-		close(midc)
-	}()
-	for sb := range midc {
+func (asr StatusReceiver) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	return asr.Sr.StatBlobs(ctx, blobs, func(sb blob.SizedRef) error {
 		asr.noteChunkOnServer(sb)
 		statBlobExisted.Incr(1)
-		dest <- sb
-	}
-	return <-errc
+		return fn(sb)
+	})
 }
 
 type writeUntilSliceFull struct {

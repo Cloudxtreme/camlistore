@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,17 +27,17 @@ import (
 	"os"
 	"regexp"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/schema"
 
 	"go4.org/readerutil"
 	"go4.org/types"
 )
 
-func (c *Client) FetchSchemaBlob(b blob.Ref) (*schema.Blob, error) {
-	rc, _, err := c.Fetch(b)
+func (c *Client) FetchSchemaBlob(ctx context.Context, b blob.Ref) (*schema.Blob, error) {
+	rc, _, err := c.Fetch(ctx, b)
 	if err != nil {
 		return nil, err
 	}
@@ -44,8 +45,8 @@ func (c *Client) FetchSchemaBlob(b blob.Ref) (*schema.Blob, error) {
 	return schema.BlobFromReader(b, rc)
 }
 
-func (c *Client) Fetch(b blob.Ref) (io.ReadCloser, uint32, error) {
-	return c.fetchVia(b, c.viaPathTo(b))
+func (c *Client) Fetch(ctx context.Context, b blob.Ref) (io.ReadCloser, uint32, error) {
+	return c.fetchVia(ctx, b, c.viaPathTo(b))
 }
 
 func (c *Client) viaPathTo(b blob.Ref) (path []blob.Ref) {
@@ -70,12 +71,12 @@ func (c *Client) viaPathTo(b blob.Ref) (path []blob.Ref) {
 
 var blobsRx = regexp.MustCompile(blob.Pattern)
 
-func (c *Client) fetchVia(b blob.Ref, v []blob.Ref) (body io.ReadCloser, size uint32, err error) {
+func (c *Client) fetchVia(ctx context.Context, b blob.Ref, v []blob.Ref) (body io.ReadCloser, size uint32, err error) {
 	if c.sto != nil {
 		if len(v) > 0 {
 			return nil, 0, errors.New("FetchVia not supported in non-HTTP mode")
 		}
-		return c.sto.Fetch(b)
+		return c.sto.Fetch(ctx, b)
 	}
 	pfx, err := c.blobPrefix()
 	if err != nil {
@@ -95,7 +96,7 @@ func (c *Client) fetchVia(b blob.Ref, v []blob.Ref) (body io.ReadCloser, size ui
 		url = buf.String()
 	}
 
-	req := c.newRequest("GET", url)
+	req := c.newRequest(ctx, "GET", url)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -155,7 +156,7 @@ func (c *Client) fetchVia(b blob.Ref, v []blob.Ref) (body io.ReadCloser, size ui
 
 // ErrNotSharing is returned when a client that was not created with
 // NewFromShareRoot tries to access shared blobs.
-var ErrNotSharing = errors.New("Client can not deal with shared blobs. Create it with NewFromShareRoot.")
+var ErrNotSharing = errors.New("client can not deal with shared blobs. Create it with NewFromShareRoot")
 
 // UpdateShareChain reads the schema of b from r, and instructs the client that
 // all blob refs found in this schema should use b as a preceding chain link, in
@@ -188,9 +189,9 @@ func (c *Client) UpdateShareChain(b blob.Ref, r io.Reader) error {
 	return nil
 }
 
-func (c *Client) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (c *Client) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	if c.sto != nil {
-		return blobserver.Receive(c.sto, br, source)
+		return blobserver.Receive(ctx, c.sto, br, source)
 	}
 	size, ok := readerutil.Size(source)
 	if !ok {
@@ -202,7 +203,7 @@ func (c *Client) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, erro
 		Contents: source,
 		SkipStat: true,
 	}
-	pr, err := c.Upload(h)
+	pr, err := c.Upload(ctx, h)
 	if err != nil {
 		return blob.SizedRef{}, err
 	}

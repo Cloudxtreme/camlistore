@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@ limitations under the License.
 package drive
 
 import (
+	"context"
 	"io"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
-func (sto *driveStorage) ReceiveBlob(b blob.Ref, source io.Reader) (blob.SizedRef, error) {
-	file, err := sto.service.Upsert(b.String(), source)
+func (sto *driveStorage) ReceiveBlob(ctx context.Context, b blob.Ref, source io.Reader) (blob.SizedRef, error) {
+	file, err := sto.service.Upsert(ctx, b.String(), source)
 	if err != nil {
 		return blob.SizedRef{Ref: b, Size: 0}, err
 	}

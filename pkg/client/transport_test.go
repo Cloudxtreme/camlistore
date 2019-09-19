@@ -1,7 +1,7 @@
 // +build fake_android
 
 /*
-Copyright 2015 The Camlistore Authors.
+Copyright 2015 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"net/http"
 	"testing"
 
-	"camlistore.org/pkg/client/android"
-	"camlistore.org/pkg/httputil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/client/android"
 
 	"golang.org/x/net/http2"
 )
@@ -165,7 +165,7 @@ func TestTransportSetup(t *testing.T) {
 	}
 	for tti, tt := range transportTests {
 		cl := &Client{
-			paramsOnly:         true,
+			noExtConfig:        true,
 			server:             tt.server,
 			trustedCerts:       tt.trustedCerts,
 			insecureAnyTLSCert: tt.insecureTLS,

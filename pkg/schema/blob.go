@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package schema
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -24,7 +25,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
 // A MissingFieldError represents a missing JSON field in a schema blob.
@@ -50,7 +51,7 @@ type Buildable interface {
 	Builder() *Builder
 }
 
-// A Blob represents a Camlistore schema blob.
+// A Blob represents a Perkeep schema blob.
 // It is immutable.
 type Blob struct {
 	br  blob.Ref
@@ -149,12 +150,32 @@ func (b *Blob) DirectoryEntries() (br blob.Ref, ok bool) {
 	return b.ss.Entries, true
 }
 
+// StaticSetMembers returns the refs in the "members" field if b is a valid
+// "static-set" schema. Note that if it is a large static-set, the members are
+// actually spread as subsets in "mergeSets". See StaticSetMergeSets.
 func (b *Blob) StaticSetMembers() []blob.Ref {
 	if b.Type() != "static-set" {
 		return nil
 	}
+
 	s := make([]blob.Ref, 0, len(b.ss.Members))
 	for _, ref := range b.ss.Members {
+		if ref.Valid() {
+			s = append(s, ref)
+		}
+	}
+	return s
+}
+
+// StaticSetMergeSets returns the refs of the static-sets in "mergeSets". These
+// are the subsets of all the static-set members in the case of a large directory.
+func (b *Blob) StaticSetMergeSets() []blob.Ref {
+	if b.Type() != "static-set" {
+		return nil
+	}
+
+	s := make([]blob.Ref, 0, len(b.ss.MergeSets))
+	for _, ref := range b.ss.MergeSets {
 		if ref.Valid() {
 			s = append(s, ref)
 		}
@@ -189,7 +210,7 @@ type Claim struct {
 // Blob returns the claim's Blob.
 func (c Claim) Blob() *Blob { return c.b }
 
-// ClaimDate returns the blob's "claimDate" field.
+// ClaimDateString returns the blob's "claimDate" field.
 func (c Claim) ClaimDateString() string { return c.b.ss.ClaimDate.String() }
 
 // ClaimType returns the blob's "claimType" field.
@@ -200,6 +221,12 @@ func (c Claim) Attribute() string { return c.b.ss.Attribute }
 
 // Value returns the "value" field, if set.
 func (c Claim) Value() string { return c.b.ss.Value }
+
+// Signer returns the ref of the blob containing the signing key that signed the claim.
+func (c Claim) Signer() blob.Ref { return c.b.ss.Signer }
+
+// Signature returns the claim's signature.
+func (c Claim) Signature() string { return c.b.ss.Sig }
 
 // ModifiedPermanode returns the claim's "permaNode" field, if it's
 // a claim that modifies a permanode. Otherwise a zero blob.Ref is
@@ -257,7 +284,7 @@ func (sf StaticFile) FileName() string {
 // zero value of StaticFile.
 func (b *Blob) AsStaticFile() (sf StaticFile, ok bool) {
 	// TODO (marete) Add support for device files to
-	// Camlistore and change the implementation of StaticFile to
+	// Perkeep and change the implementation of StaticFile to
 	// reflect that.
 	t := b.ss.Type
 	if t == "file" || t == "symlink" || t == "fifo" || t == "socket" {
@@ -313,7 +340,7 @@ func (sf StaticFile) AsStaticFIFO() (fifo StaticFIFO, ok bool) {
 	return
 }
 
-// AsSataticSocket returns the StaticFile as a StaticSocket if the
+// AsStaticSocket returns the StaticFile as a StaticSocket if the
 // StaticFile represents a socket. Otherwise, it returns the zero
 // value of StaticSocket and false.
 func (sf StaticFile) AsStaticSocket() (ss StaticSocket, ok bool) {
@@ -431,15 +458,15 @@ func (bb *Builder) SetSigner(signer blob.Ref) *Builder {
 
 // Sign sets the blob builder's camliSigner field with SetSigner
 // and returns the signed JSON using the provided signer.
-func (bb *Builder) Sign(signer *Signer) (string, error) {
-	return bb.SignAt(signer, time.Time{})
+func (bb *Builder) Sign(ctx context.Context, signer *Signer) (string, error) {
+	return bb.SignAt(ctx, signer, time.Time{})
 }
 
 // SignAt sets the blob builder's camliSigner field with SetSigner
 // and returns the signed JSON using the provided signer.
 // The provided sigTime is the time of the signature, used mostly
 // for planned permanodes. If the zero value, the current time is used.
-func (bb *Builder) SignAt(signer *Signer, sigTime time.Time) (string, error) {
+func (bb *Builder) SignAt(ctx context.Context, signer *Signer, sigTime time.Time) (string, error) {
 	switch bb.Type() {
 	case "permanode", "claim":
 	default:
@@ -449,7 +476,7 @@ func (bb *Builder) SignAt(signer *Signer, sigTime time.Time) (string, error) {
 		sigTime = time.Now()
 	}
 	bb.SetClaimDate(sigTime)
-	return signer.SignJSON(bb.SetSigner(signer.pubref).Blob().JSON(), sigTime)
+	return signer.SignJSON(ctx, bb.SetSigner(signer.pubref).Blob().JSON(), sigTime)
 }
 
 // SetType sets the camliType field.

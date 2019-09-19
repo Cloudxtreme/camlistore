@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package blobpacked
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,19 +34,25 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/constants"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/test"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/constants"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/test"
 
 	"go4.org/syncutil"
 )
 
+func init() {
+	testhooks.SetUseSHA1(true)
+}
+
 const debug = false
+
+var ctxbg = context.Background()
 
 func TestStorage(t *testing.T) {
 	storagetest.Test(t, func(t *testing.T) (sto blobserver.Storage, cleanup func()) {
@@ -162,7 +169,7 @@ func TestPackNormal(t *testing.T) {
 
 	pt := testPack(t,
 		func(sto blobserver.Storage) error {
-			_, err := schema.WriteFileFromReader(sto, fileName, bytes.NewReader(fileContents))
+			_, err := schema.WriteFileFromReader(ctxbg, sto, fileName, bytes.NewReader(fileContents))
 			return err
 		},
 		wantNumLargeBlobs(1),
@@ -178,12 +185,12 @@ func TestPackNoDelete(t *testing.T) {
 	fileContents := randBytes(fileSize)
 	testPack(t,
 		func(sto blobserver.Storage) error {
-			_, err := schema.WriteFileFromReader(sto, fileName, bytes.NewReader(fileContents))
+			_, err := schema.WriteFileFromReader(ctxbg, sto, fileName, bytes.NewReader(fileContents))
 			return err
 		},
 		func(pt *packTest) { pt.sto.skipDelete = true },
 		wantNumLargeBlobs(1),
-		wantNumSmallBlobs(15), // empirically
+		wantNumSmallBlobs(14), // empirically
 	)
 }
 
@@ -201,7 +208,7 @@ func TestPackLarge(t *testing.T) {
 
 	pt := testPack(t,
 		func(sto blobserver.Storage) error {
-			_, err := schema.WriteFileFromReader(sto, fileName, bytes.NewReader(fileContents))
+			_, err := schema.WriteFileFromReader(ctxbg, sto, fileName, bytes.NewReader(fileContents))
 			return err
 		},
 		wantNumLargeBlobs(2),
@@ -280,6 +287,106 @@ func countSortedRows(t *testing.T, meta sorted.KeyValue) int {
 	return rows
 }
 
+func TestParseZipMetaRow(t *testing.T) {
+	tests := []struct {
+		zm       zipMetaInfo
+		wholeRef blob.Ref
+		offset   uint64
+	}{
+		{
+			zm: zipMetaInfo{
+				zipSize:   16738962,
+				wholeSize: 139639864,
+				dataSize:  16659276,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 0,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16739170,
+				wholeSize: 139639864,
+				dataSize:  16670204,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 16659276,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16744577,
+				wholeSize: 139639864,
+				dataSize:  16668625,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 33329480,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16628223,
+				wholeSize: 139639864,
+				dataSize:  16555478,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 49998105,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16735901,
+				wholeSize: 139639864,
+				dataSize:  16661990,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 66553583,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16628162,
+				wholeSize: 139639864,
+				dataSize:  16555638,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 83215573,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16638400,
+				wholeSize: 139639864,
+				dataSize:  16569680,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 99771211,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   16731570,
+				wholeSize: 139639864,
+				dataSize:  16665343,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 116340891,
+		},
+		{
+			zm: zipMetaInfo{
+				zipSize:   6656201,
+				wholeSize: 139639864,
+				dataSize:  6633630,
+				wholeRef:  blob.MustParse("sha224-d003d3cf9784df4efe617ba319c5028fe93e5e9188cc448bf6d655b4"),
+			},
+			offset: 133006234,
+		},
+	}
+	for k, tt := range tests {
+		rv := tt.zm.rowValue(tt.offset)
+		got, err := parseZipMetaRow([]byte(rv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tt.zm != got {
+			t.Errorf("for zip %d;\n got: %#v\n want: %#v\n", k, got, tt.zm)
+		}
+	}
+}
+
 func TestReindex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
@@ -299,7 +406,7 @@ func TestReindex(t *testing.T) {
 	pt := testPack(t,
 		func(sto blobserver.Storage) error {
 			for _, f := range files {
-				if _, err := schema.WriteFileFromReader(sto, f.name, bytes.NewReader(f.contents)); err != nil {
+				if _, err := schema.WriteFileFromReader(ctxbg, sto, f.name, bytes.NewReader(f.contents)); err != nil {
 					return err
 				}
 			}
@@ -332,7 +439,7 @@ func TestReindex(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		rc, err := pt.large.SubFetch(m.largeRef, int64(m.largeOff), int64(m.size))
+		rc, err := pt.large.SubFetch(ctxbg, m.largeRef, int64(m.largeOff), int64(m.size))
 		if err != nil {
 			return err
 		}
@@ -387,6 +494,32 @@ func TestReindex(t *testing.T) {
 	hash := blob.NewHash()
 	hash.Write(files[0].contents)
 	pt.testOpenWholeRef(t, blob.RefFromHash(hash), files[0].size)
+
+	// Specifically check the z: rows.
+	zrows := []string{
+		"z:sha1-41e7665e4e3f491790121fb0440b4f685b3386cb | 16762318 sha1-f6bcda1d4111f45ca785499ae9b3bae019608f65 17825792 0 16709479",
+		"z:sha1-60e61eef95c38e15e8b6422cdaa8a95ad6c38a8b | 1120477 sha1-f6bcda1d4111f45ca785499ae9b3bae019608f65 17825792 16709479 1116313",
+		"z:sha1-9655da8b87e7ccfd804edf1c5967219e2e1ae556 | 5260755 sha1-28aa3334333bb57610ff397432dad6d2c41dc520 5242880 0 5242880",
+		"z:sha1-bc317462c29d9b70891538b7491ac420334d7ef8 | 10516226 sha1-87cdaac04cb9a37c0378970e8ab58f09f22a9907 10485760 0 10485760",
+	}
+	it := pt.sto.meta.Find(zipMetaPrefix, zipMetaPrefixLimit)
+	i := 0
+	for it.Next() {
+		got := it.Key() + " | " + it.Value()
+		if zrows[i] != got {
+			t.Errorf("for row %d;\n got: %v\n want: %v\n", i, got, zrows[i])
+		}
+		i++
+	}
+	it.Close()
+
+	recoMode, err := pt.sto.checkLargeIntegrity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoMode != NoRecovery {
+		t.Fatalf("recovery mode after integrity check: %v", recoMode)
+	}
 }
 
 func (pt *packTest) testOpenWholeRef(t *testing.T, wholeRef blob.Ref, wantSize int64) {
@@ -421,10 +554,10 @@ func TestPackTwoIdenticalfiles(t *testing.T) {
 	fileContents := randBytes(fileSize)
 	testPack(t,
 		func(sto blobserver.Storage) (err error) {
-			if _, err = schema.WriteFileFromReader(sto, "a.txt", bytes.NewReader(fileContents)); err != nil {
+			if _, err = schema.WriteFileFromReader(ctxbg, sto, "a.txt", bytes.NewReader(fileContents)); err != nil {
 				return
 			}
-			if _, err = schema.WriteFileFromReader(sto, "b.txt", bytes.NewReader(fileContents)); err != nil {
+			if _, err = schema.WriteFileFromReader(ctxbg, sto, "b.txt", bytes.NewReader(fileContents)); err != nil {
 				return
 			}
 			return
@@ -432,7 +565,7 @@ func TestPackTwoIdenticalfiles(t *testing.T) {
 		func(pt *packTest) { pt.sto.packGate = syncutil.NewGate(1) }, // one pack at a time
 		wantNumLargeBlobs(1),
 		wantNumSmallBlobs(1), // just the "b.txt" file schema blob
-		okayWithoutMeta("sha1-cb4399f6b3b31ace417e1ec9326f9818bb3f8387"),
+		okayWithoutMeta("sha1-7912d1f93942e84cb7ebd6bd6c83b7c152dc102b"),
 	)
 }
 
@@ -506,7 +639,7 @@ func testPack(t *testing.T,
 
 	bytesOfZip := map[blob.Ref][]byte{}
 	for _, zipRef := range zipRefs {
-		rc, _, err := large.Fetch(zipRef)
+		rc, _, err := large.Fetch(ctxbg, zipRef)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -619,7 +752,7 @@ func TestSmallFallback(t *testing.T) {
 	wantSB := b1.SizedRef()
 
 	// Fetch
-	rc, _, err := s.Fetch(b1.BlobRef())
+	rc, _, err := s.Fetch(ctxbg, b1.BlobRef())
 	if err != nil {
 		t.Errorf("failed to Get blob: %v", err)
 	} else {
@@ -627,7 +760,7 @@ func TestSmallFallback(t *testing.T) {
 	}
 
 	// Stat.
-	sb, err := blobserver.StatBlob(s, b1.BlobRef())
+	sb, err := blobserver.StatBlob(ctxbg, s, b1.BlobRef())
 	if err != nil {
 		t.Errorf("failed to Stat blob: %v", err)
 	} else if sb != wantSB {
@@ -675,7 +808,7 @@ func TestForeachZipBlob(t *testing.T) {
 
 	pt := testPack(t,
 		func(sto blobserver.Storage) error {
-			_, err := schema.WriteFileFromReader(sto, fileName, bytes.NewReader(fileContents))
+			_, err := schema.WriteFileFromReader(ctxbg, sto, fileName, bytes.NewReader(fileContents))
 			return err
 		},
 		wantNumLargeBlobs(1),
@@ -698,7 +831,7 @@ func TestForeachZipBlob(t *testing.T) {
 	}
 	foreachSaw := 0
 	blobSizeSum := 0
-	if err := pt.sto.foreachZipBlob(zipBlob.Ref, func(bap BlobAndPos) error {
+	if err := pt.sto.foreachZipBlob(ctxbg, zipBlob.Ref, func(bap BlobAndPos) error {
 		foreachSaw++
 		blobSizeSum += int(bap.Size)
 		want, ok := all[bap.Ref]
@@ -772,7 +905,7 @@ func TestRemoveBlobs(t *testing.T) {
 
 	const fileSize = 1 << 20
 	fileContents := randBytes(fileSize)
-	if _, err := schema.WriteFileFromReader(sto, "foo.dat", bytes.NewReader(fileContents)); err != nil {
+	if _, err := schema.WriteFileFromReader(ctxbg, sto, "foo.dat", bytes.NewReader(fileContents)); err != nil {
 		t.Fatal(err)
 	}
 	if small.NumBlobs() != 0 || large.NumBlobs() == 0 {
@@ -793,7 +926,7 @@ func TestRemoveBlobs(t *testing.T) {
 	}
 
 	// The zip file is in use, so verify we can't delete it.
-	if err := sto.deleteZipPack(zipBlob.Ref); err == nil {
+	if err := sto.deleteZipPack(ctxbg, zipBlob.Ref); err == nil {
 		t.Fatalf("zip pack blob deleted but it should not have been allowed")
 	}
 
@@ -801,7 +934,7 @@ func TestRemoveBlobs(t *testing.T) {
 	for len(all) > 0 {
 		del := all[0].Ref
 		all = all[1:]
-		if err := sto.RemoveBlobs([]blob.Ref{del}); err != nil {
+		if err := sto.RemoveBlobs(ctx, []blob.Ref{del}); err != nil {
 			t.Fatalf("RemoveBlobs: %v", err)
 		}
 		if err := storagetest.CheckEnumerate(sto, all); err != nil {
@@ -826,7 +959,7 @@ func TestRemoveBlobs(t *testing.T) {
 	}
 
 	// TODO: test the background pack-deleter loop? figure out its design first.
-	if err := sto.deleteZipPack(zipBlob.Ref); err != nil {
+	if err := sto.deleteZipPack(ctxbg, zipBlob.Ref); err != nil {
 		t.Errorf("error deleting zip %v: %v", zipBlob.Ref, err)
 	}
 	if n := dRows(); n != 0 {
@@ -914,7 +1047,7 @@ func TestPackerBoundarySplits(t *testing.T) {
 		h := blob.NewHash()
 		h.Write(bytesC)
 		refC := blob.RefFromHash(h)
-		_, err := s.ReceiveBlob(refC, bytes.NewReader(bytesC))
+		_, err := s.ReceiveBlob(ctxbg, refC, bytes.NewReader(bytesC))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -922,15 +1055,15 @@ func TestPackerBoundarySplits(t *testing.T) {
 		// Upload the file schema blob.
 		m := schema.NewFileMap("foo.dat")
 		m.PopulateParts(sizeAB+int64(sizeC), []schema.BytesPart{
-			schema.BytesPart{
+			{
 				Size:    sizeAB / 2,
 				BlobRef: refA,
 			},
-			schema.BytesPart{
+			{
 				Size:    sizeAB / 2,
 				BlobRef: refB,
 			},
-			schema.BytesPart{
+			{
 				Size:    uint64(sizeC),
 				BlobRef: refC,
 			},
@@ -965,7 +1098,7 @@ func TestPackerBoundarySplits(t *testing.T) {
 }
 
 func slurpBlob(t *testing.T, sto blob.Fetcher, br blob.Ref) []byte {
-	rc, _, err := sto.Fetch(br)
+	rc, _, err := sto.Fetch(ctxbg, br)
 	if err != nil {
 		t.Fatal(err)
 	}

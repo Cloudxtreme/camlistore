@@ -98,7 +98,7 @@ h1.rootHeading em {
 h2,
 h2>a {
 	color: #fff;
-	background: url(camli-bar-background.png);
+	background: #699023;
 	padding: 4px 8px;
 }
 h2 {
@@ -156,10 +156,10 @@ div#page.wide table.dir td.name {
   height: 43px;
   width: 788;
   text-align: center;
-  background: url(camli-bar-background.png);
+  background: #699023;
   margin-left: auto;
   margin-right: auto;
-  margin-top: 1em;
+  margin-top: 0em;
   margin-bottom: 1em;
 }
 
@@ -280,4 +280,29 @@ a.downloadBox:hover .filename {
 }
 .downloadBox .checksum {
 	font-size: 5pt;
+}
+
+a { font-weight: bold; }
+
+/* Header anchor links styling */
+.anchor {
+	padding:4px;
+}
+.anchor svg {
+	visibility: hidden;
+	vertical-align:middle;
+}
+h1 svg,
+h2 svg,
+h3 svg,
+h4 svg {
+	fill: #375EAB;
+}
+h2 svg {
+	fill: #fff;
+}
+h1:hover .anchor svg, h2:hover .anchor svg,
+h3:hover .anchor svg, h4:hover .anchor svg,
+h5:hover .anchor svg, h6:hover .anchor svg {
+	visibility: visible;
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors.
+Copyright 2014 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,15 +16,15 @@ limitations under the License.
 
 // Package clientconfig provides types related to the client configuration
 // file.
-package clientconfig // import "camlistore.org/pkg/types/clientconfig"
+package clientconfig // import "perkeep.org/pkg/types/clientconfig"
 
 import (
 	"errors"
 	"fmt"
 	"strings"
 
-	"camlistore.org/pkg/httputil"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/httputil"
 
 	"go4.org/wkfs"
 )
@@ -34,7 +34,7 @@ type Config struct {
 	Servers            map[string]*Server `json:"servers"`                      // maps server alias to server config.
 	Identity           string             `json:"identity"`                     // GPG identity.
 	IdentitySecretRing string             `json:"identitySecretRing,omitempty"` // location of the secret ring file.
-	IgnoredFiles       []string           `json:"ignoredFiles,omitempty"`       // list of files that camput should ignore.
+	IgnoredFiles       []string           `json:"ignoredFiles,omitempty"`       // list of files that pk-put should ignore.
 }
 
 // Server holds the values specific to each server found in the JSON client
@@ -96,8 +96,8 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 		return missingConfig(param)
 	}
 	param = "keyId"
-	keyId := handlerArgs.OptionalString(param, "")
-	if keyId == "" {
+	keyID := handlerArgs.OptionalString(param, "")
+	if keyID == "" {
 		return missingConfig(param)
 	}
 
@@ -105,10 +105,10 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 	camliNetIP := serverConfig.OptionalString("camliNetIP", "")
 	if camliNetIP != "" {
 		listen = ":443"
-		// TODO(mpl): move the camliNetDomain const from camlistored.go
+		// TODO(mpl): move the camliNetDomain const from perkeepd.go
 		// to somewhere importable, so we can use it here. but later.
 		camliNetDomain := "camlistore.net"
-		baseURL = fmt.Sprintf("https://%s.%s/", keyId, camliNetDomain)
+		baseURL = fmt.Sprintf("https://%s.%s/", keyID, camliNetDomain)
 	} else {
 		listen = serverConfig.OptionalString("listen", "")
 		baseURL = serverConfig.OptionalString("baseURL", "")
@@ -160,7 +160,7 @@ func GenerateClientConfig(serverConfig jsonconfig.Obj) (*Config, error) {
 				TrustedCerts: trustedList,
 			},
 		},
-		Identity:           keyId,
+		Identity:           keyID,
 		IdentitySecretRing: secretRing,
 		IgnoredFiles:       []string{".DS_Store", "*~"},
 	}, nil

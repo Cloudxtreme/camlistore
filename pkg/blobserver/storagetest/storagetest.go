@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // Package storagetest tests blobserver.Storage implementations
-package storagetest // import "camlistore.org/pkg/blobserver/storagetest"
+package storagetest // import "perkeep.org/pkg/blobserver/storagetest"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,10 +30,9 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/test"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/test"
 
 	"go4.org/syncutil"
 )
@@ -80,6 +80,13 @@ func TestOpt(t *testing.T, opt Opts) {
 	t.Logf("Testing Enumerate for empty")
 	r.testEnumerate(nil)
 
+	t.Logf("Test stat of blob not existing")
+	{
+		b := &test.Blob{"not exist"}
+		blobRefs := []blob.Ref{b.BlobRef()}
+		testStat(t, sto, blobRefs, nil)
+	}
+
 	var blobs []*test.Blob
 	var blobRefs []blob.Ref
 	var blobSizedRefs []blob.SizedRef
@@ -90,13 +97,14 @@ func TestOpt(t *testing.T, opt Opts) {
 			contents = append(contents, "foo-"+strconv.Itoa(i))
 		}
 	}
+
 	t.Logf("Testing receive")
 	for i, x := range contents {
 		b1 := &test.Blob{x}
 		if testing.Short() {
 			t.Logf("blob[%d] = %s: %q", i, b1.BlobRef(), x)
 		}
-		b1s, err := sto.ReceiveBlob(b1.BlobRef(), b1.Reader())
+		b1s, err := sto.ReceiveBlob(context.Background(), b1.BlobRef(), b1.Reader())
 		if err != nil {
 			t.Fatalf("ReceiveBlob of %s: %v", b1, err)
 		}
@@ -116,24 +124,16 @@ func TestOpt(t *testing.T, opt Opts) {
 
 	t.Logf("Testing Fetch")
 	for i, b2 := range blobs {
-		rc, size, err := sto.Fetch(b2.BlobRef())
+		rc, size, err := sto.Fetch(context.Background(), b2.BlobRef())
 		if err != nil {
 			t.Fatalf("error fetching %d. %s: %v", i, b2, err)
 		}
-		defer rc.Close()
 		testSizedBlob(t, rc, b2.BlobRef(), int64(size))
+		rc.Close()
 	}
 
 	t.Logf("Testing Stat")
-	dest := make(chan blob.SizedRef)
-	errc := make(chan error, 1)
-	go func() {
-		errc <- sto.StatBlobs(dest, blobRefs)
-	}()
-	testStat(t, dest, blobSizedRefs)
-	if err := <-errc; err != nil {
-		t.Fatalf("error stating blobs %s: %v", blobRefs, err)
-	}
+	testStat(t, sto, blobRefs, blobSizedRefs)
 
 	// Enumerate tests.
 	sort.Sort(blob.SizedByRef(blobSizedRefs))
@@ -171,20 +171,20 @@ func TestOpt(t *testing.T, opt Opts) {
 }
 
 func (r *run) testRemove(blobRefs []blob.Ref) {
+	ctx := context.Background()
 	t, sto := r.t, r.sto
 	t.Logf("Testing Remove")
-	if err := sto.RemoveBlobs(blobRefs); err != nil {
+	if err := sto.RemoveBlobs(ctx, blobRefs); err != nil {
 		if strings.Contains(err.Error(), "not implemented") {
 			t.Logf("RemoveBlobs: %v", err)
 			return
-		} else {
-			t.Fatalf("RemoveBlobs: %v", err)
 		}
+		t.Fatalf("RemoveBlobs: %v", err)
 	}
 	r.testEnumerate(nil) // verify they're all gone
 	if len(blobRefs) > 0 {
 		t.Logf("Testing double-delete")
-		if err := sto.RemoveBlobs([]blob.Ref{blobRefs[0]}); err != nil {
+		if err := sto.RemoveBlobs(ctx, []blob.Ref{blobRefs[0]}); err != nil {
 			t.Fatalf("Double RemoveBlobs: %v", err)
 		}
 	}
@@ -199,7 +199,7 @@ func (r *run) testSubFetcher() {
 	}
 	t.Logf("Testing SubFetch")
 	big := &test.Blob{"Some big blob"}
-	if _, err := sto.ReceiveBlob(big.BlobRef(), big.Reader()); err != nil {
+	if _, err := sto.ReceiveBlob(context.Background(), big.BlobRef(), big.Reader()); err != nil {
 		t.Fatal(err)
 	}
 	regions := []struct {
@@ -212,7 +212,11 @@ func (r *run) testSubFetcher() {
 		{5, 100, "big blob", true},
 	}
 	for _, tt := range regions {
-		r, err := sf.SubFetch(big.BlobRef(), tt.off, tt.limit)
+		r, err := sf.SubFetch(context.Background(), big.BlobRef(), tt.off, tt.limit)
+		if err == blob.ErrUnimplemented {
+			t.Logf("%T implements SubFetcher but its wrapped value doesn't", sto)
+			return
+		}
 		if err != nil {
 			t.Fatalf("Error fetching big blob for SubFetch: %v", err)
 		}
@@ -238,7 +242,11 @@ func (r *run) testSubFetcher() {
 		{1, -1},
 	}
 	for _, tt := range invalids {
-		r, err := sf.SubFetch(big.BlobRef(), tt.off, tt.limit)
+		r, err := sf.SubFetch(context.Background(), big.BlobRef(), tt.off, tt.limit)
+		if err == blob.ErrUnimplemented {
+			t.Logf("%T implements SubFetcher but its wrapped value doesn't", sto)
+			return
+		}
 		if err == nil {
 			r.Close()
 			t.Errorf("No error fetching with off=%d limit=%d; wanted an error", tt.off, tt.limit)
@@ -335,7 +343,7 @@ func CheckEnumerate(sto blobserver.Storage, wantUnsorted []blob.SizedRef, opts .
 	}
 
 	if !reflect.DeepEqual(got, want) {
-		return fmt.Errorf("Enumerate mismatch. Got %d; want %d.\n Got: %v\nWant: %v\n",
+		return fmt.Errorf("enumerate mismatch. Got %d; want %d.\n Got: %v\nWant: %v\n",
 			len(got), len(want), got, want)
 	}
 	return nil
@@ -366,29 +374,41 @@ func (r *run) withRetries(fn func() error) error {
 	}
 }
 
-func testStat(t *testing.T, enum <-chan blob.SizedRef, want []blob.SizedRef) {
+func testStat(t *testing.T, sto blobserver.BlobStatter, blobs []blob.Ref, want []blob.SizedRef) {
 	// blobs may arrive in ANY order
-	m := make(map[string]int, len(want))
+	pos := make(map[blob.Ref]int) // wanted ref => its position in want
+	need := make(map[blob.Ref]bool)
 	for i, sb := range want {
-		m[sb.Ref.String()] = i
+		pos[sb.Ref] = i
+		need[sb.Ref] = true
 	}
 
-	i := 0
-	for sb := range enum {
+	err := sto.StatBlobs(context.Background(), blobs, func(sb blob.SizedRef) error {
 		if !sb.Valid() {
-			break
+			t.Errorf("StatBlobs func called with invalid/zero blob.SizedRef")
+			return nil
 		}
-		wanted := want[m[sb.Ref.String()]]
-		if wanted.Size != sb.Size {
-			t.Fatalf("received blob size is %d, wanted %d for &%d", sb.Size, wanted.Size, i)
+		wantPos, ok := pos[sb.Ref]
+		if !ok {
+			t.Errorf("StatBlobs func called with unrequested ref %v (size %d)", sb.Ref, sb.Size)
+			return nil
 		}
-		if wanted.Ref != sb.Ref {
-			t.Fatalf("received blob ref mismatch &%d: wanted %s, got %s", i, sb.Ref, wanted.Ref)
+		if !need[sb.Ref] {
+			t.Errorf("StatBlobs func called with ref %v multiple times", sb.Ref)
+			return nil
 		}
-		i++
-		if i >= len(want) {
-			break
+		delete(need, sb.Ref)
+		w := want[wantPos]
+		if sb != w {
+			t.Errorf("StatBlobs returned %v; want %v", sb, w)
 		}
+		return nil
+	})
+	for br := range need {
+		t.Errorf("StatBlobs never returned results for %v", br)
+	}
+	if err != nil {
+		t.Errorf("StatBlobs: %v", err)
 	}
 }
 
@@ -411,7 +431,7 @@ type WantSizedRefs []blob.SizedRef
 func (s WantSizedRefs) verify(got []blob.SizedRef) error {
 	want := []blob.SizedRef(s)
 	if !reflect.DeepEqual(got, want) {
-		return fmt.Errorf("Mismatch:\n got %d blobs: %q\nwant %d blobs: %q\n", len(got), got, len(want), want)
+		return fmt.Errorf("mismatch:\n got %d blobs: %q\nwant %d blobs: %q\n", len(got), got, len(want), want)
 	}
 	return nil
 }

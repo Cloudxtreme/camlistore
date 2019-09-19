@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ var parseTests = []struct {
 	skipBytes bool // skip ParseBytes test
 }{
 	{in: "sha1-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33"},
+	{in: "sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"},
 	{in: "foo-0b"},
 	{in: "foo-0b0c"},
 
@@ -281,5 +282,126 @@ func TestJSONMarshalSized(t *testing.T) {
 	}
 	if g, e := string(b), `{"blobRef":null,"size":0}`; g != e {
 		t.Fatalf("got %q, want %q", g, e)
+	}
+}
+
+var equalStringTests = []struct {
+	ref  Ref
+	str  string
+	want bool
+}{
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659", true},
+	// last digit wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ed9658", false},
+	// second to last digit wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ed9669", false},
+	// hyphen wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1xce284c167558a9ef22df04390c87a6d0c9ed9659", false},
+	// truncated:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-", false},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1", false},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "", false},
+	// right length, wrong hash:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha2-ce284c167558a9ef22df04390c87a6d0c9ed9659", false},
+
+	// Other hashes:
+	{MustParse("foo-cafe"), "foo-cafe", true},
+	{MustParse("foo-caf"), "foo-caf", true},
+
+	{MustParse("foo-cafe"), "foo-beef", false},
+	{MustParse("foo-cafe"), "bar-cafe", false},
+	{MustParse("foo-cafe"), "fooxbeef", false},
+	{MustParse("foo-caf"), "foo-cae", false},
+	{MustParse("foo-caf"), "foo-ca", false},
+
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f", true},
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42g", false}, // last byte wrong
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42e", false}, // last byte wrong
+}
+
+func TestEqualString(t *testing.T) {
+	for _, tt := range equalStringTests {
+		got := tt.ref.EqualString(tt.str)
+		if got != tt.want {
+			t.Errorf("ref %q EqualString(%q) = %v; want %v", tt.ref, tt.str, got, tt.want)
+		}
+	}
+}
+
+func BenchmarkEqualString(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		for _, tt := range equalStringTests {
+			got := tt.ref.EqualString(tt.str)
+			if got != tt.want {
+				b.Fatalf("ref %q EqualString(%q) = %v; want %v", tt.ref, tt.str, got, tt.want)
+			}
+		}
+	}
+}
+
+var hasPrefixTests = []struct {
+	ref  Ref
+	str  string
+	want bool
+}{
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659", true},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ed", true},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9e", true},
+	// last digit wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9ee", false},
+	// second to last digit wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-ce284c167558a9ef22df04390c87a6d0c9f", false},
+	// hyphen wrong:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1xce284c167558a9ef22df04390c87a6d0c9ed", false},
+	// truncated:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-c", true},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1-", false},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha1", false},
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "", false},
+	// wrong hash:
+	{MustParse("sha1-ce284c167558a9ef22df04390c87a6d0c9ed9659"), "sha2-ce284c167558a9ef22df04390c87a6d0c9ed96", false},
+
+	// Other hashes:
+	{MustParse("foo-cafe"), "foo-cafe", true},
+	{MustParse("foo-cafe"), "foo-caf", true},
+	{MustParse("foo-cafe"), "foo-ca", true},
+	{MustParse("foo-cafe"), "foo-c", true},
+
+	{MustParse("foo-cafe"), "foo-", false},
+	{MustParse("foo-cafe"), "", false},
+	{MustParse("foo-cafe"), "foo-beef", false},
+	{MustParse("foo-cafe"), "foo-bee", false},
+	{MustParse("foo-cafe"), "bar-cafe", false},
+	{MustParse("foo-cafe"), "fooxbe", false},
+	{MustParse("foo-cafe"), "foo-c", true},
+	{MustParse("foo-caf"), "foo-cae", false},
+	{MustParse("foo-caf"), "foo-cb", false},
+
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14a", true},
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14b", false},
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d14", true},
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-d15", false},
+	{MustParse("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"), "sha224-", false}, // TODO: make this true?
+}
+
+func TestHasPrefix(t *testing.T) {
+	for _, tt := range hasPrefixTests {
+		got := tt.ref.HasPrefix(tt.str)
+		if got != tt.want {
+			t.Errorf("ref %q HasPrefix(%q) = %v; want %v", tt.ref, tt.str, got, tt.want)
+		}
+	}
+}
+
+func BenchmarkHasPrefix(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		for _, tt := range hasPrefixTests {
+			got := tt.ref.HasPrefix(tt.str)
+			if got != tt.want {
+				b.Fatalf("ref %q HasPrefix(%q) = %v; want %v", tt.ref, tt.str, got, tt.want)
+			}
+		}
 	}
 }

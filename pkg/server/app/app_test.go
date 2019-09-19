@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 )
 
@@ -171,6 +172,10 @@ func TestQuit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping test in short mode")
 	}
+	if runtime.GOOS == "windows" {
+		// windows does not support interrupts
+		t.Skip("Skipping interrupt test on windows")
+	}
 
 	cmd := exec.Command("sleep", "10000")
 	err := cmd.Start()
@@ -187,7 +192,7 @@ func TestQuit(t *testing.T) {
 
 	pid, err := ignoreInterrupt()
 	if err != nil {
-		t.Skip("couldn't run test helper command: %v", err)
+		t.Skipf("couldn't run test helper command: %v", err)
 	}
 	h = Handler{
 		process: pid,

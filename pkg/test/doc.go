@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,5 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package test provides common Camlistore test objects.
-package test // import "camlistore.org/pkg/test"
+// Package test provides common Perkeep test objects.
+package test // import "perkeep.org/pkg/test"

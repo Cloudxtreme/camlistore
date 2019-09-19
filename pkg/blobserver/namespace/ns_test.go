@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,15 @@ limitations under the License.
 package namespace
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/test"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/test"
 )
 
 func newNamespace(t *testing.T, ld *test.Loader) *nsto {
@@ -104,7 +104,7 @@ func TestIsolation(t *testing.T) {
 	want("ns2", b2r, b3r)
 	want("master", b1r, b2r, b3r)
 
-	if _, _, err := ns2.Fetch(b1r); err == nil {
+	if _, _, err := ns2.Fetch(context.Background(), b1r); err == nil {
 		t.Errorf("b1 shouldn't be accessible via ns2")
 	}
 }

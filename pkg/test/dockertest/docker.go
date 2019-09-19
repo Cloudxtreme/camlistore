@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,10 @@ limitations under the License.
 /*
 Package dockertest contains helper functions for setting up and tearing down docker containers to aid in testing.
 */
-package dockertest // import "camlistore.org/pkg/test/dockertest"
+package dockertest // import "perkeep.org/pkg/test/dockertest"
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"database/sql"
@@ -35,10 +36,10 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/netutil"
+	"perkeep.org/internal/netutil"
 )
 
-// Debug, if set, prevents any container from being removed.
+// Debug when set, prevents any container from being removed.
 var Debug bool
 
 /// runLongTest checks all the conditions for running a docker container
@@ -121,7 +122,6 @@ func loadCamliHubImage(image string) error {
 		}
 		return <-errc1
 	}
-	return nil
 }
 
 // haveDocker returns whether the "docker" command was found.
@@ -130,12 +130,30 @@ func haveDocker() bool {
 	return err == nil
 }
 
+// haveImage reports whether we have the the given docker image. The name can
+// either be of the <repository>, or <image id>, or <repository:tag> form.
 func haveImage(name string) (ok bool, err error) {
 	out, err := exec.Command("docker", "images", "--no-trunc").Output()
 	if err != nil {
 		return
 	}
-	return bytes.Contains(out, []byte(name)), nil
+	fields := strings.Split(name, ":")
+	if len(fields) < 2 {
+		return bytes.Contains(out, []byte(name)), nil
+	}
+	tag := fields[1]
+	image := fields[0]
+	sc := bufio.NewScanner(bytes.NewBuffer(out))
+	for sc.Scan() {
+		l := sc.Text()
+		if !strings.HasPrefix(l, image) {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(l, image)), tag) {
+			return true, nil
+		}
+	}
+	return false, sc.Err()
 }
 
 func run(args ...string) (containerID string, err error) {
@@ -271,21 +289,14 @@ func setupContainer(t *testing.T, image string, port int, timeout time.Duration,
 
 const (
 	mongoImage       = "mpl7/mongo"
-	mysqlImage       = "mysql"
+	mysqlImage       = "mysql:8"
 	MySQLUsername    = "root"
 	MySQLPassword    = "root"
 	postgresImage    = "nornagon/postgres"
 	PostgresUsername = "docker" // set up by the dockerfile of postgresImage
 	PostgresPassword = "docker" // set up by the dockerfile of postgresImage
 	camliHub         = "https://storage.googleapis.com/camlistore-docker/"
-	fakeS3Image      = "camlistore/fakes3"
 )
-
-func SetupFakeS3Container(t *testing.T) (c ContainerID, ip string) {
-	return setupContainer(t, fakeS3Image, 4567, 10*time.Second, func() (string, error) {
-		return run("-d", fakeS3Image)
-	})
-}
 
 // SetupMongoContainer sets up a real MongoDB instance for testing purposes,
 // using a Docker container. It returns the container ID and its IP address,

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@ limitations under the License.
 package search
 
 import (
+	"context"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/types/camtypes"
-
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 func SetTestHookBug121(hook func()) {
@@ -49,3 +48,5 @@ func (s *Handler) ExportGetPermanodeLocation(ctx context.Context, permaNode blob
 func ExportBestByLocation(res *SearchResult, loc map[blob.Ref]camtypes.Location, limit int) {
 	bestByLocation(res, loc, limit)
 }
+
+var ExportUitdamLC = uitdamLC

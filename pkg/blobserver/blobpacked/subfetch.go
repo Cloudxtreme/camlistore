@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore AUTHORS
+Copyright 2014 The Perkeep AUTHORS
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,11 @@ limitations under the License.
 package blobpacked
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
 // Ensure we implement the optional interface correctly.
@@ -31,7 +32,8 @@ var _ blob.SubFetcher = (*storage)(nil)
 // The Reader may return fewer than 'length' bytes. Callers should
 // check. The returned error should be os.ErrNotExist if the blob
 // doesn't exist.
-func (s *storage) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
+func (s *storage) SubFetch(ctx context.Context, ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
+	// TODO: pass ctx to more calls within this method.
 	m, err := s.getMetaRow(ref)
 	if err != nil {
 		return nil, err
@@ -42,12 +44,15 @@ func (s *storage) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, e
 			return nil, err
 		}
 		// get the blob from the large subfetcher
-		return s.large.SubFetch(m.largeRef, int64(m.largeOff)+offset, length)
+		return s.large.SubFetch(ctx, m.largeRef, int64(m.largeOff)+offset, length)
 	}
 	if sf, ok := s.small.(blob.SubFetcher); ok {
-		return sf.SubFetch(ref, offset, length)
+		rc, err := sf.SubFetch(ctx, ref, offset, length)
+		if err != blob.ErrUnimplemented {
+			return rc, err
+		}
 	}
-	rc, size, err := s.small.Fetch(ref)
+	rc, size, err := s.small.Fetch(ctx, ref)
 	if err != nil {
 		return rc, err
 	}

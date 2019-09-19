@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,10 +26,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/importer"
 )
 
 var _ importer.TestDataMaker = imp{}
@@ -104,7 +104,7 @@ Content-Type: application/json; charset=UTF-8
 			apiURL, photosetAPIPath, page, photosetId, fakeUserId)
 		response := fmt.Sprintf("%s%s", okHeader, fakePhotoset(photosetId, page, pages, photoIds[pageStart:pageEnd]))
 		responses[photosURL] = httputil.StaticResponder(response)
-		for k, _ := range photoIds {
+		for k := range photoIds {
 			if k < pageEnd {
 				continue
 			}
@@ -277,12 +277,12 @@ func fakePhotosPage(page, pages, perPage int, photoIds []string) string {
 }
 
 func fakePicture() string {
-	camliDir, err := osutil.GoPackagePath("camlistore.org")
+	camliDir, err := osutil.GoPackagePath("perkeep.org")
 	if err == os.ErrNotExist {
-		log.Fatal("Directory \"camlistore.org\" not found under GOPATH/src; are you not running with devcam?")
+		log.Fatal("Directory \"perkeep.org\" not found under GOPATH/src; are you not running with devcam?")
 	}
 	if err != nil {
-		log.Fatalf("Error searching for \"camlistore.org\" under GOPATH: %v", err)
+		log.Fatalf("Error searching for \"perkeep.org\" under GOPATH: %v", err)
 	}
-	return filepath.Join(camliDir, filepath.FromSlash("vendor/embed/glitch/npc_piggy__x1_walk_png_1354829432.png"))
+	return filepath.Join(camliDir, filepath.FromSlash("clients/web/embed/glitch/npc_piggy__x1_walk_png_1354829432.png"))
 }

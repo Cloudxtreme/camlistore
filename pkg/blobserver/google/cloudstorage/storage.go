@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +21,11 @@ package cloudstorage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -33,19 +33,17 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/memory"
-	"camlistore.org/pkg/constants"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/memory"
+	"perkeep.org/pkg/constants"
 
-	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
 	"go4.org/cloud/google/gcsutil"
 	"go4.org/ctxutil"
 	"go4.org/jsonconfig"
 	"go4.org/oauthutil"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
@@ -77,12 +75,12 @@ var (
 	_ blobserver.MaxEnumerateConfig = (*Storage)(nil)
 )
 
-func (gs *Storage) MaxEnumerate() int { return 1000 }
+func (s *Storage) MaxEnumerate() int { return 1000 }
 
-func (gs *Storage) StorageGeneration() (time.Time, string, error) {
-	return gs.genTime, gs.genRandom, nil
+func (s *Storage) StorageGeneration() (time.Time, string, error) {
+	return s.genTime, s.genRandom, nil
 }
-func (gs *Storage) ResetStorageGeneration() error { return errors.New("not supported") }
+func (s *Storage) ResetStorageGeneration() error { return errors.New("not supported") }
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Storage, error) {
 	var (
@@ -122,9 +120,6 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Stora
 		err error
 	)
 	if clientID == "auto" {
-		if !metadata.OnGCE() {
-			return nil, errors.New(`Cannot use "auto" client_id when not running on GCE`)
-		}
 		ts, err = google.DefaultTokenSource(ctx, storage.ScopeReadWrite)
 		if err != nil {
 			return nil, err
@@ -191,7 +186,7 @@ func (s *Storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef,
 		}
 		br, ok := blob.Parse(file)
 		if !ok {
-			return fmt.Errorf("Non-Camlistore object named %q found in bucket", file)
+			return fmt.Errorf("Non-Perkeep object named %q found in bucket", file)
 		}
 		select {
 		case dest <- blob.SizedRef{Ref: br, Size: uint32(obj.Size)}:
@@ -202,16 +197,15 @@ func (s *Storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef,
 	return nil
 }
 
-func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+func (s *Storage) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error) {
 	var buf bytes.Buffer
 	size, err := io.Copy(&buf, source)
 	if err != nil {
 		return blob.SizedRef{}, err
 	}
 
-	// TODO(mpl): use context from caller, once one is available (issue 733)
-	w := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).NewWriter(context.TODO())
-	if _, err := io.Copy(w, ioutil.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+	w := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).NewWriter(ctx)
+	if _, err := io.Copy(w, bytes.NewReader(buf.Bytes())); err != nil {
 		return blob.SizedRef{}, err
 	}
 	if err := w.Close(); err != nil {
@@ -221,48 +215,38 @@ func (s *Storage) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, err
 	if s.cache != nil {
 		// NoHash because it's already verified if we read it
 		// without errors on the io.Copy above.
-		blobserver.ReceiveNoHash(s.cache, br, bytes.NewReader(buf.Bytes()))
+		blobserver.ReceiveNoHash(ctx, s.cache, br, bytes.NewReader(buf.Bytes()))
 	}
 	return blob.SizedRef{Ref: br, Size: uint32(size)}, nil
 }
 
-func (s *Storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+var statGate = syncutil.NewGate(20) // arbitrary cap
+
+func (s *Storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	// TODO: use cache
-	// TODO(mpl): use context from caller, once one is available (issue 733)
-	ctx := context.TODO()
-	var grp syncutil.Group
-	gate := syncutil.NewGate(20) // arbitrary cap
-	for i := range blobs {
-		br := blobs[i]
-		gate.Start()
-		grp.Go(func() error {
-			defer gate.Done()
-			attrs, err := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).Attrs(ctx)
-			if err == storage.ErrObjectNotExist {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			size := attrs.Size
-			if size > constants.MaxBlobSize {
-				return fmt.Errorf("blob %s stat size too large (%d)", br, size)
-			}
-			dest <- blob.SizedRef{Ref: br, Size: uint32(size)}
-			return nil
-		})
-	}
-	return grp.Err()
+	return blobserver.StatBlobsParallelHelper(ctx, blobs, fn, statGate, func(br blob.Ref) (sb blob.SizedRef, err error) {
+		attrs, err := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).Attrs(ctx)
+		if err == storage.ErrObjectNotExist {
+			return sb, nil
+		}
+		if err != nil {
+			return sb, err
+		}
+		size := attrs.Size
+		if size > constants.MaxBlobSize {
+			return sb, fmt.Errorf("blob %s stat size too large (%d)", br, size)
+		}
+		return blob.SizedRef{Ref: br, Size: uint32(size)}, nil
+	})
 }
 
-func (s *Storage) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
+func (s *Storage) Fetch(ctx context.Context, br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	if s.cache != nil {
-		if rc, size, err = s.cache.Fetch(br); err == nil {
+		if rc, size, err = s.cache.Fetch(ctx, br); err == nil {
 			return
 		}
 	}
-	// TODO(mpl): use context from caller, once one is available (issue 733)
-	r, err := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).NewReader(context.TODO())
+	r, err := s.client.Bucket(s.bucket).Object(s.dirPrefix + br.String()).NewReader(ctx)
 	if err == storage.ErrObjectNotExist {
 		return nil, 0, os.ErrNotExist
 	}
@@ -281,12 +265,11 @@ func (s *Storage) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) 
 	return r, size, nil
 }
 
-func (s *Storage) SubFetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, err error) {
+func (s *Storage) SubFetch(ctx context.Context, br blob.Ref, offset, length int64) (rc io.ReadCloser, err error) {
 	if offset < 0 || length < 0 {
 		return nil, blob.ErrNegativeSubFetch
 	}
-	// TODO(mpl): use context from caller, once one is available (issue 733)
-	ctx := context.WithValue(context.TODO(), ctxutil.HTTPClient, s.baseHTTPClient)
+	ctx = context.WithValue(ctx, ctxutil.HTTPClient, s.baseHTTPClient)
 	rc, err = gcsutil.GetPartialObject(ctx, gcsutil.Object{Bucket: s.bucket, Key: s.dirPrefix + br.String()}, offset, length)
 	if err == gcsutil.ErrInvalidRange {
 		return nil, blob.ErrOutOfRangeOffsetSubFetch
@@ -297,12 +280,10 @@ func (s *Storage) SubFetch(br blob.Ref, offset, length int64) (rc io.ReadCloser,
 	return rc, err
 }
 
-func (s *Storage) RemoveBlobs(blobs []blob.Ref) error {
+func (s *Storage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	if s.cache != nil {
-		s.cache.RemoveBlobs(blobs)
+		s.cache.RemoveBlobs(ctx, blobs)
 	}
-	// TODO(mpl): use context from caller, once one is available (issue 733)
-	ctx := context.TODO()
 	gate := syncutil.NewGate(50) // arbitrary
 	var grp syncutil.Group
 	for i := range blobs {

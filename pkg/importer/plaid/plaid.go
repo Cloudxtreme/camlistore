@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Camlistore Authors
+Copyright 2017 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package plaid implements an importer for financial transactions from plaid.com
-package plaid // import "camlistore.org/pkg/importer/plaid"
+package plaid // import "perkeep.org/pkg/importer/plaid"
 
 import (
 	"bytes"
@@ -27,11 +27,11 @@ import (
 	"net/url"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
 
 	"github.com/plaid/plaid-go/plaid"
 )
@@ -42,12 +42,13 @@ func init() {
 
 type imp struct{}
 
-func (*imp) SupportsIncremental() bool {
-	return true
-}
-
-func (*imp) NeedsAPIKey() bool {
-	return true
+func (*imp) Properties() importer.Properties {
+	return importer.Properties{
+		Title:               "Plaid",
+		Description:         "import your financial transactions from plaid.com",
+		SupportsIncremental: true,
+		NeedsAPIKey:         true,
+	}
 }
 
 const (
@@ -165,7 +166,7 @@ func (im *imp) Run(ctx *importer.RunContext) (err error) {
 	client := plaid.NewClient(clientID, secret, plaid.Tartan)
 	resp, _, err := client.ConnectGet(ctx.AccountNode().Attr(acctAttrToken), &opt)
 	if err != nil {
-		fmt.Errorf("ConnectGet: %s\n", err)
+		fmt.Errorf("connectGet: %s", err)
 		return
 	}
 
@@ -194,7 +195,7 @@ func (im *imp) importTransaction(ctx *importer.RunContext, t *plaid.Transaction)
 		return "", err
 	}
 
-	fileRef, err := schema.WriteFileFromReader(ctx.Host.Target(), "", bytes.NewBuffer(transJSON))
+	fileRef, err := schema.WriteFileFromReader(ctx.Context(), ctx.Host.Target(), "", bytes.NewBuffer(transJSON))
 	if err != nil {
 		return "", err
 	}

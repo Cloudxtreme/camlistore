@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,21 +20,21 @@ limitations under the License.
 // has access and visibility to a subset of the blobs which have been
 // uploaded through this namespace. The list of accessible blobs are
 // stored in the provided "inventory" sorted key/value target.
-package namespace // import "camlistore.org/pkg/blobserver/namespace"
+package namespace // import "perkeep.org/pkg/blobserver/namespace"
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/sorted"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/sorted"
 
 	"go4.org/strutil"
 )
@@ -98,7 +98,7 @@ func (ns *nsto) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, a
 	return nil
 }
 
-func (ns *nsto) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
+func (ns *nsto) Fetch(ctx context.Context, br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	invSizeStr, err := ns.inventory.Get(br.String())
 	if err == sorted.ErrNotFound {
 		err = os.ErrNotExist
@@ -111,7 +111,7 @@ func (ns *nsto) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	if err != nil {
 		return
 	}
-	rc, size, err = ns.master.Fetch(br)
+	rc, size, err = ns.master.Fetch(ctx, br)
 	if err != nil {
 		return
 	}
@@ -122,7 +122,7 @@ func (ns *nsto) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	return rc, size, nil
 }
 
-func (ns *nsto) ReceiveBlob(br blob.Ref, src io.Reader) (sb blob.SizedRef, err error) {
+func (ns *nsto) ReceiveBlob(ctx context.Context, br blob.Ref, src io.Reader) (sb blob.SizedRef, err error) {
 	var buf bytes.Buffer
 	size, err := io.Copy(&buf, src)
 	if err != nil {
@@ -134,7 +134,7 @@ func (ns *nsto) ReceiveBlob(br blob.Ref, src io.Reader) (sb blob.SizedRef, err e
 		return blob.SizedRef{br, uint32(size)}, nil
 	}
 
-	sb, err = ns.master.ReceiveBlob(br, &buf)
+	sb, err = ns.master.ReceiveBlob(ctx, br, &buf)
 	if err != nil {
 		return
 	}
@@ -143,7 +143,7 @@ func (ns *nsto) ReceiveBlob(br blob.Ref, src io.Reader) (sb blob.SizedRef, err e
 	return
 }
 
-func (ns *nsto) RemoveBlobs(blobs []blob.Ref) error {
+func (ns *nsto) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	for _, br := range blobs {
 		if err := ns.inventory.Delete(br.String()); err != nil {
 			return err
@@ -152,7 +152,7 @@ func (ns *nsto) RemoveBlobs(blobs []blob.Ref) error {
 	return nil
 }
 
-func (ns *nsto) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (ns *nsto) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	for _, br := range blobs {
 		invSizeStr, err := ns.inventory.Get(br.String())
 		if err == sorted.ErrNotFound {
@@ -165,7 +165,9 @@ func (ns *nsto) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
 		if err != nil {
 			log.Printf("Bogus namespace key %q / value %q", br.String(), invSizeStr)
 		}
-		dest <- blob.SizedRef{br, uint32(invSize)}
+		if err := fn(blob.SizedRef{br, uint32(invSize)}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

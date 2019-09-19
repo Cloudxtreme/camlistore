@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package cmdmain contains the shared implementation for camget,
-// camput, camtool, and other Camlistore command-line tools.
-package cmdmain // import "camlistore.org/pkg/cmdmain"
+// Package cmdmain contains the shared implementation for pk-get,
+// pk-put, pk, and other Perkeep command-line tools.
+package cmdmain // import "perkeep.org/pkg/cmdmain"
 
 import (
 	"flag"
@@ -24,10 +24,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 
-	"camlistore.org/pkg/buildinfo"
+	"perkeep.org/pkg/buildinfo"
 
 	"go4.org/legal"
 )
@@ -67,6 +70,9 @@ var (
 	modeCommand = make(map[string]CommandRunner)
 	modeFlags   = make(map[string]*flag.FlagSet)
 	wantHelp    = make(map[string]*bool)
+	// asNewCommand stores whether the mode should actually be run as a new
+	// independent command.
+	asNewCommand = make(map[string]bool)
 
 	// Indirections for replacement by tests
 	Stderr io.Writer = os.Stderr
@@ -92,6 +98,21 @@ type CommandRunner interface {
 	RunCommand(args []string) error
 }
 
+// ExecRunner is the type that a command mode should implement when that mode
+// just calls a new executable that will run as a new command.
+type ExecRunner interface {
+	CommandRunner
+	LookPath() (string, error)
+}
+
+// Demoter is an interface that boring commands can implement to
+// demote themselves in the tool listing, for boring or low-level
+// subcommands. They only show up in --help mode.
+type Demoter interface {
+	CommandRunner
+	Demote() bool
+}
+
 type exampler interface {
 	Examples() []string
 }
@@ -100,9 +121,14 @@ type describer interface {
 	Describe() string
 }
 
-// RegisterCommand adds a mode to the list of modes for the main command.
+func demote(c CommandRunner) bool {
+	i, ok := c.(Demoter)
+	return ok && i.Demote()
+}
+
+// RegisterMode adds a mode to the list of modes for the main command.
 // It is meant to be called in init() for each subcommand.
-func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunner) {
+func RegisterMode(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunner) {
 	if _, dup := modeCommand[mode]; dup {
 		log.Fatalf("duplicate command %q registered", mode)
 	}
@@ -114,6 +140,15 @@ func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunne
 	wantHelp[mode] = &cmdHelp
 	modeFlags[mode] = flags
 	modeCommand[mode] = makeCmd(flags)
+}
+
+// RegisterCommand adds a mode to the list of modes for the main command, and
+// also specifies that this mode is just another executable that runs as a new
+// cmdmain command. The executable to run is determined by the LookPath implementation
+// for this mode.
+func RegisterCommand(mode string, makeCmd func(Flags *flag.FlagSet) CommandRunner) {
+	RegisterMode(mode, makeCmd)
+	asNewCommand[mode] = true
 }
 
 func hasFlags(flags *flag.FlagSet) bool {
@@ -129,28 +164,45 @@ func usage(msg string) {
 	if msg != "" {
 		Errorf("Error: %v\n", msg)
 	}
+	var modesQualifer string
+	if !*FlagHelp {
+		modesQualifer = " (use --help to see all modes)"
+	}
 	Errorf(`
-Usage: ` + cmdName + ` [globalopts] <mode> [commandopts] [commandargs]
+Usage: `+cmdName+` [globalopts] <mode> [commandopts] [commandargs]
 
-Modes:
+Modes:%s
 
-`)
+`, modesQualifer)
+	var modes []string
 	for mode, cmd := range modeCommand {
-		if des, ok := cmd.(describer); ok {
-			Errorf("  %s: %s\n", mode, des.Describe())
+		if des, ok := cmd.(describer); ok && (*FlagHelp || !demote(cmd)) {
+			modes = append(modes, fmt.Sprintf("  %s: %s\n", mode, des.Describe()))
 		}
 	}
+	sort.Strings(modes)
+	for i := range modes {
+		Errorf("%s", modes[i])
+	}
+
 	Errorf("\nExamples:\n")
+	modes = nil
 	for mode, cmd := range modeCommand {
-		if ex, ok := cmd.(exampler); ok {
+		if ex, ok := cmd.(exampler); ok && (*FlagHelp || !demote(cmd)) {
+			line := ""
 			exs := ex.Examples()
 			if len(exs) > 0 {
-				Errorf("\n")
+				line = "\n"
 			}
 			for _, example := range exs {
-				Errorf("  %s %s %s\n", cmdName, mode, example)
+				line += fmt.Sprintf("  %s %s %s\n", cmdName, mode, example)
 			}
+			modes = append(modes, line)
 		}
+	}
+	sort.Strings(modes)
+	for i := range modes {
+		Errorf("%s", modes[i])
 	}
 
 	Errorf(`
@@ -200,7 +252,7 @@ func PrintLicenses() {
 }
 
 // Main is meant to be the core of a command that has
-// subcommands (modes), such as camput or camtool.
+// subcommands (modes), such as pk-put or pk.
 func Main() {
 	registerFlagOnce.Do(ExtraFlagRegistration)
 	if setCommandLineOutput != nil {
@@ -210,11 +262,12 @@ func Main() {
 		usage("")
 	}
 	flag.Parse()
+	flag.CommandLine.SetOutput(Stderr)
 	PostFlag()
 
 	args := flag.Args()
 	if *FlagVersion {
-		fmt.Fprintf(Stderr, "%s version: %s\n", os.Args[0], buildinfo.Version())
+		fmt.Fprintf(Stderr, "%s version: %s\n", os.Args[0], buildinfo.Summary())
 		return
 	}
 	if *FlagHelp {
@@ -234,10 +287,22 @@ func Main() {
 		usage(fmt.Sprintf("Unknown mode %q", mode))
 	}
 
+	if _, ok := asNewCommand[mode]; ok {
+		runAsNewCommand(cmd, mode)
+		return
+	}
+
 	cmdFlags := modeFlags[mode]
 	cmdFlags.SetOutput(Stderr)
 	err := cmdFlags.Parse(args[1:])
 	if err != nil {
+		// We want -h to behave as -help, but without having to define another flag for
+		// it, so we handle it here.
+		// TODO(mpl): maybe even remove -help and just let them both be handled here?
+		if err == flag.ErrHelp {
+			help(mode)
+			return
+		}
 		err = ErrUsage
 	} else {
 		if *wantHelp[mode] {
@@ -270,6 +335,39 @@ func Main() {
 	}
 }
 
+// runAsNewCommand runs the executable specified by cmd's LookPath, which means
+// cmd must implement the ExecRunner interface. The executable must be a binary of
+// a program that runs Main.
+func runAsNewCommand(cmd CommandRunner, mode string) {
+	execCmd, ok := cmd.(ExecRunner)
+	if !ok {
+		panic(fmt.Sprintf("%v does not implement ExecRunner", mode))
+	}
+	cmdPath, err := execCmd.LookPath()
+	if err != nil {
+		Errorf("Error: %v\n", err)
+		Exit(2)
+	}
+	allArgs := shiftFlags(mode)
+	if err := runExec(cmdPath, allArgs, newCopyEnv()); err != nil {
+		panic(fmt.Sprintf("running %v should have ended with an os.Exit, and not leave us with that error: %v", cmdPath, err))
+	}
+}
+
+// shiftFlags prepends all the arguments (global flags) passed before the given
+// mode to the list of arguments after that mode, and returns that list.
+func shiftFlags(mode string) []string {
+	modePos := 0
+	for k, v := range os.Args {
+		if v == mode {
+			modePos = k
+			break
+		}
+	}
+	globalFlags := os.Args[1:modePos]
+	return append(globalFlags, os.Args[modePos+1:]...)
+}
+
 // Errorf prints to Stderr, regardless of FlagVerbose.
 func Errorf(format string, args ...interface{}) {
 	fmt.Fprintf(Stderr, format, args...)
@@ -288,4 +386,55 @@ func Logf(format string, v ...interface{}) {
 		return
 	}
 	logger.Printf(format, v...)
+}
+
+// sysExec is set to syscall.Exec on platforms that support it.
+var sysExec func(argv0 string, argv []string, envv []string) (err error)
+
+// runExec execs bin. If the platform doesn't support exec, it runs it and waits
+// for it to finish.
+func runExec(bin string, args []string, e *env) error {
+	if sysExec != nil {
+		sysExec(bin, append([]string{filepath.Base(bin)}, args...), e.flat())
+	}
+
+	cmd := exec.Command(bin, args...)
+	cmd.Env = e.flat()
+	cmd.Stdout = Stdout
+	cmd.Stderr = Stderr
+	return cmd.Run()
+}
+
+type env struct {
+	m     map[string]string
+	order []string
+}
+
+func (e *env) set(k, v string) {
+	_, dup := e.m[k]
+	e.m[k] = v
+	if !dup {
+		e.order = append(e.order, k)
+	}
+}
+
+func (e *env) flat() []string {
+	vv := make([]string, 0, len(e.order))
+	for _, k := range e.order {
+		if v, ok := e.m[k]; ok {
+			vv = append(vv, k+"="+v)
+		}
+	}
+	return vv
+}
+
+func newCopyEnv() *env {
+	e := &env{make(map[string]string), nil}
+	for _, kv := range os.Environ() {
+		eq := strings.Index(kv, "=")
+		if eq > 0 {
+			e.set(kv[:eq], kv[eq+1:])
+		}
+	}
+	return e
 }

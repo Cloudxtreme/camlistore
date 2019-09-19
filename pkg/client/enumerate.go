@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,14 +17,14 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"net/url"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
 )
 
 // EnumerateOpts are the options to Client.EnumerateBlobsOpts.
@@ -71,7 +71,7 @@ func (c *Client) EnumerateBlobsOpts(ctx context.Context, ch chan<- blob.SizedRef
 
 	error := func(msg string, e error) error {
 		err := fmt.Errorf("client enumerate error: %s: %v", msg, e)
-		c.printf("%v", err.Error)
+		c.printf("%v", err)
 		return err
 	}
 
@@ -90,7 +90,7 @@ func (c *Client) EnumerateBlobsOpts(ctx context.Context, ch chan<- blob.SizedRef
 		}
 		url_ := fmt.Sprintf("%s/camli/enumerate-blobs?after=%s&limit=%d&maxwaitsec=%d",
 			pfx, url.QueryEscape(after), enumerateBatchSize, waitSec)
-		req := c.newRequest("GET", url_)
+		req := c.newRequest(ctx, "GET", url_)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return error("http request", err)

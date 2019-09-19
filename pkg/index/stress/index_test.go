@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Camlistore Authors.
+Copyright 2016 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,7 @@ package stress
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
 	"flag"
-	"fmt"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -33,20 +31,22 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/localdisk"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/server"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/kvfile"
-	"camlistore.org/pkg/sorted/leveldb"
-	"camlistore.org/pkg/sorted/sqlite"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/localdisk"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/server"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/kvfile"
+	"perkeep.org/pkg/sorted/leveldb"
+	"perkeep.org/pkg/sorted/sqlite"
+	"perkeep.org/pkg/types/camtypes"
 )
+
+var ctxbg = context.Background()
 
 var (
 	flagTempDir  = flag.String("tempDir", os.TempDir(), "dir where we'll write all the benchmarks dirs. In case the default is on too small a partition since we may use lots of data.")
@@ -293,7 +293,7 @@ func populate(b *testing.B, dbfile string,
 	if err != nil {
 		b.Fatal(err)
 	}
-	if _, err := blobserver.Receive(bs, ks.pubKeyRef, strings.NewReader(ks.pubKey)); err != nil {
+	if _, err := blobserver.Receive(ctxbg, bs, ks.pubKeyRef, strings.NewReader(ks.pubKey)); err != nil {
 		b.Fatal(err)
 	}
 	idx, err := index.New(kv)
@@ -312,7 +312,7 @@ func populate(b *testing.B, dbfile string,
 		td := &trackDigestReader{r: f}
 		fm := schema.NewFileMap(v.Name())
 		fm.SetModTime(v.ModTime())
-		fileRef, err := schema.WriteFileMap(bs, fm, td)
+		fileRef, err := schema.WriteFileMap(ctxbg, bs, fm, td)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -327,13 +327,13 @@ func populate(b *testing.B, dbfile string,
 			EntityFetcher: ks.entityFetcher,
 			SignatureTime: time.Unix(0, 0),
 		}
-		signed, err := sr.Sign()
+		signed, err := sr.Sign(ctxbg)
 		if err != nil {
 			b.Fatal("problem signing: " + err.Error())
 		}
-		pn := blob.SHA1FromString(signed)
+		pn := blob.RefFromString(signed)
 		// N.B: use blobserver.Receive so that the blob hub gets notified, and the blob gets enqueued into the index
-		if _, err := blobserver.Receive(bs, pn, strings.NewReader(signed)); err != nil {
+		if _, err := blobserver.Receive(ctxbg, bs, pn, strings.NewReader(signed)); err != nil {
 			b.Fatal(err)
 		}
 
@@ -351,12 +351,12 @@ func populate(b *testing.B, dbfile string,
 			EntityFetcher: ks.entityFetcher,
 			SignatureTime: claimTime,
 		}
-		signed, err = sr.Sign()
+		signed, err = sr.Sign(ctxbg)
 		if err != nil {
 			b.Fatal("problem signing: " + err.Error())
 		}
-		cl := blob.SHA1FromString(signed)
-		if _, err := blobserver.Receive(bs, cl, strings.NewReader(signed)); err != nil {
+		cl := blob.RefFromString(signed)
+		if _, err := blobserver.Receive(ctxbg, bs, cl, strings.NewReader(signed)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -373,9 +373,9 @@ type keyStuff struct {
 }
 
 func doKeyStuff(b *testing.B) keyStuff {
-	camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+	camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 	if err != nil {
-		b.Fatal("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+		b.Fatal("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 	}
 	secretRingFile := filepath.Join(camliRootPath, "pkg", "jsonsign", "testdata", "test-secring.gpg")
 	pubKey := `-----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -391,7 +391,7 @@ Enpn/oOOfYFa5h0AFndZd1blMvruXfdAobjVABEBAAE=
 	return keyStuff{
 		secretRingFile: secretRingFile,
 		pubKey:         pubKey,
-		pubKeyRef:      blob.SHA1FromString(pubKey),
+		pubKeyRef:      blob.RefFromString(pubKey),
 		entityFetcher: &jsonsign.CachingEntityFetcher{
 			Fetcher: &jsonsign.FileEntityFetcher{File: secretRingFile},
 		},
@@ -573,7 +573,7 @@ type trackDigestReader struct {
 
 func (t *trackDigestReader) Read(p []byte) (n int, err error) {
 	if t.h == nil {
-		t.h = sha1.New()
+		t.h = blob.NewHash()
 	}
 	n, err = t.r.Read(p)
 	t.h.Write(p[:n])
@@ -581,7 +581,7 @@ func (t *trackDigestReader) Read(p []byte) (n int, err error) {
 }
 
 func (t *trackDigestReader) Sum() string {
-	return fmt.Sprintf("sha1-%x", t.h.Sum(nil))
+	return blob.RefFromHash(t.h).String()
 }
 
 func TestChildIndexer(t *testing.T) {

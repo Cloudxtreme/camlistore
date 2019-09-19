@@ -2,7 +2,7 @@
 Picasa Importer
 ===============
 
-This is a working Camlistore importer for Picasa. So far it can import
+This is a working Perkeep importer for Picasa. So far it can import
 all photos but not their metadata.
 
 To use:
@@ -40,4 +40,4 @@ TODO
   * The album's author name is not used yet, and the album's short name is needed.
   * Picasa Web dumps a lot of metadata on us. Which would be usable?
 
-See https://camlistore.org/issue/391
+See https://perkeep.org/issue/391

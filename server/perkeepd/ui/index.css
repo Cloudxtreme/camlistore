@@ -1,0 +1,82 @@
+/*
+Copyright 2012 The Perkeep Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+@import (less) "prefix-free.css";
+
+
+/* http://www.paulirish.com/2012/box-sizing-border-box-ftw/ */
+*, *:before, *:after {
+	.box-sizing(border-box);
+}
+
+body {
+	margin: 0;
+	overflow-x: hidden;
+	overflow-y: scroll;
+}
+
+.cam-index-page {
+	font: 16px/1.4 normal Arial, sans-serif;
+}
+
+.cam-index-title {
+	display: inline-block;
+}
+
+.cam-content-wrap {
+	position: relative;
+}
+
+.cam-unselectable {
+	.user-select(none);
+}
+
+.cam-index-upload-dialog>* {
+	vertical-align: middle;
+}
+
+.cam-unstyled-button {
+    border: none;
+    margin: 0;
+    padding: 0;
+    width: auto;
+	overflow: visible;
+	cursor: pointer;
+	text-decoration: none;
+
+	background: transparent;
+
+    /* Inherit font, color, and align from ancestor */
+    color: inherit;
+    font: inherit;
+	text-align: inherit;
+
+    /* Normalize `line-height`. Cannot be changed from `normal` in Firefox 4+. */
+    line-height: normal;
+
+    /* Corrects font smoothing for webkit */
+    -webkit-font-smoothing: inherit;
+    -moz-osx-font-smoothing: inherit;
+
+    /* Corrects inability to style clickable `input` types in iOS */
+	-webkit-appearance: none;
+
+	/* Remove excess padding and border in Firefox 4+ */
+	&::-moz-focus-inner {
+		border: 0;
+		padding: 0;
+	}
+}

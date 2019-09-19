@@ -1,7 +1,7 @@
 // +build linux darwin
 
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ package fs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -27,10 +28,9 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"golang.org/x/net/context"
 )
 
-// If TrackStats is true, statistics are kept on operations.
+// TrackStats controls whether statistics are kept on operations.
 var TrackStats bool
 
 func init() {
@@ -57,7 +57,7 @@ func newStat(name string) *stat {
 	return s
 }
 
-// TODO: https://github.com/camlistore/camlistore/issues/679
+// TODO: https://github.com/perkeep/perkeep/issues/679
 
 type atomicInt64 struct {
 	v int64

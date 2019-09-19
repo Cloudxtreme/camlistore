@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -163,6 +163,14 @@ func (fs *gcsFS) OpenFile(name string, flag int, perm os.FileMode) (wkfs.FileWri
 	}
 	// TODO(mpl): consider adding perm to the object's ObjectAttrs.Metadata
 	return fs.sc.Bucket(bucket).Object(fileName).NewWriter(fs.ctx), nil
+}
+
+func (fs *gcsFS) Remove(name string) error {
+	bucket, fileName, err := fs.parseName(name)
+	if err != nil {
+		return err
+	}
+	return fs.sc.Bucket(bucket).Object(fileName).Delete(fs.ctx)
 }
 
 type statInfo struct {

@@ -1,5 +1,5 @@
 /*
-Copyright 2012 The Camlistore Authors.
+Copyright 2012 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // Package sqlkv implements the sorted.KeyValue interface using an *sql.DB.
-package sqlkv // import "camlistore.org/pkg/sorted/sqlkv"
+package sqlkv // import "perkeep.org/pkg/sorted/sqlkv"
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,9 +26,9 @@ import (
 	"strings"
 	"sync"
 
-	"camlistore.org/pkg/leak"
-	"camlistore.org/pkg/sorted"
 	"go4.org/syncutil"
+	"perkeep.org/internal/leak"
+	"perkeep.org/pkg/sorted"
 )
 
 // KeyValue implements the sorted.KeyValue interface using an *sql.DB.
@@ -46,7 +47,7 @@ type KeyValue struct {
 	//
 	// This originally existed just for SQLite, whose driver likes
 	// to return "the database is locked"
-	// (camlistore.org/issue/114), so this keeps some pressure
+	// (perkeep.org/issue/114), so this keeps some pressure
 	// off. But we still trust SQLite to deal with concurrency in
 	// most cases.
 	//
@@ -122,11 +123,39 @@ func (b *batchTx) Delete(key string) {
 	_, b.err = b.tx.Exec(b.kv.sql("DELETE FROM /*TPRE*/rows WHERE k=?"), key)
 }
 
-func (kv *KeyValue) BeginBatch() sorted.BatchMutation {
+func (b *batchTx) Find(start, end string) sorted.Iterator {
+	if b.err != nil {
+		return &iter{
+			kv:         b.kv,
+			closeCheck: leak.NewChecker(),
+			err:        b.err,
+		}
+	}
+	return find(b.kv, b.tx, start, end)
+}
+
+func (b *batchTx) Get(key string) (value string, err error) {
+	if b.err != nil {
+		return "", b.err
+	}
+	return get(b.kv, b.tx, key)
+}
+
+func (b *batchTx) Close() error {
+	if b.err != nil {
+		return b.err
+	}
+	if b.kv.Gate != nil {
+		defer b.kv.Gate.Done()
+	}
+	return b.tx.Commit()
+}
+
+func (kv *KeyValue) beginTx(txOpts *sql.TxOptions) *batchTx {
 	if kv.Gate != nil {
 		kv.Gate.Start()
 	}
-	tx, err := kv.DB.Begin()
+	tx, err := kv.DB.BeginTx(context.TODO(), txOpts)
 	if err != nil {
 		log.Printf("SQL BEGIN BATCH: %v", err)
 	}
@@ -135,6 +164,10 @@ func (kv *KeyValue) BeginBatch() sorted.BatchMutation {
 		err: err,
 		kv:  kv,
 	}
+}
+
+func (kv *KeyValue) BeginBatch() sorted.BatchMutation {
+	return kv.beginTx(nil)
 }
 
 func (kv *KeyValue) CommitBatch(b sorted.BatchMutation) error {
@@ -154,16 +187,22 @@ func (kv *KeyValue) CommitBatch(b sorted.BatchMutation) error {
 	return bt.tx.Commit()
 }
 
+func (kv *KeyValue) BeginReadTx() sorted.ReadTransaction {
+	return kv.beginTx(&sql.TxOptions{
+		ReadOnly: true,
+		// Needed so that repeated reads of the same data are always
+		// consistent:
+		Isolation: sql.LevelSerializable,
+	})
+
+}
+
 func (kv *KeyValue) Get(key string) (value string, err error) {
 	if kv.Gate != nil {
 		kv.Gate.Start()
 		defer kv.Gate.Done()
 	}
-	err = kv.DB.QueryRow(kv.sql("SELECT v FROM /*TPRE*/rows WHERE k=?"), key).Scan(&value)
-	if err == sql.ErrNoRows {
-		err = sorted.ErrNotFound
-	}
-	return
+	return get(kv, kv.DB, key)
 }
 
 func (kv *KeyValue) Set(key, value string) error {
@@ -205,30 +244,53 @@ func (kv *KeyValue) Wipe() error {
 
 func (kv *KeyValue) Close() error { return kv.DB.Close() }
 
-func (kv *KeyValue) Find(start, end string) sorted.Iterator {
-	var releaseGate func() // nil if unused
-	if kv.Gate != nil {
-		kv.Gate.Start()
-		releaseGate = kv.Gate.Done
-	}
+// Something we can make queries on. This will either be an *sql.DB or an *sql.Tx.
+type queryObject interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// Common logic for KeyValue.Find and batchTx.Find.
+func find(kv *KeyValue, qobj queryObject, start, end string) *iter {
 	var rows *sql.Rows
 	var err error
 	if end == "" {
-		rows, err = kv.DB.Query(kv.sql("SELECT k, v FROM /*TPRE*/rows WHERE k >= ? ORDER BY k "), start)
+		rows, err = qobj.Query(kv.sql("SELECT k, v FROM /*TPRE*/rows WHERE k >= ? ORDER BY k "), start)
 	} else {
-		rows, err = kv.DB.Query(kv.sql("SELECT k, v FROM /*TPRE*/rows WHERE k >= ? AND k < ? ORDER BY k "), start, end)
+		rows, err = qobj.Query(kv.sql("SELECT k, v FROM /*TPRE*/rows WHERE k >= ? AND k < ? ORDER BY k "), start, end)
 	}
 	if err != nil {
 		log.Printf("unexpected query error: %v", err)
 		return &iter{err: err}
 	}
 
-	it := &iter{
-		kv:          kv,
-		rows:        rows,
-		closeCheck:  leak.NewChecker(),
-		releaseGate: releaseGate,
+	return &iter{
+		kv:         kv,
+		rows:       rows,
+		closeCheck: leak.NewChecker(),
 	}
+}
+
+// Common logic for KeyValue.Get and batchTx.Get
+func get(kv *KeyValue, qobj queryObject, key string) (value string, err error) {
+	err = qobj.QueryRow(kv.sql("SELECT v FROM /*TPRE*/rows WHERE k=?"), key).Scan(&value)
+	if err == sql.ErrNoRows {
+		err = sorted.ErrNotFound
+	}
+	return
+}
+
+func (kv *KeyValue) Find(start, end string) sorted.Iterator {
+	var releaseGate func() // nil if unused
+	if kv.Gate != nil {
+		var once sync.Once
+		kv.Gate.Start()
+		releaseGate = func() {
+			once.Do(kv.Gate.Done)
+		}
+	}
+	it := find(kv, kv.DB, start, end)
+	it.releaseGate = releaseGate
 	return it
 }
 

@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema/nodeattr"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 // LocationHelper queries permanode locations.
@@ -17,16 +17,18 @@ import (
 // A LocationHelper is not safe for concurrent use.
 // Callers should use Lock or RLock on the underlying index instead.
 type LocationHelper struct {
-	// TODO(attila): replace the index Interface and corpus *Corpus
-	// with an *index.Index once FakeIndex is gone.
-	index  Interface
+	index  *Index
 	corpus *Corpus // may be nil
 }
 
 // NewLocationHelper returns a new location handler
 // that uses ix to query blob attributes.
-func NewLocationHelper(ix Interface) *LocationHelper {
-	return &LocationHelper{index: ix}
+func NewLocationHelper(ix *Index) *LocationHelper {
+	lh := &LocationHelper{index: ix}
+	if ix.corpus != nil {
+		lh.corpus = ix.corpus
+	}
+	return lh
 }
 
 // SetCorpus sets the corpus to be used
@@ -51,25 +53,25 @@ var altLocationRef = map[string][]string{
 // The sources are checked in this order, the location from
 // the first source yielding a valid result is returned.
 func (lh *LocationHelper) PermanodeLocation(ctx context.Context, permaNode blob.Ref,
-	at time.Time, signer blob.Ref) (camtypes.Location, error) {
-
-	return lh.permanodeLocation(ctx, permaNode, at, signer, true)
+	at time.Time, owner *Owner) (camtypes.Location, error) {
+	return lh.permanodeLocation(ctx, permaNode, at, owner, true)
 }
 
 func (lh *LocationHelper) permanodeLocation(ctx context.Context,
-	pn blob.Ref, at time.Time, signer blob.Ref,
+	pn blob.Ref, at time.Time, owner *Owner,
 	useRef bool) (loc camtypes.Location, err error) {
 
-	pa := permAttr{at: at, signerFilter: signer}
+	signerID := owner.KeyID() // might be empty
+	pa := permAttr{at: at, signerFilter: owner.RefSet(signerID)}
 	if lh.corpus != nil {
 		var claims []*camtypes.Claim
-		pa.attrs, claims = lh.corpus.permanodeAttrsOrClaims(pn, at, signer)
+		pa.attrs, claims = lh.corpus.permanodeAttrsOrClaims(pn, at, signerID)
 		if claims != nil {
 			pa.claims = claimPtrSlice(claims)
 		}
 	} else {
 		var claims []camtypes.Claim
-		claims, err = lh.index.AppendClaims(ctx, nil, pn, signer, "")
+		claims, err = lh.index.AppendClaims(ctx, nil, pn, signerID, "")
 		if err != nil {
 			return camtypes.Location{}, err
 		}
@@ -102,7 +104,7 @@ func (lh *LocationHelper) permanodeLocation(ctx context.Context,
 				if !hasRef {
 					continue
 				}
-				loc, err = lh.permanodeLocation(ctx, refPn, at, signer, false)
+				loc, err = lh.permanodeLocation(ctx, refPn, at, owner, false)
 				if err == nil {
 					return loc, err
 				}
@@ -138,7 +140,7 @@ type permAttr struct {
 	claims claimsIntf
 
 	at           time.Time
-	signerFilter blob.Ref
+	signerFilter SignerRefSet
 }
 
 // get returns the value of attr.

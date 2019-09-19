@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors.
+Copyright 2014 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package client
 import (
 	"testing"
 
-	"camlistore.org/pkg/types/clientconfig"
+	"perkeep.org/pkg/types/clientconfig"
 )
 
 func TestAliasFromConfig(t *testing.T) {
@@ -58,6 +58,35 @@ func TestAliasFromConfig(t *testing.T) {
 		}
 		if alias != want {
 			t.Errorf("url %v matched %v, wanted %v", url, alias, want)
+		}
+	}
+}
+
+func TestServerOfName(t *testing.T) {
+	addrs := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "foo.com:80",
+			want:  "foo.com",
+		},
+		{
+			input: "192.168.0.9:80",
+			want:  "",
+		},
+		{
+			input: "foo.com",
+			want:  "",
+		},
+	}
+	c, err := New(OptionNoExternalConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range addrs {
+		if got := c.serverNameOfAddr(v.input); got != v.want {
+			t.Errorf("wanted %v, got %q", v.want, got)
 		}
 	}
 }

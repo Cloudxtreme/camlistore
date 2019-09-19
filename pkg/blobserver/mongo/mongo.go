@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,12 +34,13 @@ collection (optional, defaults to blobs)
 user (optional)
 password (optional)
 */
-package mongo // import "camlistore.org/pkg/blobserver/mongo"
+package mongo // import "perkeep.org/pkg/blobserver/mongo"
 
 import (
-	"camlistore.org/pkg/blobserver"
 	"go4.org/jsonconfig"
-	"labix.org/v2/mgo"
+	"go4.org/legal"
+	"gopkg.in/mgo.v2"
+	"perkeep.org/pkg/blobserver"
 )
 
 type mongoStorage struct {
@@ -59,6 +60,12 @@ type blobDoc struct {
 
 func init() {
 	blobserver.RegisterStorageConstructor("mongo", blobserver.StorageConstructor(newFromConfig))
+	legal.RegisterLicense(`
+For Mongo Driver
+mgo - MongoDB driver for Go
+Copyright (c) 2010-2013 - Gustavo Niemeyer <gustavo@niemeyer.net>
+All rights reserved.
+`)
 }
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (blobserver.Storage, error) {

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package jsonsign implements Camlistore's cryptographic signing and
+// Package jsonsign implements Perkeep's cryptographic signing and
 // verification of JSON blobs.
-package jsonsign // import "camlistore.org/pkg/jsonsign"
+package jsonsign // import "perkeep.org/pkg/jsonsign"

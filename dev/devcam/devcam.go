@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ import (
 	"syscall"
 	"time"
 
-	"camlistore.org/pkg/cmdmain"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/cmdmain"
 )
 
 var (
@@ -46,7 +46,7 @@ var (
 	withSqlite bool
 )
 
-// The path to the Camlistore source tree. Any devcam command
+// The path to the Perkeep source tree. Any devcam command
 // should be run from there.
 var camliSrcRoot string
 
@@ -151,7 +151,7 @@ func handleSignals(camliProc *os.Process) {
 	}
 }
 
-func checkCamliSrcRoot() {
+func checkPerkeepSrcRoot() {
 	args := flag.Args()
 	// TODO(mpl): we should probably get rid of that limitation someday.
 	if len(args) > 0 && (args[0] == "review" ||
@@ -164,7 +164,7 @@ func checkCamliSrcRoot() {
 		if !os.IsNotExist(err) {
 			log.Fatalf("Could not stat make.go: %v", err)
 		}
-		log.Fatal("./make.go not found; devcam needs to be run from the Camlistore source tree root.")
+		log.Fatal("./make.go not found; devcam needs to be run from the Perkeep source tree root.")
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -187,7 +187,7 @@ func repoRoot() (string, error) {
 			return dir, nil
 		}
 		if len(dir) == rootlen && dir[rootlen-1] == filepath.Separator {
-			return "", fmt.Errorf(".git not found. Rerun from within the Camlistore source tree.")
+			return "", fmt.Errorf(".git not found. Rerun from within the Perkeep source tree")
 		}
 		dir = filepath.Dir(dir)
 	}
@@ -233,45 +233,42 @@ func checkModtime() error {
 	return nil
 }
 
-// Build builds the camlistore command at the given path from the source tree root.
-func build(path string) error {
+// build builds the named perkeep targets.
+// Each target may have its "perkeep.org" prefix removed.
+func build(targets ...string) error {
 	if v, _ := strconv.ParseBool(os.Getenv("CAMLI_FAST_DEV")); v {
 		// Demo mode. See dev/demo.sh.
 		return nil
 	}
-	_, cmdName := filepath.Split(path)
-	target := pathpkg.Join("camlistore.org", filepath.ToSlash(path))
-	binPath := filepath.Join("bin", cmdName)
-	var modtime int64
-	fi, err := os.Stat(binPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("Could not stat %v: %v", binPath, err)
+	var fullTargets []string
+	for _, t := range targets {
+		t = filepath.ToSlash(t)
+		if !strings.HasPrefix(t, "perkeep.org") {
+			t = pathpkg.Join("perkeep.org", t)
 		}
-	} else {
-		modtime = fi.ModTime().Unix()
+		fullTargets = append(fullTargets, t)
 	}
+	targetsComma := strings.Join(fullTargets, ",")
 	args := []string{
 		"run", "make.go",
 		"--quiet",
 		"--race=" + strconv.FormatBool(*race),
 		"--embed_static=false",
 		"--sqlite=" + strconv.FormatBool(withSqlite),
-		fmt.Sprintf("--if_mods_since=%d", modtime),
-		"--targets=" + target,
+		"--targets=" + targetsComma,
 	}
 	cmd := exec.Command("go", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("Error building %v: %v", target, err)
+		return fmt.Errorf("error building %v: %v", targetsComma, err)
 	}
 	return nil
 }
 
 func main() {
 	cmdmain.PostFlag = func() {
-		checkCamliSrcRoot()
+		checkPerkeepSrcRoot()
 		if err := checkModtime(); err != nil {
 			log.Printf("Skipping freshness check: %v", err)
 		}

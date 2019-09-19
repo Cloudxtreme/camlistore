@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,11 @@ limitations under the License.
 // Package indextest contains the unit tests for the indexer so they
 // can be re-used for each specific implementation of the index
 // Storage interface.
-package indextest // import "camlistore.org/pkg/index/indextest"
+package indextest // import "perkeep.org/pkg/index/indextest"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,16 +35,17 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/jsonsign"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/camtypes"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/jsonsign"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/test"
+	"perkeep.org/pkg/types/camtypes"
 )
+
+var ctxbg = context.Background()
 
 var flagShowReindexRace = flag.Bool("show_reindex_race", false, "demonstrate the reindex race reported at issue #756")
 
@@ -106,16 +108,16 @@ func (id *IndexDeps) uploadAndSign(m *schema.Builder) blob.Ref {
 		EntityFetcher: id.EntityFetcher,
 		SignatureTime: id.now,
 	}
-	signed, err := sr.Sign()
+	signed, err := sr.Sign(ctxbg)
 	if err != nil {
 		id.Fatalf("problem signing: " + err.Error())
 	}
 	tb := &test.Blob{Contents: signed}
-	_, err = id.BlobSource.ReceiveBlob(tb.BlobRef(), tb.Reader())
+	_, err = id.BlobSource.ReceiveBlob(ctxbg, tb.BlobRef(), tb.Reader())
 	if err != nil {
 		id.Fatalf("public uploading signed blob to blob source, pre-indexing: %v, %v", tb.BlobRef(), err)
 	}
-	_, err = id.Index.ReceiveBlob(tb.BlobRef(), tb.Reader())
+	_, err = id.Index.ReceiveBlob(ctxbg, tb.BlobRef(), tb.Reader())
 	if err != nil {
 		id.Fatalf("problem indexing blob: %v\nblob was:\n%s", err, signed)
 	}
@@ -129,7 +131,7 @@ func (id *IndexDeps) NewPermanode() blob.Ref {
 	return id.uploadAndSign(unsigned)
 }
 
-// NewPermanode creates (& signs) a new planned permanode and adds it
+// NewPlannedPermanode creates (& signs) a new planned permanode and adds it
 // to the index, returning its blobref.
 func (id *IndexDeps) NewPlannedPermanode(key string) blob.Ref {
 	unsigned := schema.NewPlannedPermanode(key)
@@ -182,7 +184,7 @@ func (id *IndexDeps) UploadString(v string) blob.Ref {
 	cb := &test.Blob{Contents: v}
 	id.BlobSource.AddBlob(cb)
 	br := cb.BlobRef()
-	_, err := id.Index.ReceiveBlob(br, cb.Reader())
+	_, err := id.Index.ReceiveBlob(ctxbg, br, cb.Reader())
 	if err != nil {
 		id.Fatalf("UploadString: %v", err)
 	}
@@ -195,7 +197,7 @@ func (id *IndexDeps) UploadFile(fileName string, contents string, modTime time.T
 
 	m := schema.NewFileMap(fileName)
 	m.PopulateParts(int64(len(contents)), []schema.BytesPart{
-		schema.BytesPart{
+		{
 			Size:    uint64(len(contents)),
 			BlobRef: wholeRef,
 		}})
@@ -209,7 +211,7 @@ func (id *IndexDeps) UploadFile(fileName string, contents string, modTime time.T
 	fb := &test.Blob{Contents: fjson}
 	id.BlobSource.AddBlob(fb)
 	fileRef = fb.BlobRef()
-	_, err = id.Index.ReceiveBlob(fileRef, fb.Reader())
+	_, err = id.Index.ReceiveBlob(ctxbg, fileRef, fb.Reader())
 	if err != nil {
 		panic(err)
 	}
@@ -219,14 +221,12 @@ func (id *IndexDeps) UploadFile(fileName string, contents string, modTime time.T
 // If modTime is zero, it's not used.
 func (id *IndexDeps) UploadDir(dirName string, children []blob.Ref, modTime time.Time) blob.Ref {
 	// static-set entries blob
-	ss := new(schema.StaticSet)
-	for _, child := range children {
-		ss.Add(child)
-	}
+	ss := schema.NewStaticSet()
+	ss.SetStaticSetMembers(children)
 	ssjson := ss.Blob().JSON()
 	ssb := &test.Blob{Contents: ssjson}
 	id.BlobSource.AddBlob(ssb)
-	_, err := id.Index.ReceiveBlob(ssb.BlobRef(), ssb.Reader())
+	_, err := id.Index.ReceiveBlob(ctxbg, ssb.BlobRef(), ssb.Reader())
 	if err != nil {
 		id.Fatalf("UploadDir.ReceiveBlob: %v", err)
 	}
@@ -243,22 +243,15 @@ func (id *IndexDeps) UploadDir(dirName string, children []blob.Ref, modTime time
 	}
 	dirb := &test.Blob{Contents: dirjson}
 	id.BlobSource.AddBlob(dirb)
-	_, err = id.Index.ReceiveBlob(dirb.BlobRef(), dirb.Reader())
+	_, err = id.Index.ReceiveBlob(ctxbg, dirb.BlobRef(), dirb.Reader())
 	if err != nil {
 		id.Fatalf("UploadDir.ReceiveBlob: %v", err)
 	}
 	return dirb.BlobRef()
 }
 
-// NewIndexDeps returns an IndexDeps helper for populating and working
-// with the provided index for tests.
-func NewIndexDeps(index *index.Index) *IndexDeps {
-	camliRootPath, err := osutil.GoPackagePath("camlistore.org")
-	if err != nil {
-		log.Fatal("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
-	}
-	secretRingFile := filepath.Join(camliRootPath, "pkg", "jsonsign", "testdata", "test-secring.gpg")
-	pubKey := &test.Blob{Contents: `-----BEGIN PGP PUBLIC KEY BLOCK-----
+var (
+	PubKey = &test.Blob{Contents: `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
 xsBNBEzgoVsBCAC/56aEJ9BNIGV9FVP+WzenTAkg12k86YqlwJVAB/VwdMlyXxvi
 bCT1RVRfnYxscs14LLfcMWF3zMucw16mLlJCBSLvbZ0jn4h+/8vK5WuAdjw2YzLs
@@ -268,6 +261,17 @@ rexKYRRRh9IKAayD4kgS0wdlULjBU98aeEaMz1ckuB46DX3lAYqmmTEL/Rl9cOI0
 Enpn/oOOfYFa5h0AFndZd1blMvruXfdAobjVABEBAAE=
 =28/7
 -----END PGP PUBLIC KEY BLOCK-----`}
+	KeyID = "2931A67C26F5ABDA"
+)
+
+// NewIndexDeps returns an IndexDeps helper for populating and working
+// with the provided index for tests.
+func NewIndexDeps(index *index.Index) *IndexDeps {
+	camliRootPath, err := osutil.GoPackagePath("perkeep.org")
+	if err != nil {
+		log.Fatal("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
+	}
+	secretRingFile := filepath.Join(camliRootPath, "pkg", "jsonsign", "testdata", "test-secring.gpg")
 
 	id := &IndexDeps{
 		Index:            index,
@@ -276,7 +280,7 @@ Enpn/oOOfYFa5h0AFndZd1blMvruXfdAobjVABEBAAE=
 		EntityFetcher: &jsonsign.CachingEntityFetcher{
 			Fetcher: &jsonsign.FileEntityFetcher{File: secretRingFile},
 		},
-		SignerBlobRef: pubKey.BlobRef(),
+		SignerBlobRef: PubKey.BlobRef(),
 		now:           test.ClockOrigin,
 		Fataler:       logFataler{},
 	}
@@ -285,7 +289,7 @@ Enpn/oOOfYFa5h0AFndZd1blMvruXfdAobjVABEBAAE=
 	if g, w := id.SignerBlobRef.String(), "sha1-ad87ca5c78bd0ce1195c46f7c98e6025abbaf007"; g != w {
 		id.Fatalf("unexpected signer blobref; got signer = %q; want %q", g, w)
 	}
-	id.PublicKeyFetcher.AddBlob(pubKey)
+	id.PublicKeyFetcher.AddBlob(PubKey)
 	id.Index.KeyFetcher = id.PublicKeyFetcher
 	id.Index.InitBlobSource(id.BlobSource)
 	return id
@@ -313,6 +317,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	t.Logf("set attribute %q", rootClaim)
 
 	pnChild := id.NewPermanode()
+	id.SetAttribute(pnChild, "unindexed", "lost in time and space")
 	br3 := id.SetAttribute(pnChild, "tag", "bar")
 	br3Time := id.LastTime()
 	t.Logf("set attribute %q", br3)
@@ -322,9 +327,9 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 
 	// TODO(bradfitz): add EXIF tests here, once that stuff is ready.
 	if false {
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 		if err != nil {
-			t.Fatal("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+			t.Fatal("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 		}
 		for i := 1; i <= 8; i++ {
 			fileBase := fmt.Sprintf("f%d-exif.jpg", i)
@@ -338,11 +343,11 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	}
 
 	// Upload some files.
-	var jpegFileRef, exifFileRef, exifWholeRef, badExifWholeRef, nanExifWholeRef, mediaFileRef, mediaWholeRef blob.Ref
+	var jpegFileRef, exifFileRef, exifWholeRef, badExifWholeRef, nanExifWholeRef, mediaFileRef, mediaWholeRef, heicEXIFWholeRef blob.Ref
 	{
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 		if err != nil {
-			t.Fatal("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+			t.Fatal("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 		}
 		uploadFile := func(file string, modTime time.Time) (fileRef, wholeRef blob.Ref) {
 			fileName := filepath.Join(camliRootPath, "pkg", "index", "indextest", "testdata", file)
@@ -358,6 +363,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 		_, badExifWholeRef = uploadFile("bad-exif.jpg", time.Unix(1361248796, 0))
 		_, nanExifWholeRef = uploadFile("nan-exif.jpg", time.Unix(1361248796, 0))
 		mediaFileRef, mediaWholeRef = uploadFile("0s.mp3", noTime)
+		_, heicEXIFWholeRef = uploadFile("black-seattle-truncated.heic", time.Unix(1361248796, 0))
 	}
 
 	// Upload the dir containing the previous files.
@@ -378,6 +384,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	if g, e := id.Get(key), "50|100"; g != e {
 		t.Errorf("JPEG dude.jpg key %q = %q; want %q", key, g, e)
 	}
+
 	key = "filetimes|" + jpegFileRef.String()
 	if g, e := id.Get(key), ""; g != e {
 		t.Errorf("JPEG dude.jpg key %q = %q; want %q", key, g, e)
@@ -404,6 +411,12 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	key = "exifgps|" + nanExifWholeRef.String()
 	if g, e := id.Get(key), ""; g != e {
 		t.Errorf("EXIF nan-exif.jpg key %q = %q; want %q", key, g, e)
+	}
+
+	// Check that we can read EXIF from HEIC files too
+	key = "exifgps|" + heicEXIFWholeRef.String()
+	if g, e := id.Get(key), "47.6496056|-122.3512806"; g != e {
+		t.Errorf("EXIF black-seattle-truncated.heic key %q = %q; want %q", key, g, e)
 	}
 
 	key = "have:" + pn.String()
@@ -524,6 +537,41 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 		}
 	}
 
+	// SearchPermanodesWithAttr - match none with attr type "tag=nosuchtag"
+	{
+		ch := make(chan blob.Ref, 10)
+		req := &camtypes.PermanodeByAttrRequest{
+			Signer:    id.SignerBlobRef,
+			Attribute: "tag",
+			Query:     "nosuchtag",
+		}
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
+		if err != nil {
+			t.Fatalf("SearchPermanodesWithAttr = %v", err)
+		}
+		var got []blob.Ref
+		for r := range ch {
+			got = append(got, r)
+		}
+		want := []blob.Ref{}
+		if len(got) != len(want) {
+			t.Errorf("SearchPermanodesWithAttr results differ.\n got: %q\nwant: %q",
+				got, want)
+		}
+	}
+	// SearchPermanodesWithAttr - error for unindexed attr
+	{
+		ch := make(chan blob.Ref, 10)
+		req := &camtypes.PermanodeByAttrRequest{
+			Signer:    id.SignerBlobRef,
+			Attribute: "unindexed",
+		}
+		err := id.Index.SearchPermanodesWithAttr(ctx, ch, req)
+		if err == nil {
+			t.Fatalf("SearchPermanodesWithAttr with unindexed attribute should return an error")
+		}
+	}
+
 	// Delete value "pony" of type "title" (which does not actually exist) for pn
 	br4 := id.DelAttribute(pn, "title", "pony")
 	br4Time := id.LastTime()
@@ -605,7 +653,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 	// GetDirMembers
 	{
 		ch := make(chan blob.Ref, 10) // expect 2 results
-		err := id.Index.GetDirMembers(imagesDirRef, ch, 50)
+		err := id.Index.GetDirMembers(ctx, imagesDirRef, ch, 50)
 		if err != nil {
 			t.Fatalf("GetDirMembers = %v", err)
 		}
@@ -653,7 +701,7 @@ func Index(t *testing.T, initIdx func() *index.Index) {
 
 	// AppendClaims
 	{
-		claims, err := id.Index.AppendClaims(ctx, nil, pn, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn, KeyID, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
@@ -893,7 +941,7 @@ func Files(t *testing.T, initIdx func() *index.Index) {
 		if err != nil {
 			t.Fatalf("ExistingFileSchemas = %v", err)
 		}
-		want := []blob.Ref{fileRef}
+		want := index.WholeRefToFile{wholeRef.String(): []blob.Ref{fileRef}}
 		if !reflect.DeepEqual(refs, want) {
 			t.Errorf("ExistingFileSchemas got = %#v, want %#v", refs, want)
 		}
@@ -1130,7 +1178,7 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 	}
 	// and now check that AppendClaims finds nothing for pn
 	{
-		claims, err := id.Index.AppendClaims(ctx, nil, pn1, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn1, KeyID, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
@@ -1166,12 +1214,12 @@ func Delete(t *testing.T, initIdx func() *index.Index) {
 	}
 	// and check that AppendClaims finds cl1, with the right modtime too
 	{
-		claims, err := id.Index.AppendClaims(ctx, nil, pn1, id.SignerBlobRef, "")
+		claims, err := id.Index.AppendClaims(ctx, nil, pn1, KeyID, "")
 		if err != nil {
 			t.Errorf("AppendClaims = %v", err)
 		} else {
 			want := []camtypes.Claim{
-				camtypes.Claim{
+				{
 					BlobRef:   cl1,
 					Permanode: pn1,
 					Signer:    id.SignerBlobRef,
@@ -1327,26 +1375,42 @@ func checkEnumerate(idx *index.Index, want []blob.SizedRef, args *enumArgs) erro
 }
 
 func checkStat(idx *index.Index, want []blob.SizedRef) error {
-	dest := make(chan blob.SizedRef)
-	defer close(dest)
-	errCh := make(chan error)
+	pos := make(map[blob.Ref]int) // wanted ref => its position in want
+	need := make(map[blob.Ref]bool)
+	for i, sb := range want {
+		pos[sb.Ref] = i
+		need[sb.Ref] = true
+	}
+
 	input := make([]blob.Ref, len(want))
 	for _, sbr := range want {
 		input = append(input, sbr.Ref)
 	}
-	go func() {
-		errCh <- idx.StatBlobs(dest, input)
-	}()
-	for k, sbr := range want {
-		got, ok := <-dest
+	err := idx.StatBlobs(context.Background(), input, func(sb blob.SizedRef) error {
+		if !sb.Valid() {
+			return errors.New("StatBlobs func called with invalid/zero blob.SizedRef")
+		}
+		wantPos, ok := pos[sb.Ref]
 		if !ok {
-			return fmt.Errorf("could not get stat number %d", k)
+			return fmt.Errorf("StatBlobs func called with unrequested ref %v (size %d)", sb.Ref, sb.Size)
 		}
-		if got != sbr {
-			return fmt.Errorf("stat %d: got %v, wanted %v", k, got, sbr)
+		if !need[sb.Ref] {
+			return fmt.Errorf("StatBlobs func called with ref %v multiple times", sb.Ref)
 		}
+		delete(need, sb.Ref)
+		w := want[wantPos]
+		if sb != w {
+			return fmt.Errorf("StatBlobs returned %v; want %v", sb, w)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return <-errCh
+	for br := range need {
+		return fmt.Errorf("didn't get stat result for %v", br)
+	}
+	return nil
 }
 
 func EnumStat(t *testing.T, initIdx func() *index.Index) {

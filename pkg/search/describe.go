@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package search
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,12 +30,11 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/types/camtypes"
 	"go4.org/syncutil"
 	"go4.org/types"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/types/camtypes"
 )
 
 func (sh *Handler) serveDescribe(rw http.ResponseWriter, req *http.Request) {
@@ -119,7 +119,7 @@ type DescribeRequest struct {
 
 	// Rules specifies a set of rules to instruct how to keep
 	// expanding the described set. All rules are tested and
-	// matching rules grow the the response set until all rules no
+	// matching rules grow the response set until all rules no
 	// longer match or internal limits are hit.
 	Rules []*DescribeRule `json:"rules,omitempty"`
 
@@ -270,66 +270,66 @@ func (m MetaMap) Get(br blob.Ref) *DescribedBlob {
 }
 
 // URLSuffixPost returns the URL suffix for POST requests.
-func (r *DescribeRequest) URLSuffixPost() string {
+func (dr *DescribeRequest) URLSuffixPost() string {
 	return "camli/search/describe"
 }
 
 // URLSuffix returns the URL suffix for GET requests.
 // This is deprecated.
-func (r *DescribeRequest) URLSuffix() string {
+func (dr *DescribeRequest) URLSuffix() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "camli/search/describe?depth=%d&maxdirchildren=%d",
-		r.depth(), r.maxDirChildren())
-	for _, br := range r.BlobRefs {
+		dr.depth(), dr.maxDirChildren())
+	for _, br := range dr.BlobRefs {
 		buf.WriteString("&blobref=")
 		buf.WriteString(br.String())
 	}
-	if len(r.BlobRefs) == 0 && r.BlobRef.Valid() {
+	if len(dr.BlobRefs) == 0 && dr.BlobRef.Valid() {
 		buf.WriteString("&blobref=")
-		buf.WriteString(r.BlobRef.String())
+		buf.WriteString(dr.BlobRef.String())
 	}
-	if !r.At.IsAnyZero() {
+	if !dr.At.IsAnyZero() {
 		buf.WriteString("&at=")
-		buf.WriteString(r.At.String())
+		buf.WriteString(dr.At.String())
 	}
 	return buf.String()
 }
 
 // fromHTTP panics with an httputil value on failure
-func (r *DescribeRequest) fromHTTP(req *http.Request) {
+func (dr *DescribeRequest) fromHTTP(req *http.Request) {
 	switch {
 	case httputil.IsGet(req):
-		r.fromHTTPGet(req)
+		dr.fromHTTPGet(req)
 	case req.Method == "POST":
-		r.fromHTTPPost(req)
+		dr.fromHTTPPost(req)
 	default:
 		panic("Unsupported method")
 	}
 }
 
-func (r *DescribeRequest) fromHTTPPost(req *http.Request) {
-	err := json.NewDecoder(req.Body).Decode(r)
+func (dr *DescribeRequest) fromHTTPPost(req *http.Request) {
+	err := json.NewDecoder(req.Body).Decode(dr)
 	if err != nil {
 		panic(err)
 	}
 }
 
-func (r *DescribeRequest) fromHTTPGet(req *http.Request) {
+func (dr *DescribeRequest) fromHTTPGet(req *http.Request) {
 	req.ParseForm()
 	if vv := req.Form["blobref"]; len(vv) > 1 {
 		for _, brs := range vv {
 			if br, ok := blob.Parse(brs); ok {
-				r.BlobRefs = append(r.BlobRefs, br)
+				dr.BlobRefs = append(dr.BlobRefs, br)
 			} else {
 				panic(httputil.InvalidParameterError("blobref"))
 			}
 		}
 	} else {
-		r.BlobRef = httputil.MustGetBlobRef(req, "blobref")
+		dr.BlobRef = httputil.MustGetBlobRef(req, "blobref")
 	}
-	r.Depth = httputil.OptionalInt(req, "depth")
-	r.MaxDirChildren = httputil.OptionalInt(req, "maxdirchildren")
-	r.At = types.ParseTime3339OrZero(req.FormValue("at"))
+	dr.Depth = httputil.OptionalInt(req, "depth")
+	dr.MaxDirChildren = httputil.OptionalInt(req, "maxdirchildren")
+	dr.At = types.ParseTime3339OrZero(req.FormValue("at"))
 }
 
 // PermanodeFile returns in path the blobref of the described permanode
@@ -447,8 +447,8 @@ func (b *DescribedBlob) ContentRef() (br blob.Ref, ok bool) {
 	return
 }
 
-// Given a blobref string returns a Description or nil.
-// dr may be nil itself.
+// DescribedBlobStr when given a blobref string returns a Description
+// or nil.  dr may be nil itself.
 func (dr *DescribeRequest) DescribedBlobStr(blobstr string) *DescribedBlob {
 	if dr == nil {
 		return nil
@@ -746,7 +746,7 @@ func (dr *DescribeRequest) doDescribe(ctx context.Context, br blob.Ref, depth in
 	switch des.CamliType {
 	case "permanode":
 		des.Permanode = new(DescribedPermanode)
-		dr.populatePermanodeFields(ctx, des.Permanode, br, dr.sh.owner, depth)
+		dr.populatePermanodeFields(ctx, des.Permanode, br, depth)
 		var at time.Time
 		if !dr.At.IsAnyZero() {
 			at = dr.At.Time()
@@ -811,11 +811,11 @@ func (dr *DescribeRequest) doDescribe(ctx context.Context, br blob.Ref, depth in
 	}
 }
 
-func (dr *DescribeRequest) populatePermanodeFields(ctx context.Context, pi *DescribedPermanode, pn, signer blob.Ref, depth int) {
+func (dr *DescribeRequest) populatePermanodeFields(ctx context.Context, pi *DescribedPermanode, pn blob.Ref, depth int) {
 	pi.Attr = make(url.Values)
 	attr := pi.Attr
 
-	claims, err := dr.sh.index.AppendClaims(ctx, nil, pn, signer, "")
+	claims, err := dr.sh.index.AppendClaims(ctx, nil, pn, dr.sh.owner.KeyID(), "")
 	if err != nil {
 		log.Printf("Error getting claims of %s: %v", pn.String(), err)
 		dr.addError(pn, fmt.Errorf("Error getting claims of %s: %v", pn.String(), err))
@@ -883,7 +883,7 @@ func (dr *DescribeRequest) getDirMembers(ctx context.Context, br blob.Ref, depth
 	ch := make(chan blob.Ref)
 	errch := make(chan error)
 	go func() {
-		errch <- dr.sh.index.GetDirMembers(br, ch, limit)
+		errch <- dr.sh.index.GetDirMembers(ctx, br, ch, limit)
 	}()
 
 	var members []blob.Ref
@@ -905,8 +905,8 @@ func (dr *DescribeRequest) describeRefs(ctx context.Context, str string, depth i
 	}
 }
 
-func (d *DescribedBlob) setMIMEType(mime string) {
+func (b *DescribedBlob) setMIMEType(mime string) {
 	if strings.HasPrefix(mime, camliTypePrefix) {
-		d.CamliType = strings.TrimPrefix(mime, camliTypePrefix)
+		b.CamliType = strings.TrimPrefix(mime, camliTypePrefix)
 	}
 }

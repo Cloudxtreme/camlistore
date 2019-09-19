@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,14 +28,14 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/gethandler"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/schema"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/gethandler"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/schema"
 )
 
 type responseType int
@@ -137,7 +137,7 @@ func newShareFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handler
 	}
 	fetcher, ok := bs.(blob.Fetcher)
 	if !ok {
-		return nil, errors.New("share handler's storage not a Fetcher.")
+		return nil, errors.New("share handler's storage not a Fetcher")
 	}
 
 	// Should we use the search handler instead (and add a method to access
@@ -165,6 +165,7 @@ var timeSleep = time.Sleep // for tests
 // Unauthenticated user.  Be paranoid.
 func (h *shareHandler) handleGetViaSharing(rw http.ResponseWriter, req *http.Request,
 	blobRef blob.Ref) error {
+	ctx := req.Context()
 	if !httputil.IsGet(req) {
 		return &shareError{code: invalidMethod, response: badRequest, message: "Invalid method"}
 	}
@@ -207,7 +208,7 @@ func (h *shareHandler) handleGetViaSharing(rw http.ResponseWriter, req *http.Req
 					return unauthorized(shareDeleted, "Share was deleted")
 				}
 			}
-			file, size, err := h.fetcher.Fetch(br)
+			file, size, err := h.fetcher.Fetch(ctx, br)
 			if err != nil {
 				return unauthorized(shareFetchFailed, "Fetch chain 0 of %s failed: %v", br, err)
 			}
@@ -240,7 +241,7 @@ func (h *shareHandler) handleGetViaSharing(rw http.ResponseWriter, req *http.Req
 			// not the first thing in the chain)
 			continue
 		default:
-			rc, _, err := h.fetcher.Fetch(br)
+			rc, _, err := h.fetcher.Fetch(ctx, br)
 			if err != nil {
 				return unauthorized(viaChainFetchFailed, "Fetch chain %d of %s failed: %v", i, br, err)
 			}
@@ -264,7 +265,8 @@ func (h *shareHandler) handleGetViaSharing(rw http.ResponseWriter, req *http.Req
 			return unauthorized(assembleNonTransitive, "Cannot assemble non-transitive share")
 		}
 		dh := &DownloadHandler{
-			Fetcher: h.fetcher,
+			Fetcher:     h.fetcher,
+			forceInline: true,
 			// TODO(aa): It would be nice to specify a local cache here, as the UI handler does.
 		}
 		dh.ServeFile(rw, req, blobRef)
@@ -308,7 +310,7 @@ func (h *shareHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	h.serveHTTP(rw, req)
 }
 
-// bytesHaveSchemaLink reports whether bb is a valid Camlistore schema
+// bytesHaveSchemaLink reports whether bb is a valid Perkeep schema
 // blob and has target somewhere in a schema field used to represent a
 // Merkle-tree-ish file or directory.
 func bytesHaveSchemaLink(br blob.Ref, bb []byte, target blob.Ref) bool {

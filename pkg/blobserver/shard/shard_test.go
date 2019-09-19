@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Camlistore Authors
+Copyright 2016 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,15 @@ limitations under the License.
 package shard
 
 import (
+	"context"
 	"testing"
 
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/test"
 )
+
+var ctxbg = context.Background()
 
 type testStorage struct {
 	sto    *shardStorage
@@ -56,27 +59,22 @@ func TestShardBasic(t *testing.T) {
 }
 
 func TestShard(t *testing.T) {
-	thingA := &test.Blob{"something"}
-	thingB := &test.Blob{"something else"}
+	thingA := &test.Blob{"thing A"} // sha224-2b18a3b52a7211954fb97145cf50a29a6e189a6443f7f1e0fa4529f9, shard 1
+	thingB := &test.Blob{"thing B"} // sha224-f19faf56e53a22bc6f84595b5533e943c98d263b232131881f6ace8f, shard 0
 
 	ts := newTestStorage(t)
 
-	ts.sto.ReceiveBlob(thingB.BlobRef(), thingB.Reader())
-	ts.sto.ReceiveBlob(thingA.BlobRef(), thingA.Reader())
+	ts.sto.ReceiveBlob(ctxbg, thingA.BlobRef(), thingA.Reader())
+	ts.sto.ReceiveBlob(ctxbg, thingB.BlobRef(), thingB.Reader())
 
-	// sha1-1af17e73721dbe0c40011b82ed4bb1a7dbe3ce29
-	// sum32: 452034163
 	ts.checkShard(thingA, 1)
-
-	// sha1-637828c03aae38af639cc721200f2584864e8797
-	// sum32: 1668819136
 	ts.checkShard(thingB, 0)
 }
 
 // checkShard iterates through shards and find the blob. error if it is not found in expectShard, found somewhere else, or not found at all
 func (sto testStorage) checkShard(b *test.Blob, expectShard int) {
 	for shardN, shard := range sto.shards {
-		_, _, err := shard.Fetch(b.BlobRef())
+		_, _, err := shard.Fetch(ctxbg, b.BlobRef())
 		if err != nil && shardN == expectShard {
 			sto.t.Errorf("expected ref %v in shard %d, but didn't find it there", b.BlobRef(), expectShard)
 			continue

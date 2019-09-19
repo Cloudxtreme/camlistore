@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,9 +18,12 @@ package search
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -40,6 +43,8 @@ const (
 	// Maximum message size allowed from peer.
 	maxMessageSize = 10 << 10
 )
+
+var debug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG"))
 
 type wsHub struct {
 	sh             *Handler
@@ -117,7 +122,9 @@ func (h *wsHub) run() {
 				q:    wr.q,
 			}
 			wr.conn.queries[wr.tag] = wq
-			log.Printf("Added/updated search subscription for tag %q", wr.tag)
+			if debug {
+				log.Printf("websocket: added/updated search subscription for tag %q", wr.tag)
+			}
 			go h.doSearch(wq)
 
 		case wq := <-h.updatedResults:
@@ -172,7 +179,7 @@ func (h *wsHub) doSearch(wq *watchedQuery) {
 		*q.Describe = *wq.q.Describe
 	}
 
-	res, err := h.sh.Query(q)
+	res, err := h.sh.Query(context.TODO(), q)
 	if err != nil {
 		log.Printf("Query error: %v", err)
 		return
@@ -246,7 +253,9 @@ func (c *wsConn) readPump() {
 		if err != nil {
 			break
 		}
-		log.Printf("Got websocket message %#q", message)
+		if debug {
+			log.Printf("websocket: got message %#q", message)
+		}
 		cm := new(wsClientMessage)
 		if err := json.Unmarshal(message, cm); err != nil {
 			log.Printf("Ignoring bogus websocket message. Err: %v", err)
@@ -291,8 +300,15 @@ func (c *wsConn) writePump() {
 	}
 }
 
+// upgrader is used in serveWebSocket to construct websocket connections.
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	// uses a default origin check policy
+}
+
 func (sh *Handler) serveWebSocket(rw http.ResponseWriter, req *http.Request) {
-	ws, err := websocket.Upgrade(rw, req, nil, 1024, 1024)
+	ws, err := upgrader.Upgrade(rw, req, nil)
 	if _, ok := err.(websocket.HandshakeError); ok {
 		http.Error(rw, "Not a websocket handshake", 400)
 		return

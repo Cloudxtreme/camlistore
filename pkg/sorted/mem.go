@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,16 +43,16 @@ type memKeys struct {
 }
 
 // memIter converts from leveldb's iterator.Iterator interface, which
-// operates on []byte, to Camlistore's index.Iterator, which operates
+// operates on []byte, to Perkeep's index.Iterator, which operates
 // on string.
 type memIter struct {
 	lit  iterator.Iterator // underlying leveldb iterator
 	k, v *string           // if nil, not stringified yet
 }
 
-func (t *memIter) Next() bool {
-	t.k, t.v = nil, nil
-	return t.lit.Next()
+func (s *memIter) Next() bool {
+	s.k, s.v = nil, nil
+	return s.lit.Next()
 }
 
 func (s *memIter) Close() error {

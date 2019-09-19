@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package jsonsign
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +27,8 @@ import (
 	"time"
 	"unicode"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
 
 	"go4.org/wkfs"
 	"golang.org/x/crypto/openpgp"
@@ -35,7 +36,7 @@ import (
 )
 
 type EntityFetcher interface {
-	FetchEntity(keyId string) (*openpgp.Entity, error)
+	FetchEntity(keyID string) (*openpgp.Entity, error)
 }
 
 type FileEntityFetcher struct {
@@ -53,10 +54,10 @@ type CachingEntityFetcher struct {
 	m  map[string]*openpgp.Entity
 }
 
-func (ce *CachingEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, error) {
+func (ce *CachingEntityFetcher) FetchEntity(keyID string) (*openpgp.Entity, error) {
 	ce.lk.Lock()
 	if ce.m != nil {
-		e := ce.m[keyId]
+		e := ce.m[keyID]
 		if e != nil {
 			ce.lk.Unlock()
 			return e, nil
@@ -64,20 +65,20 @@ func (ce *CachingEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, erro
 	}
 	ce.lk.Unlock()
 
-	e, err := ce.Fetcher.FetchEntity(keyId)
+	e, err := ce.Fetcher.FetchEntity(keyID)
 	if err == nil {
 		ce.lk.Lock()
 		defer ce.lk.Unlock()
 		if ce.m == nil {
 			ce.m = make(map[string]*openpgp.Entity)
 		}
-		ce.m[keyId] = e
+		ce.m[keyID] = e
 	}
 
 	return e, err
 }
 
-func (fe *FileEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, error) {
+func (fe *FileEntityFetcher) FetchEntity(keyID string) (*openpgp.Entity, error) {
 	f, err := wkfs.Open(fe.File)
 	if err != nil {
 		return nil, fmt.Errorf("jsonsign: FetchEntity: %v", err)
@@ -89,19 +90,18 @@ func (fe *FileEntityFetcher) FetchEntity(keyId string) (*openpgp.Entity, error) 
 	}
 	for _, e := range el {
 		pubk := &e.PrivateKey.PublicKey
-		if pubk.KeyIdString() != keyId {
+		if pubk.KeyIdString() != keyID {
 			continue
 		}
 		if e.PrivateKey.Encrypted {
 			if err := fe.decryptEntity(e); err == nil {
 				return e, nil
-			} else {
-				return nil, err
 			}
+			return nil, err
 		}
 		return e, nil
 	}
-	return nil, fmt.Errorf("jsonsign: entity for keyid %q not found in %q", keyId, fe.File)
+	return nil, fmt.Errorf("jsonsign: entity for keyid %q not found in %q", keyID, fe.File)
 }
 
 type SignRequest struct {
@@ -129,7 +129,7 @@ func (sr *SignRequest) secretRingPath() string {
 	return osutil.SecretRingFile()
 }
 
-func (sr *SignRequest) Sign() (signedJSON string, err error) {
+func (sr *SignRequest) Sign(ctx context.Context) (signedJSON string, err error) {
 	trimmedJSON := strings.TrimRightFunc(sr.UnsignedJSON, unicode.IsSpace)
 
 	// TODO: make sure these return different things
@@ -156,7 +156,7 @@ func (sr *SignRequest) Sign() (signedJSON string, err error) {
 		return inputfail("json \"camliSigner\" key is malformed or unsupported")
 	}
 
-	pubkeyReader, _, err := sr.Fetcher.Fetch(signerBlob)
+	pubkeyReader, _, err := sr.Fetcher.Fetch(ctx, signerBlob)
 	if err != nil {
 		// TODO: not really either an inputfail or an execfail.. but going
 		// with exec for now.
@@ -181,7 +181,7 @@ func (sr *SignRequest) Sign() (signedJSON string, err error) {
 	if entityFetcher == nil {
 		file := sr.secretRingPath()
 		if file == "" {
-			return "", errors.New("jsonsign: no EntityFetcher, and no secret ring file defined.")
+			return "", errors.New("jsonsign: no EntityFetcher, and no secret ring file defined")
 		}
 		secring, err := wkfs.Open(sr.secretRingPath())
 		if err != nil {

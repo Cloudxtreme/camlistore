@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package search
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -24,11 +25,10 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/httputil"
 	"go4.org/types"
+	"perkeep.org/internal/httputil"
 
 	"go4.org/ctxutil"
-	"golang.org/x/net/context"
 )
 
 func TestSearchHelp(t *testing.T) {

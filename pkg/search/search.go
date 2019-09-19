@@ -1,5 +1,5 @@
 /*
-Copyright 2011 The Camlistore Authors.
+Copyright 2011 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,20 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package search describes and answers Camlistore search queries.
+// Package search describes and answers Perkeep search queries.
 //
 // Many of the search methods or functions provide results that are
 // ordered by modification time, or at least depend on modification
 // times. In that context, (un)deletions (of permanodes, or attributes)
 // are not considered modifications and therefore the time at which they
 // occurred does not affect the result.
-package search // import "camlistore.org/pkg/search"
+package search // import "perkeep.org/pkg/search"
 
 import (
-	"golang.org/x/net/context"
+	"context"
 )
 
 type QueryDescriber interface {
-	Query(*SearchQuery) (*SearchResult, error)
+	Query(context.Context, *SearchQuery) (*SearchResult, error)
 	Describe(context.Context, *DescribeRequest) (*DescribeResponse, error)
 }

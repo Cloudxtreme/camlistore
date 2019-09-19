@@ -1,0 +1,524 @@
+
+<h1>Release 0.10 ("Bellingham")</h1>
+
+<p><b>2018-05-02</b></p>
+
+<p>
+We're happy to announce Perkeep version 0.10, arriving about one year (too
+long!) after our last release. It's named
+after <a href="https://en.wikipedia.org/wiki/Bellingham,_Washington">Bellingham,
+WA</a>, home of <a href="https://linuxfestnorthwest.org/">LinuxFest
+Northwest</a>, where Mathieu and Brad just met up in person and gave a
+talk on
+Perkeep. [<a href="https://docs.google.com/presentation/d/1suYfv3dmjJQ1mMJIG7_D26e5cudZqPcZTPNgrLvTIrI/view">slides</a>]
+[<a href="https://www.youtube.com/watch?v=PlAU_da_U4s">video</a>].
+</p>
+
+<p>
+This is our first release with the name <b>Perkeep</b> since
+we <a href="https://perkeep.org/issue/981">renamed the project</a>
+from Camlistore.
+</p>
+
+<p>Some notable highlights of 0.10 include:</p>
+
+<ul>
+  <li>New name, <a href="https://perkeep.org/keepy">new mascot</a> (thanks, <a href="https://twitter.com/AshleyMcnamara">@AshleyMcnamara</a>!)</li>
+  <li>Map view in the web UI</li>
+  <li>Initial support for iOS HEIC images</li>
+  <li><a href="https://perkeep.org/issue/537">Migration from SHA-1</a> to SHA-224 blobs</li>
+</ul>
+
+<p>See below for the more complete list.</p>
+
+<h2>Docker</h2>
+
+<p>
+  This is our first release with an official Docker image. It contains
+the server and client binaries, but comes with no documentation. We
+assume for now that you know Docker enough to use it:
+</p>
+
+<code>
+$ docker pull gcr.io/perkeep-containers/perkeep:0.10
+</code>
+
+<h2>Android</h2>
+
+<p>
+  <a href="https://play.google.com/store/apps/details?id=org.camlistore">Our Android app</a> has been updated on the Google Play store.
+</p>
+
+<h2>Cloud Launcher</h2>
+
+<p>To deploy a Perkeep server on Google Cloud, see our <a href="https://perkeep.org/launch/">Cloud Launcher</a> utility.</p>
+
+<h2>Downloads</h2>
+
+<center>
+<a class="downloadBox" href="/dl/perkeep-0.10.1-darwin.tar.gz">
+<div class="platform">Darwin</div>
+<div>
+	<span class="filename">perkeep-0.10.1-darwin.tar.gz</span>
+</div>
+<div class="checksum">SHA256: a76c17fab2e72cd68c0fb7a2762c21be1b9d6bd06f88c52ef56f3f9f3dba62db</div>
+</a>
+<a class="downloadBox" href="/dl/perkeep-0.10.1-linux.tar.gz">
+<div class="platform">Linux</div>
+<div>
+	<span class="filename">perkeep-0.10.1-linux.tar.gz</span>
+</div>
+<div class="checksum">SHA256: 96a9832efccad5f8037d75870287539382b22dfa5795f113551bd9386def8f88</div>
+</a>
+<a class="downloadBox" href="/dl/perkeep-0.10.1-src.zip">
+<div class="platform">Source</div>
+<div>
+	<span class="filename">perkeep-0.10.1-src.zip</span>
+</div>
+<div class="checksum">SHA256: 888a4f4cda2212e8f46194a79dba5c38ad6a5890ea407b4f899645d1c6695244</div>
+</a>
+<a class="downloadBox" href="/dl/perkeep-0.10.1-windows.zip">
+<div class="platform">Windows</div>
+<div>
+	<span class="filename">perkeep-0.10.1-windows.zip</span>
+</div>
+<div class="checksum">SHA256: 87d7a8f1c1a33c8abc6827d67f72decce16424f49a6db51c03d70af89008c034</div>
+</a>
+</center>
+
+<h2>Release Stats</h2>
+
+<p>
+33 total committers over 597 commits
+since <a href='https://github.com/perkeep/perkeep/commit/d21ecfd24eb7ad8276d2ad54c533d3453b1a4734'>d21ecfd24</a>
+including Adam Shannon, Ashley McNamara, Attila Tajti, Brad
+Fitzpatrick, Bruce C. Dillahunty, Daniel Heath, Daniel Lipovetsky,
+Eric Drechsel, Fabian Wickborn, Filippo Valsorda, Govert Versluis,
+Hernan Grecco, James Hillyerd, Josh Bleecher Snyder, Magnus
+Landerblom, Markus Peröbner, Mathieu Lonjaret, Max Bernstein, Michael
+Houston, Mike Lloyd, Paul Jolly, Paul Lindner, Peter Etelej, Phillip
+Couto, Piotr S. Staszewski, Ronald Evers, Sergi Mansilla, Stephen
+Searles, Sterchele Nicolas, Steve Armstrong, Steven L. Speek, Tamás
+Gulácsi, Tilman Dilo, Will Norris.
+</p>
+
+<p>Thank you!</p>
+
+
+
+<h2>Other Changes</h2>
+
+<p>Some other changes not mentioned above but excluding the most boring cleanups:</p>
+
+<p>
+<ul>
+
+<li>
+app/scanningcabinet:
+<ul>
+<li>Show other tags of a doc in search results</li>
+</ul>
+</li>
+
+<li>
+blob:
+<ul>
+<li>support SHA-224 blobrefs, make them the default</li>
+<li>add ref.HasPrefix method</li>
+<li>add ref.EqualString method</li>
+</ul>
+</li>
+
+
+<li>
+blobserver:
+<ul>
+<li>add Go <code>context.Context</code> support to ReceiveBlob, Fetch, and BlobRemover</li>
+<li>change BlobStatter interface, simplify proxycache</li>
+</ul>
+</li>
+
+<li>
+blobserver/azure:
+<ul>
+<li>new support for storing blobs on Microsoft Azure</li>
+</ul>
+</li>
+
+<li>
+blobserver/blobpacked:
+<ul>
+<li>add start-up sanity check for integrity of packed zips</li>
+<li>log reindexing progress</li>
+</ul>
+</li>
+
+<li>
+blobserver/encrypt:
+<ul>
+<li>implement meta blob packing</li>
+<li>rewrite encryption to use NaCl and a simpler metadata format</li>
+</ul>
+</li>
+
+<li>
+blobserver/files:
+<ul>
+<li>new VFS layer for use by localdisk and other future files based implementations</li>
+</ul>
+</li>
+
+<li>
+blobserver/localdisk:
+<ul>
+<li>check that underlying filesystem can perform operations needed</li>
+<li>limit stat concurrency</li>
+<li>move most of the implementation to blobserver/files</li>
+</ul>
+</li>
+
+<li>
+blobserver/mongo:
+<ul>
+<li>fix stat behavior on missing blob</li>
+</ul>
+</li>
+
+<li>
+blobserver/overlay:
+<ul>
+<li>overlay: new blobserver type</li>
+</ul>
+</li>
+
+<li>
+blobserver/remote:
+<ul>
+<li>added trusted certs option</li>
+</ul>
+</li>
+
+<li>
+blobserver/union:
+<ul>
+<li>union: new blobserver type</li>
+</ul>
+</li>
+
+<li>
+camnetdns:
+<ul>
+<li>use Lets Encrypt http-01 challenge</li>
+</ul>
+</li>
+
+<li>
+client:
+<ul>
+<li>remove and clean most New constructors, replace them with options</li>
+<li>check client/server version mismatch</li>
+<li>make android work with Let's Encrypt</li>
+</ul>
+</li>
+
+<li>
+clients:
+<ul>
+<li>Move all relevant clients code under it</li>
+</ul>
+</li>
+
+<li>
+clients/android:
+<ul>
+<li>migrate to gradle, update build setup</li>
+<li>avoid wifi manager memory leak</li>
+<li>add multiple profile support</li>
+<li>make the upload service permanent</li>
+<li>show pk-put error messages</li>
+<li>remove self-signed cert option</li>
+<li>add Keepy icon</li>
+<li>New release on Google Play Store</li>
+</ul>
+</li>
+
+<li>
+clients/osx:
+<ul>
+<li>fix and update OSX status-menu app</li>
+</ul>
+</li>
+
+<li>
+cmd:
+<ul>
+<li>rename cammount to pk-mount</li>
+<li>rename camget to pk-get, and make it a mode of pk</li>
+<li>rename camput to pk-put, and make it a mode of pk</li>
+<li>rename camweb to pk-web</li>
+<li>rename camdeploy to pk-deploy</li>
+</ul>
+</li>
+
+<li>
+deploy/gce:
+<ul>
+<li>add Google Cloud Free Tier option</li>
+</ul>
+</li>
+
+<li>
+doc:
+<ul>
+<li>update build instructions</li>
+<li>add <a href="/doc/compare">comparison</a> to other software and services</li>
+<li>add jsonsign protocol docs</li>
+<li>add LFNW 2018 talk</li>
+</ul>
+</li>
+
+<li>
+FUSE filesystem:
+<ul>
+<li>add &#34;versions&#34; folder</li>
+</ul>
+</li>
+
+<li>
+geocode:
+<ul>
+<li>support the now-required Google API key and document how to configure</li>
+</ul>
+</li>
+
+<li>
+gpgchallenge:
+<ul>
+<li>switch to using long forms of key IDs</li>
+</ul>
+</li>
+
+<li>
+importer:
+<ul>
+<li>add gphotos, a Google Photos importer</li>
+<li>pick the &#34;best&#34; importer account when several exist</li>
+<li>rename foursquare to swarm, add Properties to Importer interface</li>
+<li>refresh importer root page, add Titles, Descriptions, TODO bugs</li>
+</ul>
+</li>
+
+<li>
+index:
+<ul>
+<li>ignore unset msdos time when possible</li>
+<li>ignore indexed NaN location</li>
+<li>add integrity check</li>
+<li>switch to using the (long) GPG keyID, and not its blobRef, as the owner</li>
+<li>support for HEIC images</li>
+</ul>
+</li>
+
+<li>
+images:
+<ul>
+<li>support for HEIC images</li>
+<li>support making thumbnails for HEIC in docker</li>
+</ul>
+</li>
+
+<li>
+magic:
+<ul>
+<li>support for HEIC images</li>
+</ul>
+</li>
+
+<li>
+osutil:
+<ul>
+<li>rename the config dir to perkeep</li>
+</ul>
+</li>
+
+<li>
+make.go:
+<ul>
+<li>fix building on FreeBSD</li>
+<li>fix building on Windows</li>
+<li>allow specifying CAMLI_GOPHERJS_GOROOT for building gopherjs with different Go</li>
+<li>move to Go 1.10</li>
+<li>remove the tmp source code mirroring, now that Go is caching properly</li>
+<li>rely on Go (GOBIN, GOPATH, or $HOME/go) for install location</li>
+</ul>
+</li>
+
+<li>
+misc/docker:
+<ul>
+<li>add heiftojpeg, for making thumbnails from HEIC images</li>
+<li>update go image to 1.10.2</li>
+</ul>
+</li>
+
+<li>
+perkeepd:
+<ul>
+<li>use Let&#39;s Encrypt http-01 challenge</li>
+<li>listen for SIGTERM</li>
+<li>on GCE, automatically migrate itself to Perkeep systemd service</li>
+</ul>
+</li>
+
+<li>
+perkeepd/ui:
+<ul>
+<li>add &#34;Select all&#34; action</li>
+<li>add Map aspect</li>
+<li>disable key navigation when editing permanode attributes</li>
+<li>add sha224 support</li>
+<li>rename UI menu from Camli to Perkeep</li>
+<li>change Foursquare logo to Swarm logo</li>
+<li>add link to mobile setup in UI drop-down</li>
+<li>prefer permanode aspect over map aspect</li>
+</ul>
+</li>
+
+<li>
+pk:
+<ul>
+<li>add &#34;tool whoami&#34; subcommand</li>
+<li>add &#34;-1&#34; flag to search subcommand</li>
+<li>make &#34;search&#34; command highlight position of JSON syntax errors</li>
+</ul>
+</li>
+
+<li>
+pk-devimport:
+<ul>
+<li>new command that runs a local importer</li>
+</ul>
+</li>
+
+<li>
+pk-mount:
+<ul>
+<li>add more documentation and examples to help people get started with PerkeepFs</li>
+<li>in debug mode, dump stacks on SIGQUIT</li>
+<li>default to mounting at /pk if it exists</li>
+</ul>
+</li>
+
+<li>
+pk-put:
+<ul>
+<li>always output on fatal errors</li>
+<li>add --permanode option for blob subcommand</li>
+<li>add flag to specify hash function for raw blobs</li>
+</ul>
+</li>
+
+<li>
+pk:
+<ul>
+<li>move more packages to internal</li>
+</ul>
+</li>
+
+<li>
+rollsum:
+<ul>
+<li>optimizations to get better generated code from the compiler</li>
+</ul>
+</li>
+
+<li>
+schema:
+<ul>
+<li>support for large directories, by breaking into subsets</li>
+</ul>
+</li>
+
+<li>
+search:
+<ul>
+<li>support location area predicate</li>
+<li>enable using Around with unsorted blob sources</li>
+<li>add Map sort</li>
+<li>add &#34;ref:&#34; predicate support</li>
+<li>add expression/constraint aliases</li>
+<li>switch to using (long) GPG key ID, instead of its blobRef</li>
+<li>add support for wildcards in filename search</li>
+<li>allow empty expression</li>
+<li>optimize searching for a single blob</li>
+<li>optimize several popular search types to use better in-memory indexes</li>
+</ul>
+</li>
+
+<li>
+server:
+<ul>
+<li>use a caching fetcher when downloading</li>
+<li>add recovery option on web UI and instance page</li>
+<li>add support for directories download</li>
+</ul>
+</li>
+
+<li>
+serverinit:
+<ul>
+<li>catch typos in high-level server config</li>
+<li>remove DBNames and provide consistent default instead</li>
+<li>improve error message to help people find config file with errors</li>
+</ul>
+</li>
+
+<li>
+sorted/postgres:
+<ul>
+<li>create databases on boot</li>
+</ul>
+</li>
+
+<li>
+sorted/sqlkv:
+<ul>
+<li>make multiple close safe</li>
+</ul>
+</li>
+
+<li>
+vendor:
+<ul>
+<li>switch to using the dep vendor tree management tool, instead of doing things manually</li>
+</ul>
+</li>
+
+<li>
+website:
+<ul>
+<li>add link to <a href="https://opencollective.com/perkeep">Open Collective page</a></li>
+<li>allow serving godoc for any valid package</li>
+<li>use Let's Encrypt http-01 challenge</li>
+<li>migrate to perkeep.org as the production domain</li>
+<li>Add CoC on community page</li>
+<li>add links to <a href="https://play.google.com/store/apps/details?id=org.camlistore">Android app</a></li>
+<li>move go code to pk-web package</li>
+</ul>
+</li>
+
+</ul>
+</p>
+
+<h2 id="point-releases">Point Releases</h2>
+
+<h3 id="0.10.1">0.10.1</h3>
+
+Released on 2018-05-14. Bug fixes <a href='https://github.com/perkeep/perkeep/compare/fcba46d922d3f4b6b860cc080213218258e61f1b...21e2d574e5c637d8c00bc8ab9bf34fd883dece1d'>since 0.10</a>:
+
+<ul>
+	<li> <b>cmd/pk</b>: fix summary of the "get" subcommand in help mode (<a href='https://github.com/perkeep/perkeep/commit/361dfcd004e04351e58045fbe4fc75aed4080e7b'>361dfcd</a>) </li>
+	<li> <b>internal/osutil</b>: make perkeepd start on Windows without configuration location errors (<a href='https://github.com/perkeep/perkeep/commit/e607198dfc931cb72c2c77e624a0badcc487f0e9'>e607198</a>) </li>
+	<li> <b>server/perkeepd</b>: stop initialization when creating default configuration fails (<a href='https://github.com/perkeep/perkeep/commit/4a715367ed854e19c204ca7c4014700fec427a76'>4a71536</a>) </li>
+	<li> <b>blobserver/files</b>: fix a data race in enumeration (<a href='https://github.com/perkeep/perkeep/commit/1c0648653102b62baf22d7cf054548bd68f4e3f5'>1c06486</a>) </li>
+</ul>

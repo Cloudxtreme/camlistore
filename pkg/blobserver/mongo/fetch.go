@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,15 +18,16 @@ package mongo
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 
-	"camlistore.org/pkg/blob"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2/bson"
+	"perkeep.org/pkg/blob"
 )
 
-func (m *mongoStorage) Fetch(ref blob.Ref) (io.ReadCloser, uint32, error) {
+func (m *mongoStorage) Fetch(ctx context.Context, ref blob.Ref) (io.ReadCloser, uint32, error) {
 	var b blobDoc
 	err := m.c.Find(bson.M{"key": ref.String()}).One(&b)
 	if err != nil {

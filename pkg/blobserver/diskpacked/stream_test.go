@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package diskpacked
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -27,11 +28,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/test"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/test"
 )
 
 type blobDetails struct {
@@ -67,7 +67,7 @@ func uploadTestBlobs(t *testing.T, s blobserver.Storage, blobs []blobDetails) {
 			t.Fatalf("hex.DecodeString(): %v", err)
 		}
 
-		_, err = blobserver.Receive(s, ref, bytes.NewBuffer(data))
+		_, err = blobserver.Receive(ctxbg, s, ref, bytes.NewBuffer(data))
 		if err != nil {
 			t.Fatalf("blobserver.Receive(): %v", err)
 		}
@@ -173,12 +173,14 @@ func TestBasicStreaming(t *testing.T) {
 
 func verifySizeAndHash(t *testing.T, blob *blob.Blob) {
 	hash := sha1.New()
-	r := blob.Open()
+	r, err := blob.ReadAll(ctxbg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	n, err := io.Copy(hash, r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Close()
 
 	if uint32(n) != blob.Size() {
 		t.Fatalf("read %d bytes from blob %v; want %v", n, blob.Ref(), blob.Size())
@@ -198,6 +200,7 @@ func TestStreamMultiplePacks(t *testing.T) {
 }
 
 func TestStreamSkipRemovedBlobs(t *testing.T) {
+	ctx := context.Background()
 	// Note: This is the only streaming test that makes use of the
 	// index (for RemoveBlobs() to succeed). The others do create
 	// an indexed storage but they do not use the index to stream
@@ -213,7 +216,7 @@ func TestStreamSkipRemovedBlobs(t *testing.T) {
 		t.Fatalf("blob.Parse: %s", testPack1[0].digest)
 	}
 
-	err := s.RemoveBlobs([]blob.Ref{ref})
+	err := s.RemoveBlobs(ctx, []blob.Ref{ref})
 	if err != nil {
 		t.Fatalf("RemoveBlobs: %v", err)
 	}

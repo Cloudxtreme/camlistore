@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,12 @@ limitations under the License.
 // Among other things, it can throttle its connections, inherit its
 // listening socket from a file descriptor in the environment, and
 // log all activity.
-package webserver // import "camlistore.org/pkg/webserver"
+package webserver // import "perkeep.org/pkg/webserver"
 
 import (
-	"bufio"
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -36,12 +34,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bradfitz/runsit/listen"
+	"perkeep.org/pkg/webserver/listen"
 
 	"go4.org/net/throttle"
 	"go4.org/wkfs"
 	"golang.org/x/net/http2"
 )
+
+const alpnProto = "acme-tls/1" // from golang.org/x/crypto/acme.ALPNProto
 
 type Server struct {
 	mux      *http.ServeMux
@@ -106,19 +106,21 @@ func (s *Server) SetTLS(setup TLSSetup) {
 }
 
 func (s *Server) ListenURL() string {
+	if s.listener == nil {
+		return ""
+	}
+	taddr, ok := s.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return ""
+	}
 	scheme := "http"
 	if s.enableTLS {
 		scheme = "https"
 	}
-	if s.listener != nil {
-		if taddr, ok := s.listener.Addr().(*net.TCPAddr); ok {
-			if taddr.IP.IsUnspecified() {
-				return fmt.Sprintf("%s://localhost:%d", scheme, taddr.Port)
-			}
-			return fmt.Sprintf("%s://%s", scheme, s.listener.Addr())
-		}
+	if taddr.IP.IsUnspecified() {
+		return fmt.Sprintf("%s://localhost:%d", scheme, taddr.Port)
 	}
-	return ""
+	return fmt.Sprintf("%s://%s", scheme, s.listener.Addr())
 }
 
 func (s *Server) HandleFunc(pattern string, fn func(http.ResponseWriter, *http.Request)) {
@@ -171,7 +173,6 @@ func (s *Server) Listen(addr string) error {
 		return nil
 	}
 
-	doLog := os.Getenv("TESTING_PORT_WRITE_FD") == "" // Don't make noise during unit tests
 	if addr == "" {
 		return fmt.Errorf("<host>:<port> needs to be provided to start listening")
 	}
@@ -182,9 +183,7 @@ func (s *Server) Listen(addr string) error {
 		return fmt.Errorf("Failed to listen on %s: %v", addr, err)
 	}
 	base := s.ListenURL()
-	if doLog {
-		s.printf("Starting to listen on %s\n", base)
-	}
+	s.printf("Starting to listen on %s\n", base)
 
 	doEnableTLS := func() error {
 		config := &tls.Config{
@@ -195,6 +194,9 @@ func (s *Server) Listen(addr string) error {
 		}
 		if s.tlsCertFile == "" && s.certManager != nil {
 			config.GetCertificate = s.certManager
+			// TODO(mpl): see if we can instead use
+			// https://godoc.org/golang.org/x/crypto/acme/autocert#Manager.TLSConfig
+			config.NextProtos = append(config.NextProtos, alpnProto)
 			s.listener = tls.NewListener(s.listener, config)
 			return nil
 		}
@@ -213,7 +215,7 @@ func (s *Server) Listen(addr string) error {
 		}
 	}
 
-	if doLog && strings.HasSuffix(base, ":0") {
+	if strings.HasSuffix(base, ":0") {
 		s.printf("Now listening on %s\n", s.ListenURL())
 	}
 
@@ -263,25 +265,11 @@ func (s *Server) Serve() {
 // TODO: write back the port number that we randomly selected?
 // For now just writes back a single byte.
 func runTestHarnessIntegration(listener net.Listener) {
-	writePipe, err := pipeFromEnvFd("TESTING_PORT_WRITE_FD")
-	if err != nil {
-		return
-	}
-	readPipe, _ := pipeFromEnvFd("TESTING_CONTROL_READ_FD")
-
-	if writePipe != nil {
-		writePipe.Write([]byte(listener.Addr().String() + "\n"))
-	}
-
-	if readPipe != nil {
-		bufr := bufio.NewReader(readPipe)
-		for {
-			line, err := bufr.ReadString('\n')
-			if err == io.EOF || line == "EXIT\n" {
-				os.Exit(0)
-			}
-			return
-		}
+	addr := os.Getenv("CAMLI_SET_BASE_URL_AND_SEND_ADDR_TO")
+	c, err := net.Dial("tcp", addr)
+	if err == nil {
+		fmt.Fprintf(c, "%s\n", listener.Addr())
+		c.Close()
 	}
 }
 

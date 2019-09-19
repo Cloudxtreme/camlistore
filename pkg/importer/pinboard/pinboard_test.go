@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,16 @@ package pinboard
 import (
 	"testing"
 
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	imptest "camlistore.org/pkg/importer/test"
-	"camlistore.org/pkg/schema/nodeattr"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/importer"
+	imptest "perkeep.org/pkg/importer/test"
+	"perkeep.org/pkg/schema/nodeattr"
 )
+
+func init() {
+	testhooks.SetUseSHA1(true)
+}
 
 func verifyUsername(t *testing.T, apiToken string, expected string) {
 	extracted := extractUsername(apiToken)
@@ -45,7 +50,7 @@ func TestIntegrationRun(t *testing.T) {
 
 	responder := httputil.FileResponder("testdata/batchresponse.json")
 	transport, err := httputil.NewRegexpFakeTransport([]*httputil.Matcher{
-		&httputil.Matcher{`^https\://api\.pinboard\.in/v1/posts/all\?auth_token=gina:foo&format=json&results=10000&todt=\d\d\d\d.*`, responder},
+		{`^https\://api\.pinboard\.in/v1/posts/all\?auth_token=gina:foo&format=json&results=10000&todt=\d\d\d\d.*`, responder},
 	})
 	if err != nil {
 		t.Fatal(err)

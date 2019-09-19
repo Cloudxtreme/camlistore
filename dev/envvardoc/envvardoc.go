@@ -1,6 +1,6 @@
 // Program envvardoc will verify all referenced environment variables in go
 // source are properly documented.
-package main // import "camlistore.org/dev/envvardoc"
+package main // import "perkeep.org/dev/envvardoc"
 
 import (
 	"bufio"
@@ -43,7 +43,7 @@ type varMap map[string][]pos
 
 func sortedKeys(m varMap) []string {
 	keys := make([]string, 0, len(m))
-	for k, _ := range m {
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

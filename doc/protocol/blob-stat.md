@@ -2,7 +2,7 @@
 
 This document describes the "batch stat" API end-point, for checking
 the size/existence of multiple blobs when the client and/or server do
-not support SPDY or HTTP/2.0.  See [blob-upload](blob-upload.md) for more
+not support HTTP/2.0.  See [blob-upload](blob-upload.md) for more
 background.
 
 Notably: the HTTP method may be GET or POST.  GET is more correct but
@@ -16,7 +16,7 @@ The HTTP request path is `$blobRoot/camli/stat`.  See
 In either case, the request form values: (either in the URL for GET or
 application/x-www-form-urlencoded body for POST)
 
-    camliversion    required   Version of camlistore and/or stat protocol;
+    camliversion    required   Version of Perkeep and/or stat protocol;
                                reserved for future use.  Must be "1" for now.
 
     blob<n>         optional/  Must start at 1 and go up, no gaps allowed, not

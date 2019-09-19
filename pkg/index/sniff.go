@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"bytes"
 	"errors"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/magic"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/magic"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
 )
 
 type BlobSniffer struct {
@@ -83,7 +83,7 @@ func (sn *BlobSniffer) Body() ([]byte, error) {
 }
 
 // MIMEType returns the sniffed blob's content-type or the empty string if unknown.
-// If the blob is a Camlistore schema metadata blob, the MIME type will be of
+// If the blob is a Perkeep schema metadata blob, the MIME type will be of
 // the form "application/json; camliType=foo".
 func (sn *BlobSniffer) MIMEType() string { return sn.mimeType }
 

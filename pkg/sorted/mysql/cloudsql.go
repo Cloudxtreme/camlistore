@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,10 +25,9 @@ import (
 	"strings"
 
 	"cloud.google.com/go/compute/metadata"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	sqladmin "google.golang.org/api/sqladmin/v1beta3"
+	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
 
 const cloudSQLSuffix = ".cloudsql.google.internal"
@@ -51,7 +51,7 @@ func maybeRemapCloudSQL(host string) (out string, err error) {
 		return "", fmt.Errorf("error enumerating Cloud SQL instances: %v", err)
 	}
 	for _, it := range listRes.Items {
-		if !strings.EqualFold(it.Instance, inst) {
+		if !strings.EqualFold(it.Name, inst) {
 			continue
 		}
 		js, _ := json.Marshal(it)
@@ -63,7 +63,7 @@ func maybeRemapCloudSQL(host string) (out string, err error) {
 	}
 	var found []string
 	for _, it := range listRes.Items {
-		found = append(found, it.Instance)
+		found = append(found, it.Name)
 	}
 	return "", fmt.Errorf("Cloud SQL instance %q not found. Found: %q", inst, found)
 }

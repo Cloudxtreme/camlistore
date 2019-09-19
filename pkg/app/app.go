@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors.
+Copyright 2014 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 // Package app provides helpers for server applications interacting
-// with Camlistore.
+// with Perkeep.
 // See also https://camlistore.org/doc/app-environment for the related
 // variables.
-package app // import "camlistore.org/pkg/app"
+package app // import "perkeep.org/pkg/app"
 
 import (
 	"errors"
@@ -27,13 +27,13 @@ import (
 	"os"
 	"strings"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/httputil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/client"
 )
 
-// Auth returns the auth mode for the app to access Camlistore, as defined by
-// environment variables automatically supplied by the Camlistore server host.
+// Auth returns the auth mode for the app to access Perkeep, as defined by
+// environment variables automatically supplied by the Perkeep server host.
 func Auth() (auth.AuthMode, error) {
 	return basicAuth()
 }
@@ -50,8 +50,8 @@ func basicAuth() (auth.AuthMode, error) {
 	return auth.NewBasicAuth(userpass[0], userpass[1]), nil
 }
 
-// Client returns a Camlistore client as defined by environment variables
-// automatically supplied by the Camlistore server host.
+// Client returns a Perkeep client as defined by environment variables
+// automatically supplied by the Perkeep server host.
 func Client() (*client.Client, error) {
 	server := os.Getenv("CAMLI_API_HOST")
 	if server == "" {
@@ -61,7 +61,11 @@ func Client() (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.NewFromParams(server, am), nil
+	return client.New(
+		client.OptionNoExternalConfig(),
+		client.OptionServer(server),
+		client.OptionAuthMode(am),
+	)
 }
 
 // ListenAddress returns the host:[port] network address, derived from the environment,
@@ -75,7 +79,7 @@ func ListenAddress() (string, error) {
 }
 
 // PathPrefix returns the app's prefix on the app handler if the request was proxied
-// through Camlistore, or "/" if the request went directly to the app.
+// through Perkeep, or "/" if the request went directly to the app.
 func PathPrefix(r *http.Request) string {
 	if prefix := httputil.PathBase(r); prefix != "" {
 		return prefix

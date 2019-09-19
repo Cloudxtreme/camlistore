@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package archiver
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,10 +29,13 @@ import (
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/test"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/test"
 )
+
+var ctxbg = context.Background()
 
 func TestArchiver(t *testing.T) {
 	src := new(test.Fetcher)
@@ -53,7 +57,7 @@ func TestArchiver(t *testing.T) {
 		return errors.New("Store shouldn't be called")
 	}
 	a.MinZipSize = 400 // empirically: the zip will be 416 bytes
-	if err := a.RunOnce(); err != ErrSourceTooSmall {
+	if err := a.RunOnce(ctxbg); err != ErrSourceTooSmall {
 		t.Fatalf("RunOnce with just Hello = %v; want ErrSourceTooSmall", err)
 	}
 
@@ -65,7 +69,7 @@ func TestArchiver(t *testing.T) {
 		inZip = brs
 		return nil
 	}
-	if err := a.RunOnce(); err != nil {
+	if err := a.RunOnce(ctxbg); err != nil {
 		t.Fatalf("RunOnce with Hello and World = %v", err)
 	}
 	if zipData == nil {
@@ -94,8 +98,10 @@ func TestArchiverStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping in short mode")
 	}
+	defer testhooks.SetUseSHA1(true)()
+
 	src := new(test.Fetcher)
-	fileRef, err := schema.WriteFileFromReader(src, "random", io.LimitReader(randReader{}, 10<<20))
+	fileRef, err := schema.WriteFileFromReader(ctxbg, src, "random", io.LimitReader(randReader{}, 10<<20))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +128,7 @@ func TestArchiverStress(t *testing.T) {
 		},
 	}
 	for {
-		err := a.RunOnce()
+		err := a.RunOnce(ctxbg)
 		if err == ErrSourceTooSmall {
 			break
 		}
@@ -146,7 +152,12 @@ func TestArchiverStress(t *testing.T) {
 		if err := foreachZipEntry(zipd, func(br blob.Ref, contents []byte) {
 			tb := &test.Blob{Contents: string(contents)}
 			if tb.BlobRef() != br {
-				t.Fatal("corrupt zip callback")
+				c := contents
+				if len(c) > 500 {
+					c = c[:500]
+					c = append(c, "..."...)
+				}
+				t.Fatalf("corrupt zip callback; test blob %v (%q) != zip blob %v", tb.BlobRef(), c, br)
 			}
 			src.AddBlob(tb)
 		}); err != nil {

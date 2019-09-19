@@ -1,7 +1,7 @@
 // +build with_sqlite
 
 /*
-Copyright 2012 The Camlistore Authors.
+Copyright 2012 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,20 +28,25 @@ import (
 	"sync"
 	"testing"
 
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/kvtest"
-	_ "camlistore.org/pkg/sorted/sqlite"
-	"go4.org/jsonconfig"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/kvtest"
+	_ "perkeep.org/pkg/sorted/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go4.org/jsonconfig"
 )
 
 var (
 	once        sync.Once
 	dbAvailable bool
 )
+
+func init() {
+	testhooks.SetUseSHA1(true)
+}
 
 func do(db *sql.DB, sql string) {
 	_, err := db.Exec(sql)

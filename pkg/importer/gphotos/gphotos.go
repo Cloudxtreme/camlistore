@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Camlistore Authors
+Copyright 2017 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@ limitations under the License.
 
 // Package gphotos implements a Google Photos importer, using the Google Drive
 // API to access the Google Photos folder.
-package gphotos // import "camlistore.org/pkg/importer/gphotos"
+package gphotos // import "perkeep.org/pkg/importer/gphotos"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,19 +31,19 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/importer/picasa"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/pkg/search"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/importer/picasa"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
+	"perkeep.org/pkg/search"
 
 	"go4.org/ctxutil"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -84,7 +85,14 @@ type imp struct {
 	importer.OAuth2
 }
 
-func (imp) SupportsIncremental() bool { return true }
+func (imp) Properties() importer.Properties {
+	return importer.Properties{
+		Title:               "Google Photos (via Drive API)",
+		Description:         "import all your photos from Google Photos, via Google Drive. (requires settings changes in Drive)",
+		SupportsIncremental: true, // TODO: but not well
+		NeedsAPIKey:         true,
+	}
+}
 
 type userInfo struct {
 	ID    string // numeric gphotos user ID ("11583474931002155675")
@@ -252,7 +260,8 @@ func (imp) AccountSetupHTML(host *importer.Host) string {
 <p>First, you need to enable the Google Photos folder in the <a href='https://drive.google.com/'>Google Drive</a> settings.</p>
 <p>Then visit <a href='https://console.developers.google.com/'>https://console.developers.google.com/</a>
 and create a new project.</p>
-<p>Then under "API Manager" in the left sidebar, click on "Credentials", then click the button <b>"Create credentials"</b>, and pick <b>"OAuth client ID"</b>.</p>
+<p>Next, go to the <a href='https://console.cloud.google.com/apis/library'>API Library</a> of your project, and enable the <em>Google Drive API</em>. You may have to wait a few minutes after this step, before the API is enabled on Google's side.</p>
+<p>Finally, go to the <a href='https://console.cloud.google.com/apis/credentials'>API Credentials</a> of your project. Click the button <b>"Create credentials"</b>, and pick <b>"OAuth client ID"</b>.</p>
 <p>Use the following settings:</p>
 <ul>
   <li>Web application</li>
@@ -266,10 +275,9 @@ and create a new project.</p>
 // A run is our state for a given run of the importer.
 type run struct {
 	*importer.RunContext
-	incremental  bool // whether we've completed a run in the past
 	photoGate    *syncutil.Gate
 	setNextToken func(string) error
-	*downloader
+	dl           *downloader
 }
 
 var forceFullImport, _ = strconv.ParseBool(os.Getenv("CAMLI_GPHOTOS_FULL_IMPORT"))
@@ -309,10 +317,9 @@ func (imp) Run(rctx *importer.RunContext) error {
 	}
 	r := &run{
 		RunContext:   rctx,
-		incremental:  !forceFullImport && acctNode.Attr(importer.AcctAttrCompletedVersion) == runCompleteVersion,
 		photoGate:    syncutil.NewGate(3),
 		setNextToken: func(nextToken string) error { return acctNode.SetAttr(acctSinceToken, nextToken) },
-		downloader:   dl,
+		dl:           dl,
 	}
 	if err := r.importPhotos(ctx, sinceToken); err != nil {
 		return err
@@ -326,55 +333,40 @@ func (imp) Run(rctx *importer.RunContext) error {
 }
 
 func (r *run) importPhotos(ctx context.Context, sinceToken string) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	photosCh, nextToken, err := r.downloader.photos(ctx, sinceToken)
-	if err != nil {
-		return fmt.Errorf("gphotos importer: %v", err)
-	}
 	photosNode, err := r.getTopLevelNode("photos")
 	if err != nil {
 		return fmt.Errorf("gphotos importer: get top level node: %v", err)
 	}
-	for batch := range photosCh {
+
+	grp, grpCtx := errgroup.WithContext(ctx)
+
+	nextToken, err := r.dl.foreachPhoto(grpCtx, sinceToken, func(ctx context.Context, ph *photo) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if batch.err != nil {
-			return err
+
+		r.photoGate.Start()
+		grp.Go(func() error {
+			defer r.photoGate.Done()
+			return r.updatePhoto(ctx, photosNode, ph)
+		})
+		return nil
+
+	})
+	if gerr := grp.Wait(); gerr != nil {
+		if err == nil || err == context.Canceled || err == context.DeadlineExceeded {
+			err = gerr
 		}
-		if err := r.importPhotosBatch(ctx, photosNode, batch.photos); err != nil {
-			return err
-		}
+	}
+	if err != nil {
+		return fmt.Errorf("gphotos importer: %v", err)
 	}
 	if r.setNextToken != nil {
 		r.setNextToken(nextToken)
 	}
 	return nil
-}
-
-func (r *run) importPhotosBatch(ctx context.Context, parent *importer.Object, photos []photo) error {
-	var grp syncutil.Group
-	for _, photo := range photos {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		photo := photo
-		r.photoGate.Start()
-		grp.Go(func() error {
-			defer r.photoGate.Done()
-			return r.updatePhoto(ctx, parent, photo)
-		})
-	}
-	return grp.Err()
 }
 
 func (ph photo) filename() string {
@@ -423,9 +415,14 @@ func (ph photo) title(altTitle string) string {
 // contents, and with no conflicting attributes, exists. So we reuse that
 // permanode.
 // 4) A permanode for the photo object already exists, so we reuse it.
-func (r *run) updatePhoto(ctx context.Context, parent *importer.Object, ph photo) (ret error) {
+func (r *run) updatePhoto(ctx context.Context, parent *importer.Object, ph *photo) error {
 	if ph.ID == "" {
 		return errors.New("photo has no ID")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	// fileRefStr, in addition to being used as the camliConent value, is used
@@ -440,18 +437,18 @@ func (r *run) updatePhoto(ctx context.Context, parent *importer.Object, ph photo
 
 	photoNode, err := parent.ChildPathObjectOrFunc(ph.ID, func() (*importer.Object, error) {
 		h := blob.NewHash()
-		rc, err := r.downloader.openPhoto(ctx, ph)
+		rc, err := r.dl.openPhoto(ctx, *ph)
 		if err != nil {
 			return nil, err
 		}
-		fileRef, err := schema.WriteFileFromReader(r.Host.Target(), filename, io.TeeReader(rc, h))
+		fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), filename, io.TeeReader(rc, h))
 		rc.Close()
 		if err != nil {
 			return nil, err
 		}
 		fileRefStr = fileRef.String()
 		wholeRef := blob.RefFromHash(h)
-		pn, attrs, err := findExistingPermanode(r.Host.Searcher(), wholeRef)
+		pn, attrs, err := findExistingPermanode(r.Context(), r.Host.Searcher(), wholeRef)
 		if err != nil {
 			if err != os.ErrNotExist {
 				return nil, fmt.Errorf("could not look for permanode with %v as camliContent : %v", fileRefStr, err)
@@ -465,7 +462,7 @@ func (r *run) updatePhoto(ctx context.Context, parent *importer.Object, ph photo
 	})
 	if err != nil {
 		if fileRefStr != "" {
-			return fmt.Errorf("error getting permanode for photo %q, with content %v: $v", ph.ID, fileRefStr, err)
+			return fmt.Errorf("error getting permanode for photo %q, with content %v: %v", ph.ID, fileRefStr, err)
 		}
 		return fmt.Errorf("error getting permanode for photo %q: %v", ph.ID, err)
 	}
@@ -476,11 +473,11 @@ func (r *run) updatePhoto(ctx context.Context, parent *importer.Object, ph photo
 		// been interrupted. So we check for an existing camliContent.
 		if camliContent := photoNode.Attr(nodeattr.CamliContent); camliContent == "" {
 			// looks like an incomplete node, so we need to re-download.
-			rc, err := r.downloader.openPhoto(ctx, ph)
+			rc, err := r.dl.openPhoto(ctx, *ph)
 			if err != nil {
 				return err
 			}
-			fileRef, err := schema.WriteFileFromReader(r.Host.Target(), filename, rc)
+			fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), filename, rc)
 			rc.Close()
 			if err != nil {
 				return err
@@ -601,8 +598,8 @@ var sensitiveAttrs = []string{
 // as well as the existing attributes on the node, so the caller
 // can merge them with whatever new attributes it wants to add to
 // the node.
-func findExistingPermanode(qs search.QueryDescriber, wholeRef blob.Ref) (pn blob.Ref, picasaAttrs url.Values, err error) {
-	res, err := qs.Query(&search.SearchQuery{
+func findExistingPermanode(ctx context.Context, qs search.QueryDescriber, wholeRef blob.Ref) (pn blob.Ref, picasaAttrs url.Values, err error) {
+	res, err := qs.Query(ctx, &search.SearchQuery{
 		Constraint: &search.Constraint{
 			Permanode: &search.PermanodeConstraint{
 				Attr: "camliContent",

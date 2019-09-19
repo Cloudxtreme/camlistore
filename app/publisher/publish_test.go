@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,14 +25,17 @@ import (
 	"testing"
 	"time"
 
-	camliClient "camlistore.org/pkg/client"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/search"
-
-	"golang.org/x/net/context"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/testhooks"
+	camliClient "perkeep.org/pkg/client"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	"perkeep.org/pkg/search"
 )
+
+func init() {
+	testhooks.SetUseSHA1(true)
+}
 
 type publishURLTest struct {
 	path            string // input
@@ -122,24 +126,24 @@ type fakeClient struct {
 	sh                  *search.Handler
 }
 
-func (fc *fakeClient) Query(req *search.SearchQuery) (*search.SearchResult, error) {
-	return fc.sh.Query(req)
+func (fc *fakeClient) Query(ctx context.Context, req *search.SearchQuery) (*search.SearchResult, error) {
+	return fc.sh.Query(ctx, req)
 }
 
-func (fc *fakeClient) Search(req *search.SearchQuery) (*search.SearchResult, error) {
-	return fc.sh.Query(req)
+func (fc *fakeClient) Search(ctx context.Context, req *search.SearchQuery) (*search.SearchResult, error) {
+	return fc.sh.Query(ctx, req)
 }
 
 func (fc *fakeClient) Describe(ctx context.Context, req *search.DescribeRequest) (*search.DescribeResponse, error) {
 	return fc.sh.Describe(ctx, req)
 }
 
-func (fc *fakeClient) GetJSON(url string, data interface{}) error {
+func (fc *fakeClient) GetJSON(ctx context.Context, url string, data interface{}) error {
 	// no need to implement
 	return nil
 }
 
-func (fc *fakeClient) Post(url string, bodyType string, body io.Reader) error {
+func (fc *fakeClient) Post(ctx context.Context, url string, bodyType string, body io.Reader) error {
 	// no need to implement
 	return nil
 }
@@ -149,13 +153,18 @@ func (fc *fakeClient) Post(url string, bodyType string, body io.Reader) error {
 func TestPublishURLs(t *testing.T) {
 	rootName := "foo"
 	idxd := setupContent(rootName)
-	sh := search.NewHandler(idxd.Index, idxd.SignerBlobRef)
+	ownerRef := indextest.PubKey
+	owner := index.NewOwner(indextest.KeyID, ownerRef.BlobRef())
+	sh := search.NewHandler(idxd.Index, owner)
 	corpus, err := idxd.Index.KeepInMemory()
 	if err != nil {
 		t.Fatalf("error slurping index to memory: %v", err)
 	}
 	sh.SetCorpus(corpus)
-	cl := camliClient.New("http://whatever.fake")
+	cl, err := camliClient.New(camliClient.OptionServer("http://whatever.fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	fcl := &fakeClient{cl, sh}
 	ph := &publishHandler{
 		rootName: rootName,
@@ -205,13 +214,18 @@ func TestPublishMembers(t *testing.T) {
 	rootName := "foo"
 	idxd := setupContent(rootName)
 
-	sh := search.NewHandler(idxd.Index, idxd.SignerBlobRef)
+	ownerRef := indextest.PubKey
+	owner := index.NewOwner(indextest.KeyID, ownerRef.BlobRef())
+	sh := search.NewHandler(idxd.Index, owner)
 	corpus, err := idxd.Index.KeepInMemory()
 	if err != nil {
 		t.Fatalf("error slurping index to memory: %v", err)
 	}
 	sh.SetCorpus(corpus)
-	cl := camliClient.New("http://whatever.fake")
+	cl, err := camliClient.New(camliClient.OptionServer("http://whatever.fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	fcl := &fakeClient{cl, sh}
 	ph := &publishHandler{
 		rootName: rootName,

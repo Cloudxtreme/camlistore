@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ package integration
 import (
 	"testing"
 
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/test"
 )
 
-// Make sure that the camlistored process started
+// Make sure that the perkeepd process started
 // by the World gets terminated when all the tests
 // are done.
 // This works only as long as TestZLastTest is the

@@ -16,18 +16,18 @@ valid.
   sent to Amazon's S3 service.
 
 `CAMLI_APP_BINDIR` (string)
-: Path to the directory where Camlistore first looks for the server applications
+: Path to the directory where Perkeep first looks for the server applications
   executables, when starting them. It looks in PATH otherwise.
 
 `CAMLI_AUTH` (string)
 : See [server-config](server-config.md).
   Used as a fallback in pkg/client.Client (except on android) when
   configuration files lack and 'auth' entry.  If a client is using the -server
-  commandline to specify the camlistore instance to talk to, this env var
+  commandline to specify the Perkeep instance to talk to, this env var
   takes precedence over that specified in the configuration files.
 
 `CAMLI_BASEURL` (string)
-: URL set in devcam to act as a baseURL in the devcam launched camlistored.
+: URL set in devcam to act as a baseURL in the devcam launched perkeepd.
 
 `CAMLI_CACHE_DIR` (string)
 : Path used by [pkg/osutil](/pkg/osutil) to override operating system specific
@@ -40,10 +40,10 @@ valid.
 `CAMLI_DBNAME` (string)
 : Backend specific data source name (DSN).
   Set in devcam to pass database configuration for the indexer to the devcam
-  launched camlistored.
+  launched perkeepd.
 
 `CAMLI_DEBUG` (bool)
-: Used by camlistored and camput to enable additional commandline options.
+: Used by perkeepd and pk put to enable additional commandline options.
   Used in pkg/schema to enable additional logging.
 
 `CAMLI_DEBUG_CONFIG` (bool)
@@ -62,7 +62,7 @@ valid.
   takes precedence over the "default" bool in client-config.json.
 
 `CAMLI_DEV_CAMLI_ROOT` (string)
-: If set, the base directory of Camlistore when in dev mode.
+: If set, the base directory of Perkeep when in dev mode.
   Used by [pkg/server](/pkg/server) for finding static assests (js, css, html).
   Used as a signal by [pkg/index/\*](/pkg/index) and [pkg/server](/pkg/server)
   to output more helpful error message when run under devcam.
@@ -85,7 +85,7 @@ valid.
 `CAMLI_GCE_\*`
 : Variables prefixed with `CAMLI_GCE_` concern the Google Compute Engine deploy
   handler in [pkg/deploy/gce](/pkg/deploy/gce), which is only used by camweb to
-  launch Camlistore on Google Compute Engine. They do not affect Camlistore's
+  launch Perkeep on Google Compute Engine. They do not affect Perkeep's
   behaviour.
 
 `CAMLI_GCE_CLIENTID` (string)
@@ -122,8 +122,11 @@ valid.
 
 `CAMLI_GOPHERJS_GOROOT` (string)
 : As gopherjs does not build with go tip, when make.go is run with go devel,
-  CAMLI_GOPHERJS_GOROOT should be set to a Go 1.9 root so that gopherjs can be
-  built with Go 1.9. Otherwise it defaults to $HOME/go1.9.
+  CAMLI_GOPHERJS_GOROOT should be set to a Go 1.10 root so that gopherjs can be
+  built with Go 1.10. Otherwise it defaults to $HOME/go1.10.
+
+`CAMLI_HELLO_ENABLED (bool)
+: Whether to start the hello world app as well. Variable used only by devcam server.
 
 `CAMLI_HTTP_DEBUG` (bool)
 : Enable per-request logging in [pkg/webserver](/pkg/webserver).
@@ -143,7 +146,7 @@ files to be ignored by [pkg/client](/pkg/client) when uploading.
   Referenced in [pkg/osutil](/pkg/osutil) and used indirectly by
   [go4.org/jsonconfig.ConfigParser](http://go4.org/jsonconfig#ConfigParser) to search for
   files mentioned in configurations.  This is used as a last resort after first
-  checking the current directory and the camlistore config directory. It should
+  checking the current directory and the Perkeep config directory. It should
   be in the OS path form, i.e. unix-like systems would be
   /path/1:/path/two:/some/other/path, and Windows would be C:\path\one;D:\path\2
 
@@ -169,24 +172,29 @@ files to be ignored by [pkg/client](/pkg/client) when uploading.
 `CAMLI_MONGO_WIPE` (bool)
 : Wipe out mongo based index on startup.
 
-`CAMLI_MAKE_USEGOPATH` (bool)
-: When running make.go, overrides the -use_gopath flag.
-
 `CAMLI_NO_FILE_DUP_SEARCH` (bool)
 : This will cause the search-for-exists-before-upload step to be skipped when
-  camput is uploading files.
+  pk put is uploading files.
 
 `CAMLI_PPROF_START` (string)
 : Filename base to write a "<base>.cpu" and "<base>.mem" profile out
   to during server start-up.  Used to profile index corpus scanning,
   mostly.
 
-`CAMLI_QUIET` (bool)
-: Used by devcam to enable -verbose flag for camput/camget.
+`CAMLI_PUBLISH_ENABLED (bool)
+: Whether to start the publisher app as well. Variable used only by devcam server.
+
+`CAMLI_SCANCAB_ENABLED (bool)
+: Whether to start the scanning cabinet app as well. Variable used only by devcam server.
 
 `CAMLI_SECRET_RING` (string)
 : Path to the GPG secret keyring, which is otherwise set by identitySecretRing
   in the server config, and secretRing in the client config.
+
+`CAMLI_SHA1_ENABLED (bool)
+: Whether to enable the use of legacy sha1 blobs. Only used for development, for
+  creating new blobs with the legacy SHA-1 hash, instead of with the current one.
+  It does not affect the ability of Perkeep to read SHA-1 blobs.
 
 `CAMLI_DISABLE_CLIENT_CONFIG_FILE` (bool)
 : If set, the [pkg/client](/pkg/client) code will never use the on-disk config
@@ -213,6 +221,12 @@ files to be ignored by [pkg/client](/pkg/client) when uploading.
 `CAMLI_DISABLE_THUMB_CACHE` (bool)
 : If true, no thumbnail caching is done, and URLs even have cache
   buster components, to force browsers to reload a lot.
+
+`CAMLI_REDO_INDEX_ON_RECEIVE` (bool)
+: If true, the indexer will always index any blob it receives, regardless of
+  whether it thinks it's done it in the past. This is generally only useful when
+  working on the indexing code and retroactively indexing a subset of content
+  without forcing a global reindexing.
 
 `CAMLI_VAR_DIR` (string)
 : Path used by [pkg/osutil](/pkg/osutil) to override operating system specific

@@ -1,5 +1,5 @@
 /*
-Copyright 2012 Google Inc.
+Copyright 2012 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 // The genfileembed command embeds resources into Go files, to eliminate run-time
 // dependencies on files on the filesystem.
-package main // import "camlistore.org/pkg/fileembed/genfileembed"
+package main // import "perkeep.org/pkg/fileembed/genfileembed"
 
 import (
 	"bytes"
@@ -37,13 +37,13 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/rollsum"
+	"go4.org/rollsum"
 )
 
 var (
 	processAll = flag.Bool("all", false, "process all files (if false, only process modified files)")
 
-	fileEmbedPkgPath = flag.String("fileembed-package", "camlistore.org/pkg/fileembed", "the Go package name for fileembed. If you have vendored fileembed (e.g. with goven), you can use this flag to ensure that generated code imports the vendored package.")
+	fileEmbedPkgPath = flag.String("fileembed-package", "perkeep.org/pkg/fileembed", "the Go package name for fileembed. If you have vendored fileembed (e.g. with goven), you can use this flag to ensure that generated code imports the vendored package.")
 
 	chunkThreshold = flag.Int64("chunk-threshold", 0, "If non-zero, the maximum size of a file before it's cut up into content-addressable chunks with a rolling checksum")
 	chunkPackage   = flag.String("chunk-package", "", "Package to hold chunks")
@@ -163,7 +163,7 @@ func main() {
 		fmt.Fprintf(&b, "import \""+*fileEmbedPkgPath+"\"\n\n")
 		b.WriteString(imports)
 		fmt.Fprintf(&b, "func init() {\n\tFiles.Add(%q, %d, time.Unix(0, %d), %s(%s));\n}\n",
-			fileName, fileSize, fi.ModTime().UnixNano(), byteStreamType, qb)
+			filepath.ToSlash(fileName), fileSize, fi.ModTime().UnixNano(), byteStreamType, qb)
 
 		// gofmt it
 		fset := token.NewFileSet()

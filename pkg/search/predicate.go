@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,17 +20,18 @@ package search
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/geocode"
-	"camlistore.org/pkg/schema/nodeattr"
 	"go4.org/types"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/geocode"
+	"perkeep.org/pkg/schema/nodeattr"
 )
 
 const base = "0000-01-01T00:00:00Z"
@@ -125,6 +126,7 @@ func init() {
 
 	// Custom predicates
 	registerKeyword(newIsPost())
+	registerKeyword(newIsLike())
 	registerKeyword(newIsCheckin())
 
 	// Location predicates
@@ -167,12 +169,10 @@ func (mp matchPrefix) Match(a atom) (bool, error) {
 	if mp.prefix == a.predicate {
 		if len(a.args) != mp.count {
 			return true, fmt.Errorf("Wrong number of arguments for %q, given %d, expected %d", mp.prefix, len(a.args), mp.count)
-		} else {
-			return true, nil
 		}
-	} else {
-		return false, nil
+		return true, nil
 	}
+	return false, nil
 }
 
 // Core predicates
@@ -693,6 +693,33 @@ func (h hasLocation) Predicate(ctx context.Context, args []string) (*Constraint,
 	}, nil
 }
 
+// NamedSearch lets you use the search aliases you defined with SetNamed from the search handler.
+type namedSearch struct {
+	matchPrefix
+	sh *Handler
+}
+
+func newNamedSearch(sh *Handler) keyword {
+	return namedSearch{newMatchPrefix("named"), sh}
+}
+
+func (n namedSearch) Description() string {
+	return "Uses substitution of a predefined search. Set with $searchRoot/camli/search/setnamed?name=foo&substitute=attr:bar:baz" +
+		"\nSee what the substitute is with $searchRoot/camli/search/getnamed?named=foo"
+}
+
+func (n namedSearch) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	return n.namedConstraint(args[0])
+}
+
+func (n namedSearch) namedConstraint(name string) (*Constraint, error) {
+	subst, err := n.sh.getNamed(context.TODO(), name)
+	if err != nil {
+		return nil, err
+	}
+	return evalSearchInput(subst)
+}
+
 // Helpers
 
 func permWithAttr(attr, val string) *Constraint {
@@ -813,6 +840,27 @@ func (k isPost) Predicate(ctx context.Context, args []string) (*Constraint, erro
 	}, nil
 }
 
+type isLike struct {
+	matchEqual
+}
+
+func newIsLike() keyword {
+	return isLike{"is:like"}
+}
+
+func (k isLike) Description() string {
+	return "matches liked tweets"
+}
+
+func (k isLike) Predicate(ctx context.Context, args []string) (*Constraint, error) {
+	return &Constraint{
+		Permanode: &PermanodeConstraint{
+			Attr:  nodeattr.Type,
+			Value: "twitter.com:like",
+		},
+	}, nil
+}
+
 type isCheckin struct {
 	matchEqual
 }
@@ -843,14 +891,25 @@ func newFilename() keyword {
 }
 
 func (fn filename) Description() string {
-	return "Match filename"
+	return "Match filename, case sensitively. Supports optional '*' wildcard at beginning, end, or both."
 }
 
 func (fn filename) Predicate(ctx context.Context, args []string) (*Constraint, error) {
-	c := permOfFile(&FileConstraint{
-		FileName: &StringConstraint{
-			Equals: args[0],
-		},
-	})
-	return c, nil
+	arg := args[0]
+	switch {
+	case !strings.Contains(arg, "*"):
+		return permOfFile(&FileConstraint{FileName: &StringConstraint{Equals: arg}}), nil
+	case strings.HasPrefix(arg, "*") && !strings.Contains(arg[1:], "*"):
+		suffix := arg[1:]
+		return permOfFile(&FileConstraint{FileName: &StringConstraint{HasSuffix: suffix}}), nil
+	case strings.HasSuffix(arg, "*") && !strings.Contains(arg[:len(arg)-1], "*"):
+		prefix := arg[:len(arg)-1]
+		return permOfFile(&FileConstraint{FileName: &StringConstraint{
+			HasPrefix: prefix,
+		}}), nil
+	case strings.HasSuffix(arg, "*") && strings.HasPrefix(arg, "*") && !strings.Contains(arg[1:len(arg)-1], "*"):
+		sub := arg[1 : len(arg)-1]
+		return permOfFile(&FileConstraint{FileName: &StringConstraint{Contains: sub}}), nil
+	}
+	return nil, errors.New("unsupported glob wildcard in filename search predicate")
 }

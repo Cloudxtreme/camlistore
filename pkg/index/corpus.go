@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package index
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -29,13 +30,12 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/types/camtypes"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/types/camtypes"
 
 	"go4.org/strutil"
 	"go4.org/syncutil"
@@ -52,6 +52,10 @@ type Corpus struct {
 	// end of scan.
 	building bool
 
+	// hasLegacySHA1 reports whether some SHA-1 blobs are indexed. It is set while
+	//building the corpus from the initial index scan.
+	hasLegacySHA1 bool
+
 	// gen is incremented on every blob received.
 	// It's used as a query cache invalidator.
 	gen int64
@@ -67,16 +71,23 @@ type Corpus struct {
 	// The value is the same one in blobs.
 	camBlobs map[string]map[blob.Ref]*camtypes.BlobMeta
 
-	// TODO: add GoLLRB to third_party; keep sorted BlobMeta
-	keyId        map[blob.Ref]string
-	files        map[blob.Ref]camtypes.FileInfo
+	// TODO: add GoLLRB to vendor; keep sorted BlobMeta
+	keyId signerFromBlobrefMap
+
+	// signerRefs maps a signer GPG ID to all its signer blobs (because different hashes).
+	signerRefs   map[string]SignerRefSet
+	files        map[blob.Ref]camtypes.FileInfo // keyed by file or directory schema blob
 	permanodes   map[blob.Ref]*PermanodeMeta
 	imageInfo    map[blob.Ref]camtypes.ImageInfo // keyed by fileref (not wholeref)
 	fileWholeRef map[blob.Ref]blob.Ref           // fileref -> its wholeref (TODO: multi-valued?)
 	gps          map[blob.Ref]latLong            // wholeRef -> GPS coordinates
+	// dirChildren maps a directory to its (direct) children (static-set entries).
+	dirChildren map[blob.Ref]map[blob.Ref]struct{}
+	// fileParents maps a file or directory to its (direct) parents.
+	fileParents map[blob.Ref]map[blob.Ref]struct{}
 
 	// Lack of edge tracking implementation is issue #707
-	// (https://github.com/camlistore/camlistore/issues/707)
+	// (https://github.com/perkeep/perkeep/issues/707)
 
 	// claimBack allows hopping backwards from a Claim's Value
 	// when the Value is a blobref.  It allows, for example,
@@ -99,9 +110,37 @@ type Corpus struct {
 	permanodesByTime    *lazySortedPermanodes // cache of permanodes sorted by creation time.
 	permanodesByModtime *lazySortedPermanodes // cache of permanodes sorted by modtime.
 
+	// permanodesSetByNodeType maps from a camliNodeType attribute
+	// value to the set of permanodes that ever had that
+	// value. The bool is always true.
+	permanodesSetByNodeType map[string]map[blob.Ref]bool
+
 	// scratch string slice
 	ss []string
 }
+
+func (c *Corpus) logf(format string, args ...interface{}) {
+	log.Printf("index/corpus: "+format, args...)
+}
+
+// blobMatches reports whether br is in the set.
+func (srs SignerRefSet) blobMatches(br blob.Ref) bool {
+	for _, v := range srs {
+		if br.EqualString(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// signerFromBlobrefMap maps a signer blobRef to the signer's GPG ID (e.g.
+// 2931A67C26F5ABDA). It is needed because the signer on a claim is represented by
+// its blobRef, but the same signer could have created claims with different hashes
+// (e.g. with sha1 and with sha224), so these claims would look as if created by
+// different signers (because different blobRefs). signerID thus allows the
+// algorithms to rely on the unique GPG ID of a signer instead of the different
+// blobRef representations of it. Its value is usually the corpus keyId.
+type signerFromBlobrefMap map[blob.Ref]string
 
 type latLong struct {
 	lat, long float64
@@ -122,7 +161,9 @@ type PermanodeMeta struct {
 
 	attr attrValues // attributes from all signers
 
-	signer map[blob.Ref]attrValues // attrs per signer
+	// signer maps a signer's GPG ID (e.g. 2931A67C26F5ABDA) to the attrs for this
+	// signer.
+	signer map[string]attrValues
 }
 
 type attrValues map[string][]string
@@ -152,36 +193,42 @@ func (m attrValues) cacheAttrClaim(cl *camtypes.Claim) {
 
 // restoreInvariants sorts claims by date and
 // recalculates latest attributes.
-func (pm *PermanodeMeta) restoreInvariants() {
+func (pm *PermanodeMeta) restoreInvariants(signers signerFromBlobrefMap) error {
 	sort.Sort(camtypes.ClaimPtrsByDate(pm.Claims))
 	pm.attr = make(attrValues)
-	pm.signer = make(map[blob.Ref]attrValues)
+	pm.signer = make(map[string]attrValues)
 	for _, cl := range pm.Claims {
-		pm.appendAttrClaim(cl)
+		if err := pm.appendAttrClaim(cl, signers); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // fixupLastClaim fixes invariants on the assumption
 // that the all but the last element in Claims are sorted by date
 // and the last element is the only one not yet included in Attrs.
-func (pm *PermanodeMeta) fixupLastClaim() {
+func (pm *PermanodeMeta) fixupLastClaim(signers signerFromBlobrefMap) error {
 	if pm.attr != nil {
 		n := len(pm.Claims)
 		if n < 2 || camtypes.ClaimPtrsByDate(pm.Claims).Less(n-2, n-1) {
 			// already sorted, update Attrs from new Claim
-			pm.appendAttrClaim(pm.Claims[n-1])
-			return
+			return pm.appendAttrClaim(pm.Claims[n-1], signers)
 		}
 	}
-	pm.restoreInvariants()
+	return pm.restoreInvariants(signers)
 }
 
 // appendAttrClaim stores permanode attributes
-// from cl in pm.attr and pm.signer[cl.Signer].
+// from cl in pm.attr and pm.signer[signerID[cl.Signer]].
 // The caller of appendAttrClaim is responsible for calling
 // it with claims sorted in camtypes.ClaimPtrsByDate order.
-func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim) {
-	sc, ok := pm.signer[cl.Signer]
+func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim, signers signerFromBlobrefMap) error {
+	signer, ok := signers[cl.Signer]
+	if !ok {
+		return fmt.Errorf("claim %v has unknown signer %q", cl.BlobRef, cl.Signer)
+	}
+	sc, ok := pm.signer[signer]
 	if !ok {
 		// Optimize for the case where cl.Signer of all claims are the same.
 		// Instead of having two identical attrValues copies in
@@ -193,8 +240,8 @@ func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim) {
 			// Set up signer cache to reference
 			// the existing attrValues.
 			pm.attr.cacheAttrClaim(cl)
-			pm.signer[cl.Signer] = pm.attr
-			return
+			pm.signer[signer] = pm.attr
+			return nil
 
 		case 1:
 			// pm.signer has exactly one other signer,
@@ -214,7 +261,7 @@ func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim) {
 			}
 		}
 		sc = make(attrValues)
-		pm.signer[cl.Signer] = sc
+		pm.signer[signer] = sc
 	}
 
 	pm.attr.cacheAttrClaim(cl)
@@ -223,26 +270,43 @@ func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim) {
 	if len(pm.signer) > 1 {
 		sc.cacheAttrClaim(cl)
 	}
+	return nil
+}
+
+// signerID returns the GPG ID (e.g. 2931A67C26F5ABDA) corresponding to the
+// signer. It returns the empty value if signer is not a valid blob Ref, and the
+// unusable value "unknown GPG key" when it applies, as a convenience to help
+// with the different cases covered by valuesAtSigner.
+func (c *Corpus) signerID(signer blob.Ref) string {
+	if !signer.Valid() {
+		return ""
+	}
+	id, ok := c.keyId[signer]
+	if !ok {
+		return "unknown GPG key"
+	}
+	return id
 }
 
 // valuesAtSigner returns an attrValues to query permanode attr values at the
-// given time for the signerFilter.
+// given time for the signerFilter, which is the GPG ID of a signer (e.g. 2931A67C26F5ABDA).
+// It returns (nil, true) if signerFilter is not empty but pm has no
+// attributes for it (including if signerFilter is unknown).
 // It returns ok == true if v represents attrValues valid for the specified
 // parameters.
 // It returns (nil, false) if neither pm.attr nor pm.signer should be used for
 // the given time, because e.g. some claims are more recent than this time. In
 // which case, the caller should resort to querying another source, such as pm.Claims.
-// If signerFilter is valid and pm has no attributes for it, (nil, true) is
-// returned.
 // The returned map must not be changed by the caller.
 func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
-	signerFilter blob.Ref) (v attrValues, ok bool) {
+	signerFilter string) (v attrValues, ok bool) {
 
 	if pm.attr == nil {
 		return nil, false
 	}
+
 	var m attrValues
-	if signerFilter.Valid() {
+	if signerFilter != "" {
 		m = pm.signer[signerFilter]
 		if m == nil {
 			return nil, true
@@ -261,19 +325,23 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 
 func newCorpus() *Corpus {
 	c := &Corpus{
-		blobs:        make(map[blob.Ref]*camtypes.BlobMeta),
-		camBlobs:     make(map[string]map[blob.Ref]*camtypes.BlobMeta),
-		files:        make(map[blob.Ref]camtypes.FileInfo),
-		permanodes:   make(map[blob.Ref]*PermanodeMeta),
-		imageInfo:    make(map[blob.Ref]camtypes.ImageInfo),
-		deletedBy:    make(map[blob.Ref]blob.Ref),
-		keyId:        make(map[blob.Ref]string),
-		brOfStr:      make(map[string]blob.Ref),
-		fileWholeRef: make(map[blob.Ref]blob.Ref),
-		gps:          make(map[blob.Ref]latLong),
-		mediaTags:    make(map[blob.Ref]map[string]string),
-		deletes:      make(map[blob.Ref][]deletion),
-		claimBack:    make(map[blob.Ref][]*camtypes.Claim),
+		blobs:                   make(map[blob.Ref]*camtypes.BlobMeta),
+		camBlobs:                make(map[string]map[blob.Ref]*camtypes.BlobMeta),
+		files:                   make(map[blob.Ref]camtypes.FileInfo),
+		permanodes:              make(map[blob.Ref]*PermanodeMeta),
+		imageInfo:               make(map[blob.Ref]camtypes.ImageInfo),
+		deletedBy:               make(map[blob.Ref]blob.Ref),
+		keyId:                   make(map[blob.Ref]string),
+		signerRefs:              make(map[string]SignerRefSet),
+		brOfStr:                 make(map[string]blob.Ref),
+		fileWholeRef:            make(map[blob.Ref]blob.Ref),
+		gps:                     make(map[blob.Ref]latLong),
+		mediaTags:               make(map[blob.Ref]map[string]string),
+		deletes:                 make(map[blob.Ref][]deletion),
+		claimBack:               make(map[blob.Ref][]*camtypes.Claim),
+		permanodesSetByNodeType: make(map[string]map[blob.Ref]bool),
+		dirChildren:             make(map[blob.Ref]map[blob.Ref]struct{}),
+		fileParents:             make(map[blob.Ref]map[blob.Ref]struct{}),
 	}
 	c.permanodesByModtime = &lazySortedPermanodes{
 		c:      c,
@@ -321,19 +389,20 @@ func (crashStorage) Find(start, end string) sorted.Iterator {
 // *********** Updating the corpus
 
 var corpusMergeFunc = map[string]func(c *Corpus, k, v []byte) error{
-	"have":            nil, // redundant with "meta"
-	"recpn":           nil, // unneeded.
-	"meta":            (*Corpus).mergeMetaRow,
-	"signerkeyid":     (*Corpus).mergeSignerKeyIdRow,
-	"claim":           (*Corpus).mergeClaimRow,
-	"fileinfo":        (*Corpus).mergeFileInfoRow,
-	"filetimes":       (*Corpus).mergeFileTimesRow,
-	"imagesize":       (*Corpus).mergeImageSizeRow,
-	"wholetofile":     (*Corpus).mergeWholeToFileRow,
-	"exifgps":         (*Corpus).mergeEXIFGPSRow,
-	"exiftag":         nil, // not using any for now
-	"signerattrvalue": nil, // ignoring for now
-	"mediatag":        (*Corpus).mergeMediaTag,
+	"have":                 nil, // redundant with "meta"
+	"recpn":                nil, // unneeded.
+	"meta":                 (*Corpus).mergeMetaRow,
+	keySignerKeyID.name:    (*Corpus).mergeSignerKeyIdRow,
+	"claim":                (*Corpus).mergeClaimRow,
+	"fileinfo":             (*Corpus).mergeFileInfoRow,
+	keyFileTimes.name:      (*Corpus).mergeFileTimesRow,
+	"imagesize":            (*Corpus).mergeImageSizeRow,
+	"wholetofile":          (*Corpus).mergeWholeToFileRow,
+	"exifgps":              (*Corpus).mergeEXIFGPSRow,
+	"exiftag":              nil, // not using any for now
+	"signerattrvalue":      nil, // ignoring for now
+	"mediatag":             (*Corpus).mergeMediaTag,
+	keyStaticDirChild.name: (*Corpus).mergeStaticDirChildRow,
 }
 
 func memstats() *runtime.MemStats {
@@ -347,14 +416,18 @@ var logCorpusStats = true // set to false in tests
 
 var slurpPrefixes = []string{
 	"meta:", // must be first
-	"signerkeyid:",
+	keySignerKeyID.name + ":",
+
+	// the first two above are loaded serially first for dependency reasons, whereas
+	// the others below are loaded concurrently afterwards.
 	"claim|",
 	"fileinfo|",
-	"filetimes|",
+	keyFileTimes.name + "|",
 	"imagesize|",
 	"wholetofile|",
 	"exifgps|",
 	"mediatag|",
+	keyStaticDirChild.name + "|",
 }
 
 // Key types (without trailing punctuation) that we slurp to memory at start.
@@ -372,8 +445,8 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	var ms0 *runtime.MemStats
 	if logCorpusStats {
 		ms0 = memstats()
-		log.Printf("Slurping corpus to memory from index...")
-		log.Printf("Slurping corpus to memory from index... (1/%d: meta rows)", len(slurpPrefixes))
+		c.logf("loading into memory...")
+		c.logf("loading into memory... (1/%d: meta rows)", len(slurpPrefixes))
 	}
 
 	scanmu := new(sync.Mutex)
@@ -384,14 +457,20 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	if err := c.scanPrefix(scanmu, s, "meta:"); err != nil {
 		return err
 	}
+
+	// we do the keyIDs first, because they're necessary to properly merge claims
+	if err := c.scanPrefix(scanmu, s, keySignerKeyID.name+":"); err != nil {
+		return err
+	}
+
 	c.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs["file"]))
 	c.permanodes = make(map[blob.Ref]*PermanodeMeta, len(c.camBlobs["permanode"]))
 	cpu0 := osutil.CPUUsage()
 
 	var grp syncutil.Group
-	for i, prefix := range slurpPrefixes[1:] {
+	for i, prefix := range slurpPrefixes[2:] {
 		if logCorpusStats {
-			log.Printf("Slurping corpus to memory from index... (%d/%d: prefix %q)", i+2, len(slurpPrefixes),
+			c.logf("loading into memory... (%d/%d: prefix %q)", i+2, len(slurpPrefixes),
 				prefix[:len(prefix)-1])
 		}
 		prefix := prefix
@@ -404,7 +483,9 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	// Post-load optimizations and restoration of invariants.
 	for _, pm := range c.permanodes {
 		// Restore invariants violated during building:
-		pm.restoreInvariants()
+		if err := pm.restoreInvariants(c.keyId); err != nil {
+			return err
+		}
 
 		// And intern some stuff.
 		for _, cl := range pm.Claims {
@@ -429,7 +510,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 		if ms1.Alloc < ms0.Alloc {
 			memUsed = 0
 		}
-		log.Printf("Corpus stats: %.3f MiB mem: %d blobs (%.3f GiB) (%d schema (%d permanode, %d file (%d image), ...)",
+		c.logf("stats: %.3f MiB mem: %d blobs (%.3f GiB) (%d schema (%d permanode, %d file (%d image), ...)",
 			float64(memUsed)/(1<<20),
 			len(c.blobs),
 			float64(c.sumBlobBytes)/(1<<30),
@@ -437,7 +518,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 			len(c.permanodes),
 			len(c.files),
 			len(c.imageInfo))
-		log.Printf("Corpus scanning CPU usage: %v", cpu)
+		c.logf("scanning CPU usage: %v", cpu)
 	}
 
 	return nil
@@ -486,15 +567,45 @@ func (c *Corpus) scanPrefix(mu *sync.Mutex, s sorted.KeyValue, prefix string) (e
 			mu.Lock()
 			defer mu.Unlock()
 		}
-		if err := fn(c, it.KeyBytes(), it.ValueBytes()); err != nil {
-			return err
+		if typeKey == keySignerKeyID.name {
+			signerBlobRef, ok := blob.Parse(strings.TrimPrefix(it.Key(), keySignerKeyID.name+":"))
+			if !ok {
+				c.logf("WARNING: bogus signer blob in %v row: %q", keySignerKeyID.name, it.Key())
+				continue
+			}
+			if err := c.addKeyID(&mutationMap{
+				signerBlobRef: signerBlobRef,
+				signerID:      it.Value(),
+			}); err != nil {
+				return err
+			}
+		} else {
+			if err := fn(c, it.KeyBytes(), it.ValueBytes()); err != nil {
+				return err
+			}
 		}
 	}
 	if logCorpusStats {
 		d := time.Since(t0)
-		log.Printf("Scanned prefix %q: %d rows, %v", prefix[:len(prefix)-1], n, d)
+		c.logf("loaded prefix %q: %d rows, %v", prefix[:len(prefix)-1], n, d)
 	}
 	return nil
+}
+
+func (c *Corpus) addKeyID(mm *mutationMap) error {
+	if mm.signerID == "" || !mm.signerBlobRef.Valid() {
+		return nil
+	}
+	id, ok := c.keyId[mm.signerBlobRef]
+	// only add it if we don't already have it, to save on allocs.
+	if ok {
+		if id != mm.signerID {
+			return fmt.Errorf("GPG ID mismatch for signer %q: refusing to overwrite %v with %v", mm.signerBlobRef, id, mm.signerID)
+		}
+		return nil
+	}
+	c.signerRefs[mm.signerID] = append(c.signerRefs[mm.signerID], mm.signerBlobRef.String())
+	return c.mergeSignerKeyIdRow([]byte("signerkeyid:"+mm.signerBlobRef.String()), []byte(mm.signerID))
 }
 
 func (c *Corpus) addBlob(ctx context.Context, br blob.Ref, mm *mutationMap) error {
@@ -502,8 +613,17 @@ func (c *Corpus) addBlob(ctx context.Context, br blob.Ref, mm *mutationMap) erro
 		return nil
 	}
 	c.gen++
+	// make sure keySignerKeyID is done first before the actual mutations, even
+	// though it's also going to be done in the loop below.
+	if err := c.addKeyID(mm); err != nil {
+		return err
+	}
 	for k, v := range mm.kv {
 		kt := typeOfKey(k)
+		if kt == keySignerKeyID.name {
+			// because we already took care of it in addKeyID
+			continue
+		}
 		if !slurpedKeyType[kt] {
 			continue
 		}
@@ -599,11 +719,21 @@ func (c *Corpus) mergeClaimRow(k, v []byte) error {
 	if !c.building {
 		// Unless we're still starting up (at which we sort at
 		// the end instead), keep claims sorted and attrs in sync.
-		pm.fixupLastClaim()
+		if err := pm.fixupLastClaim(c.keyId); err != nil {
+			return err
+		}
 	}
 
 	if vbr, ok := blob.Parse(cl.Value); ok {
 		c.claimBack[vbr] = append(c.claimBack[vbr], &cl)
+	}
+	if cl.Attr == "camliNodeType" {
+		set := c.permanodesSetByNodeType[cl.Value]
+		if set == nil {
+			set = make(map[blob.Ref]bool)
+			c.permanodesSetByNodeType[cl.Value] = set
+		}
+		set[pn] = true
 	}
 	return nil
 }
@@ -646,6 +776,39 @@ func (c *Corpus) mergeFileInfoRow(k, v []byte) error {
 	return nil
 }
 
+func (c *Corpus) mergeStaticDirChildRow(k, v []byte) error {
+	// dirchild|sha1-dir|sha1-child" "1"
+	// strip the key name
+	sk := k[len(keyStaticDirChild.name)+1:]
+	pipe := bytes.IndexByte(sk, '|')
+	if pipe < 0 {
+		return fmt.Errorf("invalid dirchild key %q, missing second pipe", k)
+	}
+	parent, ok := blob.ParseBytes(sk[:pipe])
+	if !ok {
+		return fmt.Errorf("invalid dirchild parent blobref in key %q", k)
+	}
+	child, ok := blob.ParseBytes(sk[pipe+1:])
+	if !ok {
+		return fmt.Errorf("invalid dirchild child blobref in key %q", k)
+	}
+	parent = c.br(parent)
+	child = c.br(child)
+	children, ok := c.dirChildren[parent]
+	if !ok {
+		children = make(map[blob.Ref]struct{})
+	}
+	children[child] = struct{}{}
+	c.dirChildren[parent] = children
+	parents, ok := c.fileParents[child]
+	if !ok {
+		parents = make(map[blob.Ref]struct{})
+	}
+	parents[parent] = struct{}{}
+	c.fileParents[child] = parents
+	return nil
+}
+
 func (c *Corpus) mergeFileTimesRow(k, v []byte) error {
 	if len(v) == 0 {
 		return nil
@@ -685,6 +848,8 @@ func (c *Corpus) mergeImageSizeRow(k, v []byte) error {
 	return nil
 }
 
+var sha1Prefix = []byte("sha1-")
+
 // "wholetofile|sha1-17b53c7c3e664d3613dfdce50ef1f2a09e8f04b5|sha1-fb88f3eab3acfcf3cfc8cd77ae4366f6f975d227" -> "1"
 func (c *Corpus) mergeWholeToFileRow(k, v []byte) error {
 	pair := k[len("wholetofile|"):]
@@ -698,6 +863,11 @@ func (c *Corpus) mergeWholeToFileRow(k, v []byte) error {
 		return fmt.Errorf("bogus row %q = %q", k, v)
 	}
 	c.fileWholeRef[fileRef] = wholeRef
+	if c.building && !c.hasLegacySHA1 {
+		if bytes.HasPrefix(pair, sha1Prefix) {
+			c.hasLegacySHA1 = true
+		}
+	}
 	return nil
 }
 
@@ -730,7 +900,12 @@ func (c *Corpus) mergeEXIFGPSRow(k, v []byte) error {
 	lat, err := strconv.ParseFloat(string(v[:pipe]), 64)
 	long, err1 := strconv.ParseFloat(string(v[pipe+1:]), 64)
 	if err != nil || err1 != nil {
-		return fmt.Errorf("bogus row %q = %q", k, v)
+		if err != nil {
+			log.Printf("index: bogus latitude in value of row %q = %q", k, v)
+		} else {
+			log.Printf("index: bogus longitude in value of row %q = %q", k, v)
+		}
+		return nil
 	}
 	c.gps[wholeRef] = latLong{lat, long}
 	return nil
@@ -928,6 +1103,29 @@ func (c *Corpus) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, new
 	c.enumeratePermanodes(fn, c.permanodesByTime.sorted(newestFirst))
 }
 
+// EnumerateSingleBlob calls fn with br's BlobMeta if br exists in the corpus.
+func (c *Corpus) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
+	if bm := c.blobs[br]; bm != nil {
+		fn(*bm)
+	}
+}
+
+// EnumeratePermanodesByNodeTypes enumerates over all permanodes that might
+// have one of the provided camliNodeType values, calling fn for each. If fn returns false,
+// enumeration ends.
+func (c *Corpus) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool, camliNodeTypes []string) {
+	for _, t := range camliNodeTypes {
+		set := c.permanodesSetByNodeType[t]
+		for br := range set {
+			if bm := c.blobs[br]; bm != nil {
+				if !fn(*bm) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func (c *Corpus) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	bm, ok := c.blobs[br]
 	if !ok {
@@ -944,7 +1142,7 @@ func (c *Corpus) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 }
 
 func (c *Corpus) pnTimeAttr(pn blob.Ref, attr string) (t time.Time, ok bool) {
-	if v := c.PermanodeAttrValue(pn, attr, time.Time{}, blob.Ref{}); v != "" {
+	if v := c.PermanodeAttrValue(pn, attr, time.Time{}, ""); v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			return t, true
 		}
@@ -1062,14 +1260,24 @@ func (c *Corpus) PermanodeModtime(pn blob.Ref) (t time.Time, ok bool) {
 }
 
 // PermanodeAttrValue returns a single-valued attribute or "".
+// signerFilter, if set, should be the GPG ID of a signer
+// (e.g. 2931A67C26F5ABDA).
 func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 	attr string,
 	at time.Time,
-	signerFilter blob.Ref) string {
+	signerFilter string) string {
 	pm, ok := c.permanodes[permaNode]
 	if !ok {
 		return ""
 	}
+	var signerRefs SignerRefSet
+	if signerFilter != "" {
+		signerRefs, ok = c.signerRefs[signerFilter]
+		if !ok {
+			return ""
+		}
+	}
+
 	if values, ok := pm.valuesAtSigner(at, signerFilter); ok {
 		v := values[attr]
 		if len(v) == 0 {
@@ -1077,12 +1285,13 @@ func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 		}
 		return v[0]
 	}
-	return claimPtrsAttrValue(pm.Claims, attr, at, signerFilter)
+
+	return claimPtrsAttrValue(pm.Claims, attr, at, signerRefs)
 }
 
 // permanodeAttrsOrClaims returns the best available source
 // to query attr values of permaNode at the given time
-// for the signerFilter, which is either:
+// for the signerID, which is either:
 // a. m that represents attr values for the parameters, or
 // b. all claims of the permanode.
 // Only one of m or claims will be non-nil.
@@ -1096,18 +1305,19 @@ func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 // case the caller should resort to query claims directly.
 //
 // (nil, nil) is returned if the permaNode does not exist,
-// or permaNode exists and signerFilter is valid,
+// or permaNode exists and signerID is valid,
 // but permaNode has no attributes for it.
 //
 // The returned values must not be changed by the caller.
 func (c *Corpus) permanodeAttrsOrClaims(permaNode blob.Ref,
-	at time.Time, signerFilter blob.Ref) (m map[string][]string, claims []*camtypes.Claim) {
+	at time.Time, signerID string) (m map[string][]string, claims []*camtypes.Claim) {
 
 	pm, ok := c.permanodes[permaNode]
 	if !ok {
 		return nil, nil
 	}
-	m, ok = pm.valuesAtSigner(at, signerFilter)
+
+	m, ok = pm.valuesAtSigner(at, signerID)
 	if ok {
 		return m, nil
 	}
@@ -1116,19 +1326,26 @@ func (c *Corpus) permanodeAttrsOrClaims(permaNode blob.Ref,
 
 // AppendPermanodeAttrValues appends to dst all the values for the attribute
 // attr set on permaNode.
-// signerFilter is optional.
+// signerFilter, if set, should be the GPG ID of a signer (e.g. 2931A67C26F5ABDA).
 // dst must start with length 0 (laziness, mostly)
 func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 	permaNode blob.Ref,
 	attr string,
 	at time.Time,
-	signerFilter blob.Ref) []string {
+	signerFilter string) []string {
 	if len(dst) > 0 {
 		panic("len(dst) must be 0")
 	}
 	pm, ok := c.permanodes[permaNode]
 	if !ok {
 		return dst
+	}
+	var signerRefs SignerRefSet
+	if signerFilter != "" {
+		signerRefs, ok = c.signerRefs[signerFilter]
+		if !ok {
+			return dst
+		}
 	}
 	if values, ok := pm.valuesAtSigner(at, signerFilter); ok {
 		return append(dst, values[attr]...)
@@ -1140,7 +1357,7 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 		if cl.Attr != attr || cl.Date.After(at) {
 			continue
 		}
-		if signerFilter.Valid() && signerFilter != cl.Signer {
+		if len(signerRefs) > 0 && !signerRefs.blobMatches(cl.Signer) {
 			continue
 		}
 		switch cl.Type {
@@ -1167,19 +1384,30 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 }
 
 func (c *Corpus) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
-	signerFilter blob.Ref,
+	signerFilter string,
 	attrFilter string) ([]camtypes.Claim, error) {
 	pm, ok := c.permanodes[permaNode]
 	if !ok {
 		return nil, nil
 	}
+
+	var signerRefs SignerRefSet
+	if signerFilter != "" {
+		signerRefs, ok = c.signerRefs[signerFilter]
+		if !ok {
+			return dst, nil
+		}
+	}
+
 	for _, cl := range pm.Claims {
 		if c.IsDeleted(cl.BlobRef) {
 			continue
 		}
-		if signerFilter.Valid() && cl.Signer != signerFilter {
+
+		if len(signerRefs) > 0 && !signerRefs.blobMatches(cl.Signer) {
 			continue
 		}
+
 		if attrFilter != "" && cl.Attr != attrFilter {
 			continue
 		}
@@ -1194,6 +1422,32 @@ func (c *Corpus) GetFileInfo(ctx context.Context, fileRef blob.Ref) (fi camtypes
 		err = os.ErrNotExist
 	}
 	return
+}
+
+// GetDirChildren returns the direct children (static-set entries) of the directory dirRef.
+// It only returns an error if dirRef does not exist.
+func (c *Corpus) GetDirChildren(ctx context.Context, dirRef blob.Ref) (map[blob.Ref]struct{}, error) {
+	children, ok := c.dirChildren[dirRef]
+	if !ok {
+		if _, ok := c.files[dirRef]; !ok {
+			return nil, os.ErrNotExist
+		}
+		return nil, nil
+	}
+	return children, nil
+}
+
+// GetParentDirs returns the direct parents (directories) of the file or directory childRef.
+// It only returns an error if childRef does not exist.
+func (c *Corpus) GetParentDirs(ctx context.Context, childRef blob.Ref) (map[blob.Ref]struct{}, error) {
+	parents, ok := c.fileParents[childRef]
+	if !ok {
+		if _, ok := c.files[childRef]; !ok {
+			return nil, os.ErrNotExist
+		}
+		return nil, nil
+	}
+	return parents, nil
 }
 
 func (c *Corpus) GetImageInfo(ctx context.Context, fileRef blob.Ref) (ii camtypes.ImageInfo, err error) {
@@ -1277,7 +1531,7 @@ func (c *Corpus) PermanodeHasAttrValue(pn blob.Ref, at time.Time, attr, val stri
 	if !ok {
 		return false
 	}
-	if values, ok := pm.valuesAtSigner(at, blob.Ref{}); ok {
+	if values, ok := pm.valuesAtSigner(at, ""); ok {
 		for _, v := range values[attr] {
 			if v == val {
 				return true

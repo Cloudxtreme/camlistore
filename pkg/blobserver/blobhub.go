@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 
 	"go4.org/syncutil"
 )
@@ -99,10 +99,14 @@ func WaitForBlob(storage interface{}, deadline time.Time, blobs []blob.Ref) {
 	if !canLongPoll {
 		tc = time.After(2 * time.Second)
 	}
+
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+
 	select {
 	case <-ch:
 	case <-tc:
-	case <-time.After(deadline.Sub(time.Now())):
+	case <-t.C:
 	}
 }
 

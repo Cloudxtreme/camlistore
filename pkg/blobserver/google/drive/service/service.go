@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// DriveService translates blobserver.Storage methods
+// Package service translates blobserver.Storage methods
 // into Google Drive API methods.
-package service // import "camlistore.org/pkg/blobserver/google/drive/service"
+package service // import "perkeep.org/pkg/blobserver/google/drive/service"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -39,33 +40,32 @@ const (
 type DriveService struct {
 	client     *http.Client
 	apiservice *client.Service
-	parentId   string
+	parentID   string
 }
 
-// New initiates a new DriveService. parentId is the ID of the directory
+// New initiates a new DriveService. parentID is the ID of the directory
 // that will be used as the current directory in methods on the returned
 // DriveService (such as Get). If empty, it defaults to the root of the
 // drive.
-func New(oauthClient *http.Client, parentId string) (*DriveService, error) {
+func New(oauthClient *http.Client, parentID string) (*DriveService, error) {
 	apiservice, err := client.New(oauthClient)
 	if err != nil {
 		return nil, err
 	}
-	if parentId == "" {
+	if parentID == "" {
 		// because "root" is known as a special alias for the root directory in drive.
-		parentId = "root"
+		parentID = "root"
 	}
-	service := &DriveService{client: oauthClient, apiservice: apiservice, parentId: parentId}
+	service := &DriveService{client: oauthClient, apiservice: apiservice, parentID: parentID}
 	return service, err
 }
 
 // Get retrieves a file with its title equal to the provided title and a child of
-// the parentId as given to New. If not found, os.ErrNotExist is returned.
-func (s *DriveService) Get(title string) (*client.File, error) {
-	req := s.apiservice.Files.List()
+// the parentID as given to New. If not found, os.ErrNotExist is returned.
+func (s *DriveService) Get(ctx context.Context, title string) (*client.File, error) {
 	// TODO: use field selectors
-	query := fmt.Sprintf("'%s' in parents and title = '%s'", s.parentId, title)
-	req.Q(query)
+	query := fmt.Sprintf("'%s' in parents and title = '%s'", s.parentID, title)
+	req := s.apiservice.Files.List().Context(ctx).Q(query)
 	files, err := req.Do()
 	if err != nil {
 		return nil, err
@@ -76,10 +76,11 @@ func (s *DriveService) Get(title string) (*client.File, error) {
 	return files.Items[0], nil
 }
 
-// Lists the folder identified by parentId.
+// List returns a list of files. When limit is greater than zero a paginated list is returned
+// using the next response as a pageToken in subsequent calls.
 func (s *DriveService) List(pageToken string, limit int) (files []*client.File, next string, err error) {
 	req := s.apiservice.Files.List()
-	req.Q(fmt.Sprintf("'%s' in parents and mimeType != '%s'", s.parentId, MimeTypeDriveFolder))
+	req.Q(fmt.Sprintf("'%s' in parents and mimeType != '%s'", s.parentID, MimeTypeDriveFolder))
 
 	if pageToken != "" {
 		req.PageToken(pageToken)
@@ -97,8 +98,8 @@ func (s *DriveService) List(pageToken string, limit int) (files []*client.File, 
 }
 
 // Upsert inserts a file, or updates if such a file exists.
-func (s *DriveService) Upsert(title string, data io.Reader) (file *client.File, err error) {
-	if file, err = s.Get(title); err != nil {
+func (s *DriveService) Upsert(ctx context.Context, title string, data io.Reader) (file *client.File, err error) {
+	if file, err = s.Get(ctx, title); err != nil {
 		if !os.IsNotExist(err) {
 			return
 		}
@@ -106,21 +107,21 @@ func (s *DriveService) Upsert(title string, data io.Reader) (file *client.File, 
 	if file == nil {
 		file = &client.File{Title: title}
 		file.Parents = []*client.ParentReference{
-			&client.ParentReference{Id: s.parentId},
+			{Id: s.parentID},
 		}
 		file.MimeType = MimeTypeCamliBlob
-		return s.apiservice.Files.Insert(file).Media(data).Do()
+		return s.apiservice.Files.Insert(file).Media(data).Context(ctx).Do()
 	}
 
 	// TODO: handle large blobs
-	return s.apiservice.Files.Update(file.Id, file).Media(data).Do()
+	return s.apiservice.Files.Update(file.Id, file).Media(data).Context(ctx).Do()
 }
 
 var errNoDownload = errors.New("file can not be downloaded directly (conversion needed?)")
 
 // Fetch retrieves the metadata and contents of a file.
-func (s *DriveService) Fetch(title string) (body io.ReadCloser, size uint32, err error) {
-	file, err := s.Get(title)
+func (s *DriveService) Fetch(ctx context.Context, title string) (body io.ReadCloser, size uint32, err error) {
+	file, err := s.Get(ctx, title)
 	if err != nil {
 		return
 	}
@@ -139,6 +140,7 @@ func (s *DriveService) Fetch(title string) (body io.ReadCloser, size uint32, err
 	}
 
 	req, _ := http.NewRequest("GET", file.DownloadUrl, nil)
+	req.WithContext(ctx)
 	var resp *http.Response
 	if resp, err = s.client.Transport.RoundTrip(req); err != nil {
 		return
@@ -151,8 +153,8 @@ func (s *DriveService) Fetch(title string) (body io.ReadCloser, size uint32, err
 
 // Stat retrieves file metadata and returns
 // file size. Returns error if file is not found.
-func (s *DriveService) Stat(title string) (int64, error) {
-	file, err := s.Get(title)
+func (s *DriveService) Stat(ctx context.Context, title string) (int64, error) {
+	file, err := s.Get(ctx, title)
 	if err != nil || file == nil {
 		return 0, err
 	}
@@ -160,14 +162,14 @@ func (s *DriveService) Stat(title string) (int64, error) {
 }
 
 // Trash trashes the file with the given title.
-func (s *DriveService) Trash(title string) (err error) {
-	file, err := s.Get(title)
+func (s *DriveService) Trash(ctx context.Context, title string) error {
+	file, err := s.Get(ctx, title)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	_, err = s.apiservice.Files.Trash(file.Id).Do()
-	return
+	_, err = s.apiservice.Files.Trash(file.Id).Context(ctx).Do()
+	return err
 }

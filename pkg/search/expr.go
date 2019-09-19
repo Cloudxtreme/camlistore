@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,15 +17,14 @@ limitations under the License.
 package search
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
 )
 
-const seeDocs = "\nSee: https://camlistore.org/doc/search-ui"
+const seeDocs = "\nSee: https://perkeep.org/doc/search-ui"
 
 var (
 	noMatchingOpening      = "No matching opening parenthesis"
@@ -85,7 +84,7 @@ type parser struct {
 	ctx    context.Context
 }
 
-func newParser(exp string, ctx context.Context) parser {
+func newParser(ctx context.Context, exp string) parser {
 	_, tokens := lex(exp)
 	return parser{tokens: tokens, ctx: ctx}
 }
@@ -341,7 +340,7 @@ func parseExpression(ctx context.Context, exp string) (*SearchQuery, error) {
 	if exp == "" {
 		return sq, nil
 	}
-	p := newParser(exp, ctx)
+	p := newParser(ctx, exp)
 
 	c, err := p.parseExp()
 	if err != nil {

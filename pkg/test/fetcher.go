@@ -1,5 +1,5 @@
 /*
-Copyright 2011 The Camlistore Authors
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"io"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/memory"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/memory"
 )
 
 // Fetcher is an in-memory implementation of the blobserver Storage
@@ -43,46 +44,46 @@ var (
 	_ blobserver.BlobStreamer = (*Fetcher)(nil)
 )
 
-func (tf *Fetcher) Fetch(ref blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (tf *Fetcher) Fetch(ctx context.Context, ref blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	if tf.FetchErr != nil {
 		if err = tf.FetchErr(); err != nil {
 			return
 		}
 	}
-	file, size, err = tf.Storage.Fetch(ref)
+	file, size, err = tf.Storage.Fetch(ctx, ref)
 	if err != nil {
 		return
 	}
 	return file, size, nil
 }
 
-func (tf *Fetcher) SubFetch(ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
+func (tf *Fetcher) SubFetch(ctx context.Context, ref blob.Ref, offset, length int64) (io.ReadCloser, error) {
 	if tf.FetchErr != nil {
 		if err := tf.FetchErr(); err != nil {
 			return nil, err
 		}
 	}
-	rc, err := tf.Storage.SubFetch(ref, offset, length)
+	rc, err := tf.Storage.SubFetch(ctx, ref, offset, length)
 	if err != nil {
 		return rc, err
 	}
 	return rc, nil
 }
 
-func (tf *Fetcher) ReceiveBlob(br blob.Ref, source io.Reader) (blob.SizedRef, error) {
-	sb, err := tf.Storage.ReceiveBlob(br, source)
+func (tf *Fetcher) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (blob.SizedRef, error) {
+	sb, err := tf.Storage.ReceiveBlob(ctx, br, source)
 	if err != nil {
 		return sb, err
 	}
 	if err := tf.ReceiveErr; err != nil {
-		tf.RemoveBlobs([]blob.Ref{br})
+		tf.RemoveBlobs(ctx, []blob.Ref{br})
 		return sb, err
 	}
 	return sb, nil
 }
 
 func (tf *Fetcher) AddBlob(b *Blob) {
-	_, err := tf.ReceiveBlob(b.BlobRef(), b.Reader())
+	_, err := tf.ReceiveBlob(context.Background(), b.BlobRef(), b.Reader())
 	if err != nil {
 		panic(err)
 	}

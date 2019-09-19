@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ package postgres
 import (
 	"testing"
 
-	"camlistore.org/pkg/osutil"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/kvtest"
-	"camlistore.org/pkg/test/dockertest"
 	"go4.org/jsonconfig"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/kvtest"
+	"perkeep.org/pkg/test/dockertest"
 )
 
 // TestPostgreSQLKV tests against a real PostgreSQL instance, using a Docker container.
@@ -44,4 +44,22 @@ func TestPostgreSQLKV(t *testing.T) {
 		t.Fatalf("postgres.NewKeyValue = %v", err)
 	}
 	kvtest.TestSorted(t, kv)
+}
+
+func TestPostgresDBNaming(t *testing.T) {
+	cases := []struct {
+		name  string
+		valid bool
+	}{
+		{"perkeep", true},
+		{"perkeep_2", true},
+		{"perkeep-2", true},
+		{"'; drop tables;", false}, // validDatabaseName doesn't actually check for sql injection
+	}
+	for i := range cases {
+		res := validDatabaseName(cases[i].name)
+		if res != cases[i].valid {
+			t.Errorf("%q got %v expected %v", cases[i].name, res, cases[i].valid)
+		}
+	}
 }

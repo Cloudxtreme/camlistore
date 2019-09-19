@@ -16,14 +16,10 @@
     [Fossil](https://en.wikipedia.org/wiki/Fossil_\(file_system\)), apparently
     pioneered the idea of recursive content-addressable file systems.
 
-* [Monotone](http://www.monotone.ca/)'s "Certificates" are similar to Camli
-  claims.
+* [Monotone](http://www.monotone.ca/)'s "Certificates" are similar to Perkeep
+  claims. (See [terminology](terms.md#claims))
 
 Probably more, though.  Contributions to this list are welcome!
 
-## Related Projects
-
-... and indeed, the community has pointed out several projects with some of the same goals:
-
-* [Tahoe-LAFS](http://tahoe-lafs.org/)
-* [Unhosted](http://unhosted.org/)
+See the [comparison page](compare.md) for more details on how
+Perkeep compares to other software and services.

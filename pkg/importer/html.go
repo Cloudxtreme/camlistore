@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
 func (h *Host) execTemplate(w http.ResponseWriter, r *http.Request, data interface{}) {
@@ -104,7 +104,11 @@ var tmpl = template.Must(template.New("root").Funcs(map[string]interface{}{
    <ul>
       {{$base := .Host.ImporterBaseURL}}
       {{range .Importers}}
-         <li><a href="{{$base}}{{.Name}}">{{.Name}}</a></li>
+         {{if .TODOIssue}}
+             <li><b>{{.Title}}</b>: TODO: <a href="https://perkeep.org/issue/{{.TODOIssue}}">Issue {{.TODOIssue}}</a></li>
+         {{else}}
+             <li><b><a href="{{$base}}{{.Name}}">{{.Title}}</a></b>{{if .Description}}: {{.Description}}{{end}}</li>
+         {{end}}
       {{end}}
    </ul>
 {{end}}

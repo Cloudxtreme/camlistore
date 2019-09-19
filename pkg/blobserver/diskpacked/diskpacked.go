@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,11 +30,12 @@ Example low-level config:
      },
 
 */
-package diskpacked // import "camlistore.org/pkg/blobserver/diskpacked"
+package diskpacked // import "perkeep.org/pkg/blobserver/diskpacked"
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"expvar"
 	"fmt"
@@ -47,10 +48,10 @@ import (
 	"strings"
 	"sync"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/local"
-	"camlistore.org/pkg/sorted"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/local"
+	"perkeep.org/pkg/sorted"
 
 	"go4.org/jsonconfig"
 	"go4.org/lock"
@@ -58,7 +59,6 @@ import (
 	"go4.org/strutil"
 	"go4.org/syncutil"
 	"go4.org/types"
-	"golang.org/x/net/context"
 )
 
 // TODO(wathiede): replace with glog.V(2) when we decide our logging story.
@@ -154,7 +154,7 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 		return nil, fmt.Errorf("Failed to stat directory %q: %v", root, err)
 	}
 	if !fi.IsDir() {
-		return nil, fmt.Errorf("storage root %q exists but is not a directory.", root)
+		return nil, fmt.Errorf("storage root %q exists but is not a directory", root)
 	}
 	index, err := newIndex(root, indexConf)
 	if err != nil {
@@ -178,11 +178,12 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 		maxFileSize:  maxFileSize,
 		Generationer: local.NewGenerationer(root),
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.openAllPacks(); err != nil {
+		s.Close()
 		return nil, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, _, err := s.StorageGeneration(); err != nil {
 		return nil, fmt.Errorf("Error initialization generation for %q: %v", root, err)
 	}
@@ -244,6 +245,8 @@ func (s *storage) openForWrite(n int) error {
 
 	s.size, err = f.Seek(0, os.SEEK_END)
 	if err != nil {
+		f.Close()
+		l.Close()
 		return err
 	}
 
@@ -299,7 +302,6 @@ func (s *storage) openAllPacks() error {
 			break
 		}
 		if err != nil {
-			s.Close()
 			return err
 		}
 		n++
@@ -314,43 +316,45 @@ func (s *storage) openAllPacks() error {
 	return s.openForWrite(n - 1)
 }
 
+// Close index and all opened fds, with locking.
 func (s *storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
 	var closeErr error
-	if !s.closed {
-		s.closed = true
-		if err := s.index.Close(); err != nil {
-			log.Println("diskpacked: closing index:", err)
-		}
-		for _, f := range s.fds {
-			err := f.Close()
-			openFdsVar.Add(s.root, -1)
-			if err != nil {
-				closeErr = err
-			}
-		}
-		if err := s.closePack(); err != nil && closeErr == nil {
+	s.closed = true
+	if err := s.index.Close(); err != nil {
+		log.Println("diskpacked: closing index:", err)
+	}
+	for _, f := range s.fds {
+		err := f.Close()
+		openFdsVar.Add(s.root, -1)
+		if err != nil {
 			closeErr = err
 		}
+	}
+	if err := s.closePack(); err != nil && closeErr == nil {
+		closeErr = err
 	}
 	return closeErr
 }
 
-func (s *storage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
-	return s.fetch(br, 0, -1)
+func (s *storage) Fetch(ctx context.Context, br blob.Ref) (io.ReadCloser, uint32, error) {
+	return s.fetch(ctx, br, 0, -1)
 }
 
-func (s *storage) SubFetch(br blob.Ref, offset, length int64) (io.ReadCloser, error) {
+func (s *storage) SubFetch(ctx context.Context, br blob.Ref, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 || length < 0 {
 		return nil, blob.ErrNegativeSubFetch
 	}
-	rc, _, err := s.fetch(br, offset, length)
+	rc, _, err := s.fetch(ctx, br, offset, length)
 	return rc, err
 }
 
 // length of -1 means all
-func (s *storage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, size uint32, err error) {
+func (s *storage) fetch(ctx context.Context, br blob.Ref, offset, length int64) (rc io.ReadCloser, size uint32, err error) {
 	meta, err := s.meta(br)
 	if err != nil {
 		return nil, 0, err
@@ -399,7 +403,7 @@ func (s *storage) filename(file int) string {
 var removeGate = syncutil.NewGate(20) // arbitrary
 
 // RemoveBlobs removes the blobs from index and pads data with zero bytes
-func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
+func (s *storage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	batch := s.index.BeginBatch()
 	var wg syncutil.Group
 	for _, br := range blobs {
@@ -424,27 +428,17 @@ func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
 
 var statGate = syncutil.NewGate(20) // arbitrary
 
-func (s *storage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) (err error) {
-	var wg syncutil.Group
-
-	for _, br := range blobs {
-		br := br
-		statGate.Start()
-		wg.Go(func() error {
-			defer statGate.Done()
-
-			m, err := s.meta(br)
-			if err == nil {
-				dest <- m.SizedRef(br)
-				return nil
-			}
-			if err == os.ErrNotExist {
-				return nil
-			}
-			return err
-		})
-	}
-	return wg.Err()
+func (s *storage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	return blobserver.StatBlobsParallelHelper(ctx, blobs, fn, statGate, func(br blob.Ref) (sb blob.SizedRef, err error) {
+		m, err := s.meta(br)
+		if err == nil {
+			return m.SizedRef(br), nil
+		}
+		if err == os.ErrNotExist {
+			return sb, nil
+		}
+		return sb, err
+	})
 }
 
 func (s *storage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) (err error) {
@@ -577,7 +571,7 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 				return err
 			}
 			// EOF case; continue to the next pack, if any.
-			fileNum += 1
+			fileNum++
 			offset = 0
 			fd.Close() // Close the previous pack
 			fd, err = os.Open(s.filename(fileNum))
@@ -607,11 +601,16 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 			continue
 		}
 
+		ref, ok := blob.ParseBytes(digest)
+		if !ok {
+			return fmt.Errorf("diskpacked: Invalid blobref %q", digest)
+		}
+
 		// Finally, read and send the blob.
 
 		// TODO: remove this allocation per blob. We can make one instead
 		// outside of the loop, guarded by a mutex, and re-use it, only to
-		// lock the mutex and clone it if somebody actually calls Open
+		// lock the mutex and clone it if somebody actually calls ReadFull
 		// on the *blob.Blob. Otherwise callers just scanning all the blobs
 		// to see if they have everything incur lots of garbage if they
 		// don't open any blobs.
@@ -620,14 +619,9 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 			return err
 		}
 		offset += int64(size)
-		ref, ok := blob.ParseBytes(digest)
-		if !ok {
-			return fmt.Errorf("diskpacked: Invalid blobref %q", digest)
-		}
-		newReader := func() readerutil.ReadSeekCloser {
-			return newReadSeekNopCloser(bytes.NewReader(data))
-		}
-		blob := blob.NewBlob(ref, size, newReader)
+		blob := blob.NewBlob(ref, size, func(context.Context) ([]byte, error) {
+			return data, nil
+		})
 		select {
 		case dest <- blobserver.BlobAndToken{
 			Blob:  blob,
@@ -640,7 +634,8 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 	}
 }
 
-func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef, err error) {
+func (s *storage) ReceiveBlob(ctx context.Context, br blob.Ref, source io.Reader) (sbr blob.SizedRef, err error) {
+	// TODO: use ctx somehow?
 	var b bytes.Buffer
 	n, err := b.ReadFrom(source)
 	if err != nil {
@@ -669,6 +664,7 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if s.closed {
 		return errors.New("diskpacked: write to closed storage")
 	}
+
 	// to be able to undo the append
 	origOffset := s.size
 

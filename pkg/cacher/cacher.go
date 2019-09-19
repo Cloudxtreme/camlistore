@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,19 +15,20 @@ limitations under the License.
 */
 
 // Package cacher provides various blobref fetching caching mechanisms.
-package cacher // import "camlistore.org/pkg/cacher"
+package cacher // import "perkeep.org/pkg/cacher"
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/localdisk"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/localdisk"
 
 	"go4.org/syncutil/singleflight"
 )
@@ -60,8 +61,8 @@ func (cf *CachingFetcher) SetCacheHitHook(fn func(br blob.Ref, rc io.ReadCloser)
 	cf.cacheHitHook = fn
 }
 
-func (cf *CachingFetcher) Fetch(br blob.Ref) (content io.ReadCloser, size uint32, err error) {
-	content, size, err = cf.c.Fetch(br)
+func (cf *CachingFetcher) Fetch(ctx context.Context, br blob.Ref) (content io.ReadCloser, size uint32, err error) {
+	content, size, err = cf.c.Fetch(ctx, br)
 	if err == nil {
 		if cf.cacheHitHook != nil {
 			rc, err := cf.cacheHitHook(br, content)
@@ -73,20 +74,20 @@ func (cf *CachingFetcher) Fetch(br blob.Ref) (content io.ReadCloser, size uint32
 		}
 		return
 	}
-	if err = cf.faultIn(br); err != nil {
+	if err = cf.faultIn(ctx, br); err != nil {
 		return
 	}
-	return cf.c.Fetch(br)
+	return cf.c.Fetch(ctx, br)
 }
 
-func (cf *CachingFetcher) faultIn(br blob.Ref) error {
+func (cf *CachingFetcher) faultIn(ctx context.Context, br blob.Ref) error {
 	_, err := cf.g.Do(br.String(), func() (interface{}, error) {
-		sblob, _, err := cf.sf.Fetch(br)
+		sblob, _, err := cf.sf.Fetch(ctx, br)
 		if err != nil {
 			return nil, err
 		}
 		defer sblob.Close()
-		_, err = blobserver.Receive(cf.c, br, sblob)
+		_, err = blobserver.Receive(ctx, cf.c, br, sblob)
 		return nil, err
 	})
 	return err

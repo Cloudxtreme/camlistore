@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ limitations under the License.
 // Package schema manipulates Camlistore schema blobs.
 //
 // A schema blob is a JSON-encoded blob that describes other blobs.
-// See documentation in Camlistore's doc/schema/ directory.
-package schema // import "camlistore.org/pkg/schema"
+// See documentation in Perkeep's doc/schema/ directory.
+package schema // import "perkeep.org/pkg/schema"
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,7 +32,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,8 +39,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"camlistore.org/pkg/blob"
 	"github.com/bradfitz/latlong"
+	"perkeep.org/pkg/blob"
 
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/tiff"
@@ -67,8 +66,6 @@ func init() {
 // MaxSchemaBlobSize represents the upper bound for how large
 // a schema blob may be.
 const MaxSchemaBlobSize = 1 << 20
-
-var sha1Type = reflect.TypeOf(sha1.New())
 
 var (
 	ErrNoCamliVersion = errors.New("schema: no camliVersion key in map")
@@ -106,7 +103,7 @@ type Directory interface {
 	// slice and a nil os.Error. If it encounters an error before the
 	// end of the directory, Readdir returns the DirectoryEntry read
 	// until that point and a non-nil error.
-	Readdir(n int) ([]DirectoryEntry, error)
+	Readdir(ctx context.Context, n int) ([]DirectoryEntry, error)
 }
 
 type Symlink interface {
@@ -134,11 +131,11 @@ type DirectoryEntry interface {
 	FileName() string
 	BlobRef() blob.Ref
 
-	File() (File, error)           // if camliType is "file"
-	Directory() (Directory, error) // if camliType is "directory"
-	Symlink() (Symlink, error)     // if camliType is "symlink"
-	FIFO() (FIFO, error)           // if camliType is "fifo"
-	Socket() (Socket, error)       // If camliType is "socket"
+	File(ctx context.Context) (File, error)           // if camliType is "file"
+	Directory(ctx context.Context) (Directory, error) // if camliType is "directory"
+	Symlink() (Symlink, error)                        // if camliType is "symlink"
+	FIFO() (FIFO, error)                              // if camliType is "fifo"
+	Socket() (Socket, error)                          // If camliType is "socket"
 }
 
 // dirEntry is the default implementation of DirectoryEntry
@@ -165,12 +162,12 @@ func (de *dirEntry) BlobRef() blob.Ref {
 	return de.ss.BlobRef
 }
 
-func (de *dirEntry) File() (File, error) {
+func (de *dirEntry) File(ctx context.Context) (File, error) {
 	if de.fr == nil {
 		if de.ss.Type != "file" {
 			return nil, fmt.Errorf("DirectoryEntry is camliType %q, not %q", de.ss.Type, "file")
 		}
-		fr, err := NewFileReader(de.fetcher, de.ss.BlobRef)
+		fr, err := NewFileReader(ctx, de.fetcher, de.ss.BlobRef)
 		if err != nil {
 			return nil, err
 		}
@@ -179,12 +176,12 @@ func (de *dirEntry) File() (File, error) {
 	return de.fr, nil
 }
 
-func (de *dirEntry) Directory() (Directory, error) {
+func (de *dirEntry) Directory(ctx context.Context) (Directory, error) {
 	if de.dr == nil {
 		if de.ss.Type != "directory" {
 			return nil, fmt.Errorf("DirectoryEntry is camliType %q, not %q", de.ss.Type, "directory")
 		}
-		dr, err := NewDirReader(de.fetcher, de.ss.BlobRef)
+		dr, err := NewDirReader(ctx, de.fetcher, de.ss.BlobRef)
 		if err != nil {
 			return nil, err
 		}
@@ -230,16 +227,16 @@ func newDirectoryEntry(fetcher blob.Fetcher, ss *superset) (DirectoryEntry, erro
 //  DirectoryEntry if the BlobRef contains a type "file", "directory",
 //  "symlink", "fifo" or "socket".
 // TODO: ""char", "block", probably.  later.
-func NewDirectoryEntryFromBlobRef(fetcher blob.Fetcher, blobRef blob.Ref) (DirectoryEntry, error) {
+func NewDirectoryEntryFromBlobRef(ctx context.Context, fetcher blob.Fetcher, blobRef blob.Ref) (DirectoryEntry, error) {
 	ss := new(superset)
-	err := ss.setFromBlobRef(fetcher, blobRef)
+	err := ss.setFromBlobRef(ctx, fetcher, blobRef)
 	if err != nil {
-		return nil, fmt.Errorf("schema/filereader: can't fill superset: %v\n", err)
+		return nil, fmt.Errorf("schema/filereader: can't fill superset: %v", err)
 	}
 	return newDirectoryEntry(fetcher, ss)
 }
 
-// superset represents the superset of common Camlistore JSON schema
+// superset represents the superset of common Perkeep JSON schema
 // keys as a convenient json.Unmarshal target.
 // TODO(bradfitz): unexport this type. Getting too gross. Move to schema.Blob
 type superset struct {
@@ -283,8 +280,9 @@ type superset struct {
 	// See doc/schema/bytes.txt and doc/schema/files/file.txt.
 	Parts []*BytesPart `json:"parts"`
 
-	Entries blob.Ref   `json:"entries"` // for directories, a blobref to a static-set
-	Members []blob.Ref `json:"members"` // for static sets (for directory static-sets: blobrefs to child dirs/files)
+	Entries   blob.Ref   `json:"entries"`   // for directories, a blobref to a static-set
+	Members   []blob.Ref `json:"members"`   // for static sets (for directory static-sets: blobrefs to child dirs/files)
+	MergeSets []blob.Ref `json:"mergeSets"` // each is a "sub static-set", that has either Members or MergeSets. For large dirs.
 
 	// Search allows a "share" blob to share an entire search. Contrast with "target".
 	Search SearchQuery `json:"search"`
@@ -308,7 +306,7 @@ func parseSuperset(r io.Reader) (*superset, error) {
 	return &ss, nil
 }
 
-// BlobReader returns a new Blob from the provided Reader r,
+// BlobFromReader returns a new Blob from the provided Reader r,
 // which should be the body of the provided blobref.
 // Note: the hash checksum is not verified.
 func BlobFromReader(ref blob.Ref, r io.Reader) (*Blob, error) {
@@ -558,28 +556,97 @@ func (d *defaultStatHasher) Lstat(fileName string) (os.FileInfo, error) {
 }
 
 func (d *defaultStatHasher) Hash(fileName string) (blob.Ref, error) {
-	s1 := sha1.New()
+	h := blob.NewHash()
 	file, err := os.Open(fileName)
 	if err != nil {
 		return blob.Ref{}, err
 	}
 	defer file.Close()
-	_, err = io.Copy(s1, file)
+	_, err = io.Copy(h, file)
 	if err != nil {
 		return blob.Ref{}, err
 	}
-	return blob.RefFromHash(s1), nil
+	return blob.RefFromHash(h), nil
 }
 
-type StaticSet struct {
-	l    sync.Mutex
-	refs []blob.Ref
+// maximum number of static-set members in a static-set schema. As noted in
+// https://github.com/camlistore/camlistore/issues/924 , 33k members result in a
+// 1.7MB blob, so 10k members seems reasonable to stay under the MaxSchemaBlobSize (1MB)
+// limit. This is not a const, so we can lower it during tests and test the logic
+// without having to create thousands of blobs.
+var maxStaticSetMembers = 10000
+
+// NewStaticSet returns the "static-set" schema for a directory. Its members
+// should be populated with SetStaticSetMembers.
+func NewStaticSet() *Builder {
+	return base(1, "static-set")
 }
 
-func (ss *StaticSet) Add(ref blob.Ref) {
-	ss.l.Lock()
-	defer ss.l.Unlock()
-	ss.refs = append(ss.refs, ref)
+// SetStaticSetMembers sets the given members as the static-set members of this
+// builder. If the members are so numerous that they would not fit on a schema
+// blob, they are spread (recursively, if needed) onto sub static-sets. In which
+// case, these subsets are set as "mergeSets" of this builder. All the created
+// subsets are returned, so the caller can upload them along with the top
+// static-set created from this builder.
+// SetStaticSetMembers panics if bb isn't a "static-set" claim type.
+func (bb *Builder) SetStaticSetMembers(members []blob.Ref) []*Blob {
+	if bb.Type() != "static-set" {
+		panic("called SetStaticSetMembers on non static-set")
+	}
+
+	if len(members) <= maxStaticSetMembers {
+		ms := make([]string, len(members))
+		for i := range members {
+			ms[i] = members[i].String()
+		}
+		bb.m["members"] = ms
+		return nil
+	}
+
+	// too many members to fit in one static-set, so we spread them in
+	// several sub static-sets.
+	subsetsNumber := len(members) / maxStaticSetMembers
+	var perSubset int
+	if subsetsNumber < maxStaticSetMembers {
+		// this means we can fill each subset up to maxStaticSetMembers,
+		// and stash the rest in one last subset.
+		perSubset = maxStaticSetMembers
+	} else {
+		// otherwise we need to divide the members evenly in
+		// (maxStaticSetMembers - 1) subsets, and each of these subsets
+		// will also (recursively) have subsets of its own. There might
+		// also be a rest in one last subset, as above.
+		subsetsNumber = maxStaticSetMembers - 1
+		perSubset = len(members) / subsetsNumber
+	}
+	// only the subsets at this level
+	subsets := make([]*Blob, 0, subsetsNumber)
+	// subsets at this level, plus all the children subsets.
+	allSubsets := make([]*Blob, 0, subsetsNumber)
+	for i := 0; i < subsetsNumber; i++ {
+		ss := NewStaticSet()
+		subss := ss.SetStaticSetMembers(members[i*perSubset : (i+1)*perSubset])
+		subsets = append(subsets, ss.Blob())
+		allSubsets = append(allSubsets, ss.Blob())
+		for _, v := range subss {
+			allSubsets = append(allSubsets, v)
+		}
+	}
+
+	// Deal with the rest (of the euclidian division)
+	if perSubset*subsetsNumber < len(members) {
+		ss := NewStaticSet()
+		ss.SetStaticSetMembers(members[perSubset*subsetsNumber:])
+		allSubsets = append(allSubsets, ss.Blob())
+		subsets = append(subsets, ss.Blob())
+	}
+
+	mss := make([]string, len(subsets))
+	for i := range subsets {
+		mss[i] = subsets[i].BlobRef().String()
+	}
+	bb.m["mergeSets"] = mss
+	return allSubsets
 }
 
 func base(version int, ctype string) *Builder {
@@ -615,27 +682,7 @@ func NewPlannedPermanode(key string) *Builder {
 // NewHashPlannedPermanode returns a planned permanode with the sum
 // of the hash, prefixed with "sha1-", as the key.
 func NewHashPlannedPermanode(h hash.Hash) *Builder {
-	if reflect.TypeOf(h) != sha1Type {
-		panic("Hash not supported. Only sha1 for now.")
-	}
-	return NewPlannedPermanode(fmt.Sprintf("sha1-%x", h.Sum(nil)))
-}
-
-// Map returns a Camli map of camliType "static-set"
-// TODO: delete this method
-func (ss *StaticSet) Blob() *Blob {
-	bb := base(1, "static-set")
-	ss.l.Lock()
-	defer ss.l.Unlock()
-
-	members := make([]string, 0, len(ss.refs))
-	if ss.refs != nil {
-		for _, ref := range ss.refs {
-			members = append(members, ref.String())
-		}
-	}
-	bb.m["members"] = members
-	return bb.Blob()
+	return NewPlannedPermanode(blob.RefFromHash(h).String())
 }
 
 // JSON returns the map m encoded as JSON in its
@@ -866,7 +913,7 @@ const ShareHaveRef = "haveref"
 var UnknownLocation = time.FixedZone("Unknown", -60) // 1 minute west
 
 // IsZoneKnown reports whether t is in a known timezone.
-// Camlistore uses the magic timezone offset of 1 minute west of UTC
+// Perkeep uses the magic timezone offset of 1 minute west of UTC
 // to mean that the timezone wasn't known.
 func IsZoneKnown(t time.Time) bool {
 	if t.Location() == UnknownLocation {
@@ -950,7 +997,7 @@ func FileTime(f io.ReaderAt) (time.Time, error) {
 			}
 			return fi.ModTime(), nil
 		}
-		return ct, errors.New("All methods failed to find a creation time or modtime.")
+		return ct, errors.New("all methods failed to find a creation time or modtime")
 	}
 
 	size, ok := findSize(f)

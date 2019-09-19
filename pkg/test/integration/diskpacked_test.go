@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"camlistore.org/pkg/test"
+	"perkeep.org/pkg/test"
 )
 
 var (
@@ -44,7 +44,7 @@ func benchmarkWrite(b *testing.B, cfg string) {
 	if err != nil {
 		b.Fatalf("could not create server for config: %v\nError: %v", cfg, err)
 	}
-	testFile := filepath.Join(w.CamliSourceRoot(), testFileRel)
+	testFile := filepath.Join(w.SourceRoot(), testFileRel)
 	createTestFile(b, testFile, testFileSize)
 	defer os.Remove(testFile)
 	b.ResetTimer()
@@ -55,7 +55,7 @@ func benchmarkWrite(b *testing.B, cfg string) {
 			b.Fatalf("could not start server for config: %v\nError: %v", cfg, err)
 		}
 		b.StartTimer()
-		test.MustRunCmd(b, w.Cmd("camput", "file", testFile))
+		test.MustRunCmd(b, w.Cmd("pk-put", "file", testFile))
 		b.StopTimer()
 		w.Stop()
 	}

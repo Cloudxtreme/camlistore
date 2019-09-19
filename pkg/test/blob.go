@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,17 @@ limitations under the License.
 package test
 
 import (
-	"crypto/sha1"
+	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math/rand"
 	"strings"
 	"testing"
+	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"go4.org/readerutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 )
 
 // Blob is a utility class for unit tests.
@@ -34,22 +35,31 @@ type Blob struct {
 	Contents string // the contents of the blob
 }
 
+var randSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+// RandomBlob returns a random blob with the provided number of bytes.
+func RandomBlob(t *testing.T, size int64) *Blob {
+	contents := make([]byte, size)
+	_, err := io.ReadFull(randSrc, contents)
+	if err != nil {
+		t.Fatal("error reading from random source:", err)
+	}
+
+	return &Blob{
+		Contents: base64.StdEncoding.EncodeToString(contents)[:size],
+	}
+}
+
 func (tb *Blob) Blob() *blob.Blob {
 	s := tb.Contents
-	return blob.NewBlob(tb.BlobRef(), tb.Size(), func() readerutil.ReadSeekCloser {
-		return struct {
-			io.ReadSeeker
-			io.Closer
-		}{
-			io.NewSectionReader(strings.NewReader(s), 0, int64(len(s))),
-			ioutil.NopCloser(nil),
-		}
+	return blob.NewBlob(tb.BlobRef(), tb.Size(), func(ctx context.Context) ([]byte, error) {
+		return []byte(s), nil
 	})
 }
 
 func (tb *Blob) BlobRef() blob.Ref {
-	h := sha1.New()
-	h.Write([]byte(tb.Contents))
+	h := blob.NewHash()
+	io.WriteString(h, tb.Contents)
 	return blob.RefFromHash(h)
 }
 
@@ -85,7 +95,7 @@ func (tb *Blob) AssertMatches(t *testing.T, sb blob.SizedRef) {
 }
 
 func (tb *Blob) MustUpload(t *testing.T, ds blobserver.BlobReceiver) {
-	sb, err := ds.ReceiveBlob(tb.BlobRef(), tb.Reader())
+	sb, err := ds.ReceiveBlob(context.Background(), tb.BlobRef(), tb.Reader())
 	if err != nil {
 		t.Fatalf("failed to upload blob %v (%q): %v", tb.BlobRef(), tb.Contents, err)
 	}

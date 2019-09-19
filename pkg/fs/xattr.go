@@ -1,7 +1,7 @@
 // +build linux darwin
 
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ limitations under the License.
 package fs
 
 import (
+	"context"
 	"encoding/base64"
-	"log"
 	"strings"
 	"sync"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/search"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
 
 	"bazil.org/fuse"
 )
@@ -65,7 +65,7 @@ func (x *xattr) load(p *search.DescribedPermanode) {
 			name := k[len(xattrPrefix):]
 			val, err := base64.StdEncoding.DecodeString(v[0])
 			if err != nil {
-				log.Printf("Base64 decoding error on attribute %v: %v", name, err)
+				Logger.Printf("Base64 decoding error on attribute %v: %v", name, err)
 				continue
 			}
 			(*x.xattrs)[name] = val
@@ -73,14 +73,14 @@ func (x *xattr) load(p *search.DescribedPermanode) {
 	}
 }
 
-func (x *xattr) set(req *fuse.SetxattrRequest) error {
-	log.Printf("%s.setxattr(%q) -> %q", x.typeName, req.Name, req.Xattr)
+func (x *xattr) set(ctx context.Context, req *fuse.SetxattrRequest) error {
+	Logger.Printf("%s.setxattr(%q) -> %q", x.typeName, req.Name, req.Xattr)
 
 	claim := schema.NewSetAttributeClaim(x.permanode, xattrPrefix+req.Name,
 		base64.StdEncoding.EncodeToString(req.Xattr))
-	_, err := x.fs.client.UploadAndSignBlob(claim)
+	_, err := x.fs.client.UploadAndSignBlob(ctx, claim)
 	if err != nil {
-		log.Printf("Error setting xattr: %v", err)
+		Logger.Printf("Error setting xattr: %v", err)
 		return fuse.EIO
 	}
 
@@ -93,14 +93,14 @@ func (x *xattr) set(req *fuse.SetxattrRequest) error {
 	return nil
 }
 
-func (x *xattr) remove(req *fuse.RemovexattrRequest) error {
-	log.Printf("%s.Removexattr(%q)", x.typeName, req.Name)
+func (x *xattr) remove(ctx context.Context, req *fuse.RemovexattrRequest) error {
+	Logger.Printf("%s.Removexattr(%q)", x.typeName, req.Name)
 
 	claim := schema.NewDelAttributeClaim(x.permanode, xattrPrefix+req.Name, "")
-	_, err := x.fs.client.UploadAndSignBlob(claim)
+	_, err := x.fs.client.UploadAndSignBlob(ctx, claim)
 
 	if err != nil {
-		log.Printf("Error removing xattr: %v", err)
+		Logger.Printf("Error removing xattr: %v", err)
 		return fuse.EIO
 	}
 

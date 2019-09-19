@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2013 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// This file adds the "server" subcommand to devcam, to run camlistored.
+// This file adds the "server" subcommand to devcam, to run perkeepd.
 
 package main
 
@@ -33,12 +33,12 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/client"
-	"camlistore.org/pkg/cmdmain"
-	"camlistore.org/pkg/importer"
-	_ "camlistore.org/pkg/importer/allimporters"
-	"camlistore.org/pkg/netutil"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/netutil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/client"
+	"perkeep.org/pkg/cmdmain"
+	"perkeep.org/pkg/importer"
+	_ "perkeep.org/pkg/importer/allimporters"
 )
 
 type serverCmd struct {
@@ -50,6 +50,7 @@ type serverCmd struct {
 	wipe     bool
 	things   bool
 	debug    bool
+	sha1     bool
 
 	mongo    bool
 	mysql    bool
@@ -67,6 +68,7 @@ type serverCmd struct {
 	fullClosure bool
 	mini        bool
 	publish     bool // whether to build and start the publisher app(s)
+	scancab     bool // whether to build and start the scancab app(s)
 	hello       bool // whether to build and start the hello demo app
 
 	openBrowser      bool
@@ -76,7 +78,8 @@ type serverCmd struct {
 	picasaAPIKey     string
 	plaidAPIKey      string
 	twitterAPIKey    string
-	extraArgs        string // passed to camlistored
+	instapaperAPIKey string
+	extraArgs        string // passed to perkeepd
 	// end of flag vars
 
 	listen string // address + port to listen on
@@ -85,7 +88,7 @@ type serverCmd struct {
 }
 
 func init() {
-	cmdmain.RegisterCommand("server", func(flags *flag.FlagSet) cmdmain.CommandRunner {
+	cmdmain.RegisterMode("server", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := &serverCmd{
 			env: NewCopyEnv(),
 		}
@@ -96,7 +99,9 @@ func init() {
 		flags.BoolVar(&cmd.wipe, "wipe", false, "Wipe the blobs on disk and the indexer.")
 		flags.BoolVar(&cmd.things, "makethings", false, "Create various test data on startup (twitter imports for now). Requires wipe. Conflicts with mini.")
 		flags.BoolVar(&cmd.debug, "debug", false, "Enable http debugging.")
+		flags.BoolVar(&cmd.sha1, "sha1", false, "Use sha1 instead of sha224.")
 		flags.BoolVar(&cmd.publish, "publish", true, "Enable publisher app(s)")
+		flags.BoolVar(&cmd.scancab, "scancab", false, "Enable scancab app(s)")
 		flags.BoolVar(&cmd.hello, "hello", false, "Enable hello (demo) app")
 		flags.BoolVar(&cmd.mini, "mini", false, "Enable minimal mode, where all optional features are disabled. (Currently just publishing)")
 
@@ -122,9 +127,10 @@ func init() {
 		flags.StringVar(&cmd.picasaAPIKey, "picasakey", "", "The username and password to use with the Picasa importer. Formatted as '<username>:<password>'.")
 		flags.StringVar(&cmd.plaidAPIKey, "plaidkey", "", "The client_id and secret to use with the Plaid importer. Formatted as '<client_id>:<secret>'.")
 		flags.StringVar(&cmd.twitterAPIKey, "twitterapikey", "", "The key and secret to use with the Twitter importer. Formatted as '<APIkey>:<APIsecret>'.")
+		flags.StringVar(&cmd.instapaperAPIKey, "instapaperkey", "", "The key and secret to use with the Instapaper importer. Formatted as '<clientID>:<clientSecret>'.")
 		flags.StringVar(&cmd.root, "root", "", "A directory to store data in. Defaults to a location in the OS temp directory.")
 		flags.StringVar(&cmd.extraArgs, "extraargs", "",
-			"List of comma separated options that will be passed to camlistored")
+			"List of comma separated options that will be passed to perkeepd")
 		return cmd
 	})
 }
@@ -140,7 +146,7 @@ func (c *serverCmd) Examples() []string {
 }
 
 func (c *serverCmd) Describe() string {
-	return "run the stand-alone camlistored in dev mode."
+	return "run the stand-alone perkeepd in dev mode."
 }
 
 func (c *serverCmd) checkFlags(args []string) error {
@@ -152,6 +158,7 @@ func (c *serverCmd) checkFlags(args []string) error {
 			return cmdmain.UsageError("--mini and --makethings are mutually exclusive.")
 		}
 		c.publish = false
+		c.scancab = false
 		c.hello = false
 	}
 	if c.things && !c.wipe {
@@ -227,7 +234,9 @@ func (c *serverCmd) setEnvVars() error {
 	setenv("CAMLI_LEVELDB_ENABLED", "false")
 
 	setenv("CAMLI_PUBLISH_ENABLED", strconv.FormatBool(c.publish))
+	setenv("CAMLI_SCANCAB_ENABLED", strconv.FormatBool(c.scancab))
 	setenv("CAMLI_HELLO_ENABLED", strconv.FormatBool(c.hello))
+	setenv("CAMLI_SHA1_ENABLED", strconv.FormatBool(c.sha1))
 	switch {
 	case c.memory:
 		setenv("CAMLI_MEMINDEX_ENABLED", "true")
@@ -327,6 +336,10 @@ func (c *serverCmd) setEnvVars() error {
 		setenv("CAMLI_TWITTER_ENABLED", "true")
 		setenv("CAMLI_TWITTER_API_KEY", c.twitterAPIKey)
 	}
+	if c.instapaperAPIKey != "" {
+		setenv("CAMLI_INSTAPAPER_ENABLED", "true")
+		setenv("CAMLI_INSTAPAPER_API_KEY", c.instapaperAPIKey)
+	}
 	setenv("CAMLI_CONFIG_DIR", "config")
 	setenv("CAMLI_CACHE_DIR", filepath.Join(c.root, "cache"))
 	setenv("CAMLI_APP_BINDIR", "bin")
@@ -366,12 +379,12 @@ func (c *serverCmd) setupIndexer() error {
 	} else {
 		args = append(args, "-ignoreexists")
 	}
-	binPath := filepath.Join("bin", "camtool")
+	binPath := filepath.Join("bin", "pk")
 	cmd := exec.Command(binPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("Could not run camtool dbinit: %v", err)
+		return fmt.Errorf("Could not run pk dbinit: %v", err)
 	}
 	return nil
 }
@@ -401,14 +414,14 @@ func (c *serverCmd) setFullClosure() error {
 				oldsvn, err)
 		}
 		log.Println("Updating closure library...")
-		args := []string{"run", "vendor/embed/closure/updatelibrary.go", "-verbose"}
+		args := []string{"run", "clients/web/embed/closure/updatelibrary.go", "-verbose"}
 		cmd := exec.Command("go", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("Could not run updatelibrary.go: %v", err)
 		}
-		c.env.Set("CAMLI_DEV_CLOSURE_DIR", "vendor/embed/closure/lib/closure")
+		c.env.Set("CAMLI_DEV_CLOSURE_DIR", "clients/web/embed/closure/lib/closure")
 	}
 	return nil
 }
@@ -437,7 +450,10 @@ func (c *serverCmd) makeThings() error {
 		return errors.New("CAMLI_BASEURL is not set")
 	}
 
-	cl := client.New(baseURL)
+	cl, err := client.New(client.OptionServer(baseURL))
+	if err != nil {
+		return fmt.Errorf("making client: %v", err)
+	}
 	signer, err := cl.Signer()
 	if err != nil {
 		return err
@@ -497,21 +513,19 @@ func (c *serverCmd) RunCommand(args []string) error {
 	if !*noBuild {
 		withSqlite = c.sqlite
 		targets := []string{
-			filepath.Join("server", "camlistored"),
-			filepath.Join("cmd", "camtool"),
+			filepath.Join("server", "perkeepd"),
+			filepath.Join("cmd", "pk"),
 		}
 		if c.hello {
-			targets = append(targets, filepath.Join("app", "hello"))
+			targets = append(targets, "app/hello")
 		}
 		if c.publish {
-			targets = append(targets, filepath.Join("app", "publisher"))
+			targets = append(targets, "app/publisher")
 		}
-		targets = append(targets, filepath.Join("app", "scanningcabinet"))
-		for _, name := range targets {
-			err := build(name)
-			if err != nil {
-				return fmt.Errorf("Could not build %v: %v", name, err)
-			}
+		targets = append(targets, "app/scanningcabinet")
+		err := build(targets...)
+		if err != nil {
+			return err
 		}
 	}
 	if err := c.setRoot(); err != nil {
@@ -538,7 +552,10 @@ func (c *serverCmd) RunCommand(args []string) error {
 	log.Printf("Starting dev server on %v/ui/ with password \"pass3179\"\n",
 		c.env.m["CAMLI_BASEURL"])
 
-	camliBin := filepath.Join("bin", "camlistored")
+	pkBin, err := exec.LookPath("perkeepd")
+	if err != nil {
+		return fmt.Errorf("could not find perkeepd path: %v", err)
+	}
 	cmdArgs := []string{
 		"-configfile=" + filepath.Join(camliSrcRoot, "config", "dev-server-config.json"),
 		"-listen=" + c.listen,
@@ -548,7 +565,7 @@ func (c *serverCmd) RunCommand(args []string) error {
 		cmdArgs = append(cmdArgs, strings.Split(c.extraArgs, ",")...)
 	}
 	if c.things {
-		// force camlistored to be run as a child process instead of with
+		// force perkeepd to be run as a child process instead of with
 		// syscall.Exec, so c.makeThings() is able to run.
 		sysExec = nil
 		go func() {
@@ -557,5 +574,5 @@ func (c *serverCmd) RunCommand(args []string) error {
 			}
 		}()
 	}
-	return runExec(camliBin, cmdArgs, c.env)
+	return runExec(pkBin, cmdArgs, c.env)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Camlistore Authors
+Copyright 2016 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -51,10 +51,11 @@ limitations under the License.
 // [*]As the Server connects to the Client to challenge it, the Client must obviously
 // have a way, which does not need to be described by the protocol, to listen to and
 // accept these connections.
-package gpgchallenge // import "camlistore.org/pkg/gpgchallenge"
+package gpgchallenge // import "perkeep.org/pkg/gpgchallenge"
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
@@ -77,7 +78,6 @@ import (
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
 	"golang.org/x/crypto/openpgp/packet"
-	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 
 	"go4.org/wkfs"
@@ -146,7 +146,7 @@ type Server struct {
 func (cs *Server) serverInit() error {
 	nonce, err := genNonce()
 	if err != nil {
-		return fmt.Errorf("error generating key for hmac: %v")
+		return fmt.Errorf("error generating key for hmac: %v", err)
 	}
 	cs.keyHMAC = []byte(nonce)
 	cs.nonceUsed = make(map[string]bool)
@@ -265,7 +265,7 @@ func (cs *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keyID := pk.KeyIdShortString()
+	keyID := pk.KeyIdString()
 	if isSpammer := cs.rateLimit(keyID, claimedIP); isSpammer {
 		http.Error(w, "don't be a spammer", http.StatusTooManyRequests)
 		return
@@ -817,7 +817,7 @@ func publicKeyEntity(keyRing string, keyId string) (*openpgp.Entity, error) {
 	}
 	for _, e := range el {
 		pubk := e.PrimaryKey
-		if pubk.KeyIdShortString() == keyId {
+		if pubk.KeyIdString() == keyId {
 			return e, nil
 		}
 	}
@@ -837,7 +837,7 @@ func secretKeyEntity(keyRing string, keyId string) (*openpgp.Entity, error) {
 	for _, e := range el {
 		pubk := &e.PrivateKey.PublicKey
 		// TODO(mpl): decrypt private key if it is passphrase-encrypted
-		if pubk.KeyIdShortString() == keyId {
+		if pubk.KeyIdString() == keyId {
 			return e, nil
 		}
 	}

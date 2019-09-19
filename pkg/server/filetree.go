@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"log"
 	"net/http"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/schema"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/schema"
 )
 
 type FileTreeHandler struct {
@@ -49,24 +49,25 @@ type FileTreeResponse struct {
 }
 
 func (fth *FileTreeHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	ctx := req.Context()
 	if req.Method != "GET" && req.Method != "HEAD" {
 		http.Error(rw, "Invalid method", 400)
 		return
 	}
 
-	de, err := schema.NewDirectoryEntryFromBlobRef(fth.Fetcher, fth.file)
+	de, err := schema.NewDirectoryEntryFromBlobRef(ctx, fth.Fetcher, fth.file)
 	if err != nil {
 		http.Error(rw, "Error reading directory", 500)
 		log.Printf("Error reading directory from blobref %s: %v\n", fth.file, err)
 		return
 	}
-	dir, err := de.Directory()
+	dir, err := de.Directory(ctx)
 	if err != nil {
 		http.Error(rw, "Error reading directory", 500)
 		log.Printf("Error reading directory from blobref %s: %v\n", fth.file, err)
 		return
 	}
-	entries, err := dir.Readdir(-1)
+	entries, err := dir.Readdir(ctx, -1)
 	if err != nil {
 		http.Error(rw, "Error reading directory", 500)
 		log.Printf("reading dir from blobref %s: %v\n", fth.file, err)

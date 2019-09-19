@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 // Package feed implements an importer for RSS, Atom, and RDF feeds.
-package feed // import "camlistore.org/pkg/importer/feed"
+package feed // import "perkeep.org/pkg/importer/feed"
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"io"
@@ -27,16 +28,15 @@ import (
 	"net/http"
 	"net/url"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/schema"
-
-	"code.google.com/p/go.net/html"
-	"code.google.com/p/go.net/html/atom"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
 
 	"go4.org/ctxutil"
-	"golang.org/x/net/context"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
 const (
@@ -56,9 +56,14 @@ type imp struct {
 	importer.OAuth1 // for CallbackRequestAccount and CallbackURLParameters
 }
 
-func (im *imp) NeedsAPIKey() bool { return false }
-
-func (im *imp) SupportsIncremental() bool { return true }
+func (*imp) Properties() importer.Properties {
+	return importer.Properties{
+		Title:               "Feed",
+		Description:         "importer for RSS, Atom, and RDF feeds",
+		SupportsIncremental: true,
+		NeedsAPIKey:         false,
+	}
+}
 
 func (im *imp) IsAccountReady(acctNode *importer.Object) (ok bool, err error) {
 	if acctNode.Attr(acctAttrFeedURL) != "" {
@@ -145,20 +150,38 @@ func (r *run) importItem(parent *importer.Object, item *item) error {
 	if err != nil {
 		return err
 	}
-	fileRef, err := schema.WriteFileFromReader(r.Host.Target(), "", bytes.NewBufferString(item.Content))
+	fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), "", bytes.NewBufferString(item.Content))
 	if err != nil {
 		return err
 	}
 	if err := itemNode.SetAttrs(
-		"feedItemId", item.ID,
-		"camliNodeType", "feed:item",
-		"title", item.Title,
+		nodeattr.Type, "feed:item",
+		nodeattr.Title, item.Title,
+		nodeattr.CamliContent, fileRef.String(),
 		"link", item.Link,
+		"feedItemId", item.ID,
 		"author", item.Author,
-		"camliContent", fileRef.String(),
 		"feedMediaContentURL", item.MediaContent,
 	); err != nil {
 		return err
+	}
+
+	if !item.Updated.IsZero() {
+		if err := itemNode.SetAttr(nodeattr.DateModified, schema.RFC3339FromTime(item.Updated)); err != nil {
+			return err
+		}
+	}
+
+	if !item.Published.IsZero() {
+		if err := itemNode.SetAttr(nodeattr.DatePublished, schema.RFC3339FromTime(item.Published)); err != nil {
+			return err
+		}
+	}
+
+	if !item.Created.IsZero() {
+		if err := itemNode.SetAttr(nodeattr.DateCreated, schema.RFC3339FromTime(item.Created)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

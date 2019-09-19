@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@ import (
 	"strconv"
 	"time"
 
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/importer"
 )
 
 var _ importer.TestDataMaker = (*imp)(nil)
@@ -175,8 +175,8 @@ func fakeEntities(counter int) entities {
 	notPicURL := func() *urlEntity {
 		return &urlEntity{
 			URL:         `http://t.co/whatever`,
-			ExpandedURL: `http://camlistore.org`,
-			DisplayURL:  `camlistore.org`,
+			ExpandedURL: `http://perkeep.org`,
+			DisplayURL:  `perkeep.org`,
 		}
 	}
 	imgurURL := func() *urlEntity {
@@ -256,12 +256,12 @@ func fakeEntities(counter int) entities {
 }
 
 func fakePicture() string {
-	camliDir, err := osutil.GoPackagePath("camlistore.org")
+	camliDir, err := osutil.GoPackagePath("perkeep.org")
 	if err == os.ErrNotExist {
-		log.Fatal("Directory \"camlistore.org\" not found under GOPATH/src; are you not running with devcam?")
+		log.Fatal("Directory \"perkeep.org\" not found under GOPATH/src; are you not running with devcam?")
 	}
 	if err != nil {
-		log.Fatalf("Error searching for \"camlistore.org\" under GOPATH: %v", err)
+		log.Fatalf("Error searching for \"perkeep.org\" under GOPATH: %v", err)
 	}
-	return filepath.Join(camliDir, filepath.FromSlash("vendor/embed/glitch/npc_piggy__x1_walk_png_1354829432.png"))
+	return filepath.Join(camliDir, filepath.FromSlash("clients/web/embed/glitch/npc_piggy__x1_walk_png_1354829432.png"))
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@ limitations under the License.
 package importer
 
 import (
+	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"camlistore.org/pkg/test"
 	"go4.org/jsonconfig"
+	"perkeep.org/pkg/test"
 )
 
 func init() {
@@ -62,5 +64,18 @@ func TestStaticConfig(t *testing.T) {
 
 	if _, err := newFromConfig(ld, jsonconfig.Obj{"dummy1": map[string]interface{}{"clientSecret": "x"}}); err == nil {
 		t.Errorf("expected error from secret without id")
+	}
+}
+
+func TestImportRootPageHTML(t *testing.T) {
+	h, err := NewHost(HostConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/importer/", nil)
+	h.serveImportersRoot(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "dummy1") {
+		t.Errorf("Got %d response with header %v, body %s", w.Code, w.HeaderMap, w.Body.String())
 	}
 }

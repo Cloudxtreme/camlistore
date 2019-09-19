@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // Package importer imports content from third-party websites.
-package importer // import "camlistore.org/pkg/importer"
+package importer // import "perkeep.org/pkg/importer"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -31,19 +32,18 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/jsonsign/signhandler"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/search"
-	"camlistore.org/pkg/server"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/jsonsign/signhandler"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/search"
+	"perkeep.org/pkg/server"
+	"perkeep.org/pkg/types/camtypes"
 
 	"go4.org/ctxutil"
 	"go4.org/jsonconfig"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 )
 
 const (
@@ -68,19 +68,8 @@ type Importer interface {
 	// importer exits for that reason.
 	Run(*RunContext) error
 
-	// NeedsAPIKey reports whether this importer requires an API key
-	// (OAuth2 client_id & client_secret, or equivalent).
-	// If the API only requires a username & password, or a flow to get
-	// an auth token per-account without an overall API key, importers
-	// can return false here.
-	NeedsAPIKey() bool
-
-	// SupportsIncremental reports whether this importer has been optimized
-	// to run efficiently in regular incremental runs. (e.g. every 5 minutes
-	// or half hour). Eventually all importers might support this and we'll
-	// make it required, in which case we might delete this option.
-	// For now, some importers (e.g. Flickr) don't yet support this.
-	SupportsIncremental() bool
+	// Properties returns properties of this importer type.
+	Properties() Properties
 
 	// IsAccountReady reports whether the provided account node
 	// is configured.
@@ -101,6 +90,41 @@ type Importer interface {
 	CallbackURLParameters(acctRef blob.Ref) url.Values
 }
 
+// Properties contains the properties of an importer type.
+type Properties struct {
+	Title       string
+	Description string
+
+	// TODOIssue, if non-zero, marks the importer as invalid, but the UI
+	// will link to a tracking bug for implementing it.
+	TODOIssue int
+
+	// NeedsAPIKey reports whether this importer requires an API key
+	// (OAuth2 client_id & client_secret, or equivalent).
+	// If the API only requires a username & password, or a flow to get
+	// an auth token per-account without an overall API key, importers
+	// can return false here.
+	NeedsAPIKey bool
+
+	// SupportsIncremental reports whether this importer has been optimized
+	// to run efficiently in regular incremental runs. (e.g. every 5 minutes
+	// or half hour). Eventually all importers might support this and we'll
+	// make it required, in which case we might delete this option.
+	// For now, some importers (e.g. Flickr) don't yet support this.
+	SupportsIncremental bool
+
+	// PermanodeImporterType optionally specifies the "importerType"
+	// permanode attribute value that should be stored for
+	// accounts of this type. By default, it is the string that it
+	// was registered with. This should only be specified for
+	// products that have been rebranded, and then this should be
+	// the old branding, to not break people who have been
+	// importing the account since before the rebranding.
+	// For example, this is "foursquare" for "swarm", so "swarm" shows
+	// in the UI and URLs, but it's "foursquare" in permanodes.
+	PermanodeImporterType string
+}
+
 // LongPoller is optionally implemented by importers which can long
 // poll efficiently to wait for new content.
 // For example, Twitter uses this to subscribe to the user's stream.
@@ -117,7 +141,7 @@ type LongPoller interface {
 // generate test data locally. The returned Roundtripper will be used as the
 // transport of the HTTPClient, in the RunContext that will be passed to Run
 // during tests and devcam server --makethings.
-// (See http://camlistore.org/issue/417).
+// (See http://perkeep.org/issue/417).
 type TestDataMaker interface {
 	MakeTestData() http.RoundTripper
 	// SetTestAccount allows an importer to set some needed attributes on the importer
@@ -131,7 +155,10 @@ type ImporterSetupHTMLer interface {
 	AccountSetupHTML(*Host) string
 }
 
-var importers = make(map[string]Importer)
+var (
+	importers           = map[string]Importer{}
+	reservedImporterKey = map[string]bool{}
+)
 
 // All returns the map of importer implementation name to implementation. This
 // map should not be mutated.
@@ -145,7 +172,23 @@ func Register(name string, im Importer) {
 	if _, dup := importers[name]; dup {
 		panic("Dup registration of importer " + name)
 	}
+	if _, dup := reservedImporterKey[name]; dup {
+		panic("Dup registration of importer " + name)
+	}
+	if pt := im.Properties().PermanodeImporterType; pt != "" {
+		if _, dup := importers[pt]; dup {
+			panic("Dup registration of importer " + pt)
+		}
+		if _, dup := reservedImporterKey[pt]; dup {
+			panic("Dup registration of importer " + pt)
+		}
+		reservedImporterKey[pt] = true
+	}
 	importers[name] = im
+}
+
+func RegisterTODO(name string, p Properties) {
+	Register(name, &todoImp{Props: p})
 }
 
 func init() {
@@ -195,10 +238,12 @@ func NewHost(hc HostConfig) (*Host, error) {
 		if clientSecret != "" && clientId == "" {
 			return nil, fmt.Errorf("Invalid static configuration for importer %q: clientSecret specified without clientId", k)
 		}
+		props := impl.Properties()
 		imp := &importer{
 			host:         h,
 			name:         k,
 			impl:         impl,
+			props:        &props,
 			clientID:     clientId,
 			clientSecret: clientSecret,
 		}
@@ -223,7 +268,7 @@ func newFromConfig(ld blobserver.Loader, cfg jsonconfig.Obj) (http.Handler, erro
 	}
 	ClientId := make(map[string]string)
 	ClientSecret := make(map[string]string)
-	for k, _ := range importers {
+	for k := range importers {
 		var clientId, clientSecret string
 		if impConf := cfg.OptionalObject(k); impConf != nil {
 			clientId = impConf.OptionalString("clientID", "")
@@ -425,6 +470,27 @@ func (h *Host) AccountsStatus() (interface{}, []camtypes.StatusError) {
 	return s, errs
 }
 
+// RunImporterAccount runs the importerType importer on the account described in
+// accountNode.
+func (h *Host) RunImporterAccount(importerType string, accountNode blob.Ref) error {
+	h.didInit.Wait()
+	imp, ok := h.imp[importerType]
+	if !ok {
+		return fmt.Errorf("no %q importer for this account", importerType)
+	}
+	accounts, err := imp.Accounts()
+	if err != nil {
+		return err
+	}
+	for _, ia := range accounts {
+		if ia.acct.pn != accountNode {
+			continue
+		}
+		return ia.run()
+	}
+	return fmt.Errorf("no %v account matching account in node %v", importerType, accountNode)
+}
+
 func (h *Host) InitHandler(hl blobserver.FindHandlerByTyper) error {
 	if prefix, _, err := hl.FindHandlerByType("ui"); err == nil {
 		h.uiPrefix = prefix
@@ -437,11 +503,11 @@ func (h *Host) InitHandler(hl blobserver.FindHandlerByTyper) error {
 	rh := handler.(*server.RootHandler)
 	searchHandler, ok := rh.SearchHandler()
 	if !ok {
-		return errors.New("importer requires a 'root' handler with 'searchRoot' defined.")
+		return errors.New("importer requires a 'root' handler with 'searchRoot' defined")
 	}
 	h.search = searchHandler
 	if rh.Storage == nil {
-		return errors.New("importer requires a 'root' handler with 'blobRoot' defined.")
+		return errors.New("importer requires a 'root' handler with 'blobRoot' defined")
 	}
 	h.target = rh.Storage
 	h.blobSource = rh.Storage
@@ -503,6 +569,9 @@ func (h *Host) serveImportersRoot(w http.ResponseWriter, r *http.Request) {
 	for _, v := range h.importers {
 		body.Importers = append(body.Importers, h.imp[v])
 	}
+	sort.Slice(body.Importers, func(i, j int) bool {
+		return body.Importers[i].Title() < body.Importers[j].Title()
+	})
 	h.execTemplate(w, r, importersRootPage{
 		Title: "Importers",
 		Body:  body,
@@ -600,7 +669,8 @@ func (h *Host) serveImporterAccount(w http.ResponseWriter, r *http.Request, imp 
 }
 
 func (h *Host) startPeriodicImporters() {
-	res, err := h.search.Query(&search.SearchQuery{
+	res, err := h.search.Query(context.TODO(), &search.SearchQuery{
+		Sort:       search.Unsorted,
 		Expression: "attr:camliNodeType:importerAccount",
 		Describe: &search.DescribeRequest{
 			Depth: 1,
@@ -674,7 +744,7 @@ func (ia *importerAcct) maybeStart() {
 			}
 			go func() {
 				if err := lp.LongPoll(rc); err == nil {
-					log.Printf("Long poll for %s found an update. Starting run...", ia)
+					log.Printf("importer: long poll for %s found an update. Starting run...", ia)
 					timer.Stop()
 					ia.start()
 				} else {
@@ -685,7 +755,7 @@ func (ia *importerAcct) maybeStart() {
 		return
 	}
 
-	log.Printf("Starting regular periodic import for %v", ia)
+	log.Printf("importer: starting periodic import for %v", ia)
 	go ia.start()
 }
 
@@ -713,9 +783,10 @@ func (h *Host) Searcher() search.QueryDescriber { return h.search }
 
 // importer is an importer for a certain site, but not a specific account on that site.
 type importer struct {
-	host *Host
-	name string // importer name e.g. "twitter"
-	impl Importer
+	host  *Host
+	name  string // importer name e.g. "twitter"
+	impl  Importer
+	props *Properties // impl.Properties; pointer so we crash on & find uninitialized callers
 
 	// If statically configured in config file, else
 	// they come from the importer node's attributes.
@@ -732,6 +803,32 @@ type importer struct {
 
 func (im *importer) Name() string { return im.name }
 
+func (im *importer) Title() string {
+	if im.props.Title != "" {
+		return im.props.Title
+	}
+	return im.name
+}
+
+func (im *importer) TODOIssue() int {
+	return im.props.TODOIssue
+}
+
+func (im *importer) Description() string {
+	return im.props.Description
+}
+
+// ImporterType returns the account permanode's attrImporterType
+// value. This is almost always the same as the Name, except in cases
+// where a product gets rebranded. (e.g. "foursquare" to "swarm", in
+// which case the importer type remains the old branding)
+func (im *importer) ImporterType() string {
+	if im.props.PermanodeImporterType != "" {
+		return im.props.PermanodeImporterType
+	}
+	return im.name
+}
+
 func (im *importer) StaticConfig() bool { return im.clientSecret != "" }
 
 // URL returns the importer's URL without trailing slash.
@@ -743,7 +840,7 @@ func (im *importer) ShowClientAuthEditForm() bool {
 		// to the user. (e.g. a hosted multi-user configuation)
 		return false
 	}
-	return im.impl.NeedsAPIKey()
+	return im.props.NeedsAPIKey
 }
 
 func (im *importer) InsecureForm() bool {
@@ -751,7 +848,7 @@ func (im *importer) InsecureForm() bool {
 }
 
 func (im *importer) CanAddNewAccount() bool {
-	if !im.impl.NeedsAPIKey() {
+	if !im.props.NeedsAPIKey {
 		return true
 	}
 	id, sec, err := im.credentials()
@@ -769,7 +866,7 @@ func (im *importer) ClientSecret() (v string, err error) {
 }
 
 func (im *importer) Status() (status string, err error) {
-	if !im.impl.NeedsAPIKey() {
+	if !im.props.NeedsAPIKey {
 		return "no configuration required", nil
 	}
 	if im.StaticConfig() {
@@ -817,7 +914,7 @@ func (im *importer) account(nodeRef blob.Ref) (*importerAcct, error) {
 	if acct.Attr(attrNodeType) != nodeTypeImporterAccount {
 		return nil, errors.New("account has wrong node type")
 	}
-	if acct.Attr(attrImporterType) != im.name {
+	if acct.Attr(attrImporterType) != im.ImporterType() {
 		return nil, errors.New("account has wrong importer type")
 	}
 	var root *Object
@@ -863,7 +960,7 @@ func (im *importer) newAccount() (*importerAcct, error) {
 	if err := acct.SetAttrs(
 		"title", fmt.Sprintf("%s account", im.name),
 		attrNodeType, nodeTypeImporterAccount,
-		attrImporterType, im.name,
+		attrImporterType, im.ImporterType(),
 		attrImportRoot, root.PermanodeRef().String(),
 	); err != nil {
 		return nil, err
@@ -893,10 +990,11 @@ func (im *importer) Accounts() ([]*importerAcct, error) {
 	im.acctmu.Unlock()
 
 	if needQuery {
-		res, err := im.host.search.Query(&search.SearchQuery{
+		res, err := im.host.search.Query(context.TODO(), &search.SearchQuery{
+			Sort: search.Unsorted,
 			Expression: fmt.Sprintf("attr:%s:%s attr:%s:%s",
 				attrNodeType, nodeTypeImporterAccount,
-				attrImporterType, im.name,
+				attrImporterType, im.ImporterType(),
 			),
 		})
 		if err != nil {
@@ -940,21 +1038,24 @@ func (im *importer) Node() (*Object, error) {
 
 	expr := fmt.Sprintf("attr:%s:%s attr:%s:%s",
 		attrNodeType, nodeTypeImporter,
-		attrImporterType, im.name,
+		attrImporterType, im.ImporterType(),
 	)
-	res, err := im.host.search.Query(&search.SearchQuery{
-		Limit:      10, // only expect 1
+	res, err := im.host.search.Query(context.TODO(), &search.SearchQuery{
+		Sort:       search.Unsorted,
+		Limit:      10, // might be more than one because of multiple blob hash types
 		Expression: expr,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if len(res.Blobs) > 1 {
-		return nil, fmt.Errorf("Ambiguous; too many permanodes matched query %q: %v", expr, res.Blobs)
+	best, err := im.bestNode(res)
+	if err != nil {
+		return nil, err
 	}
-	if len(res.Blobs) == 1 {
-		return im.host.ObjectFromRef(res.Blobs[0].Blob)
+	if best != nil {
+		return best, nil
 	}
+
 	o, err := im.host.NewObject()
 	if err != nil {
 		return nil, err
@@ -962,13 +1063,54 @@ func (im *importer) Node() (*Object, error) {
 	if err := o.SetAttrs(
 		"title", fmt.Sprintf("%s importer", im.name),
 		attrNodeType, nodeTypeImporter,
-		attrImporterType, im.name,
+		attrImporterType, im.ImporterType(),
 	); err != nil {
 		return nil, err
 	}
 
 	im.nodeCache = o
 	return o, nil
+}
+
+// bestNode picks the most populated importer node amongst res.Blobs, or nil if
+// len(res.Blobs) == 0
+// It is the caller's responsibility to create the correct request so that
+// res.Blobs are all importer nodes.
+func (im *importer) bestNode(res *search.SearchResult) (*Object, error) {
+	if len(res.Blobs) == 0 {
+		// let the caller create a fresh node
+		return nil, nil
+	}
+	var best *Object
+	for _, desb := range res.Blobs {
+		o, err := im.host.ObjectFromRef(desb.Blob)
+		if err != nil {
+			return nil, err
+		}
+		if best == nil {
+			best = o
+			continue
+		}
+		if best.Attr(attrClientID) == "" && o.Attr(attrClientID) != "" {
+			best = o
+			continue
+		}
+		if best.Attr(attrClientSecret) == "" && o.Attr(attrClientSecret) != "" {
+			best = o
+			continue
+		}
+		if best.Attr("title") == "" && o.Attr("title") != "" {
+			best = o
+			continue
+		}
+		// all other things being equal, pick the most recent one, as it's more likely
+		// to be a sha224 than a sha1
+		if best.modtime.Before(o.modtime) {
+			best = o
+			continue
+		}
+	}
+	return best, nil
 }
 
 // importerAcct is a long-lived type representing account
@@ -1001,8 +1143,8 @@ func (ia *importerAcct) delete() error {
 
 func (ia *importerAcct) toggleAuto() error {
 	old := ia.acct.Attr(attrImportAuto)
-	if old == "" && !ia.im.impl.SupportsIncremental() {
-		return fmt.Errorf("Importer %q doesn't support automatic mode.", ia.im.name)
+	if old == "" && !ia.im.props.SupportsIncremental {
+		return fmt.Errorf("Importer %q doesn't support automatic mode", ia.im.name)
 	}
 	var new string
 	if old == "" {
@@ -1150,6 +1292,33 @@ func (ia *importerAcct) start() {
 	}()
 }
 
+// TODO(mpl): review this code more carefully. mostly copied from start().
+func (ia *importerAcct) run() error {
+	ia.mu.Lock()
+	defer ia.mu.Unlock()
+	if ia.current != nil {
+		return errors.New("whatever")
+	}
+	rc := &RunContext{
+		Host: ia.im.host,
+		ia:   ia,
+	}
+	rc.ctx, rc.cancel = context.WithCancel(context.WithValue(context.Background(), ctxutil.HTTPClient, ia.im.host.HTTPClient()))
+	ia.current = rc
+	ia.stopped = false
+	ia.lastRunStart = time.Now()
+	log.Printf("Starting %v: %s", ia, ia.AccountLinkSummary())
+	err := ia.im.impl.Run(rc)
+	if err != nil {
+		return err
+	}
+	log.Printf("%v finished.", ia)
+	ia.current = nil
+	ia.stopped = false
+	ia.lastRunDone = time.Now()
+	return ia.lastRunErr
+}
+
 func (ia *importerAcct) stop() {
 	ia.mu.Lock()
 	defer ia.mu.Unlock()
@@ -1181,12 +1350,12 @@ type ProgressMessage struct {
 	BytesDone, BytesTotal int64
 }
 
-func (h *Host) upload(bb *schema.Builder) (br blob.Ref, err error) {
-	signed, err := bb.Sign(h.signer)
+func (h *Host) upload(ctx context.Context, bb *schema.Builder) (br blob.Ref, err error) {
+	signed, err := bb.Sign(ctx, h.signer)
 	if err != nil {
 		return
 	}
-	sb, err := blobserver.ReceiveString(h.target, signed)
+	sb, err := blobserver.ReceiveString(ctx, h.target, signed)
 	if err != nil {
 		return
 	}
@@ -1195,7 +1364,8 @@ func (h *Host) upload(bb *schema.Builder) (br blob.Ref, err error) {
 
 // NewObject creates a new permanode and returns its Object wrapper.
 func (h *Host) NewObject() (*Object, error) {
-	pn, err := h.upload(schema.NewUnsignedPermanode())
+	ctx := context.TODO() // TODO: move the NewObject method to some "ImportRun" type with a context field?
+	pn, err := h.upload(ctx, schema.NewUnsignedPermanode())
 	if err != nil {
 		return nil, err
 	}
@@ -1210,8 +1380,9 @@ type Object struct {
 	h  *Host
 	pn blob.Ref // permanode ref
 
-	mu   sync.RWMutex
-	attr map[string][]string
+	mu      sync.RWMutex
+	attr    map[string][]string
+	modtime time.Time
 }
 
 // PermanodeRef returns the permanode that this object wraps.
@@ -1252,12 +1423,41 @@ func (o *Object) ForeachAttr(fn func(key, value string)) {
 	}
 }
 
+// DelAttr removes value from the values set for the attribute attr of
+// permaNode. If value is empty then all the values for attribute are cleared.
+func (o *Object) DelAttr(key, value string) error {
+	ctx := context.TODO()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, err := o.h.upload(ctx, schema.NewDelAttributeClaim(o.pn, key, value))
+	if err != nil {
+		return err
+	}
+	if o.attr == nil {
+		o.attr = make(map[string][]string)
+		return nil
+	}
+	if value == "" {
+		delete(o.attr, key)
+		return nil
+	}
+	var values []string
+	for _, v := range o.attr[key] {
+		if v != value {
+			values = append(values, v)
+		}
+	}
+	o.attr[key] = values
+	return nil
+}
+
 // SetAttr sets the attribute key to value.
 func (o *Object) SetAttr(key, value string) error {
+	ctx := context.TODO() // TODO: make it possible to get a context via Object; either new context field, or via some "ImportRun" field?
 	if o.Attr(key) == value {
 		return nil
 	}
-	_, err := o.h.upload(schema.NewSetAttributeClaim(o.pn, key, value))
+	_, err := o.h.upload(ctx, schema.NewSetAttributeClaim(o.pn, key, value))
 	if err != nil {
 		return err
 	}
@@ -1300,6 +1500,8 @@ func (o *Object) SetAttrs2(keyval ...string) (changes bool, err error) {
 
 // SetAttrValues sets multi-valued attribute.
 func (o *Object) SetAttrValues(key string, attrs []string) error {
+	ctx := context.TODO() // TODO: make it possible to get a context via Object; either new context field, or via some "ImportRun" field?
+
 	exists := asSet(o.Attrs(key))
 	actual := asSet(attrs)
 	o.mu.Lock()
@@ -1310,14 +1512,14 @@ func (o *Object) SetAttrValues(key string, attrs []string) error {
 			delete(exists, v)
 			continue
 		}
-		_, err := o.h.upload(schema.NewAddAttributeClaim(o.pn, key, v))
+		_, err := o.h.upload(ctx, schema.NewAddAttributeClaim(o.pn, key, v))
 		if err != nil {
 			return err
 		}
 	}
 	// delete unneeded values
 	for v := range exists {
-		_, err := o.h.upload(schema.NewDelAttributeClaim(o.pn, key, v))
+		_, err := o.h.upload(ctx, schema.NewDelAttributeClaim(o.pn, key, v))
 		if err != nil {
 			return err
 		}
@@ -1347,7 +1549,7 @@ func (o *Object) ChildPathObject(path string) (*Object, error) {
 	return o.ChildPathObjectOrFunc(path, o.h.NewObject)
 }
 
-// ChildPathObject returns the child object from the permanode o,
+// ChildPathObjectOrFunc returns the child object from the permanode o,
 // given by the "camliPath:xxxx" attribute, where xxx is the provided
 // path. If the path doesn't exist, the provided func should return an
 // appropriate object. If the func fails, the return error is
@@ -1389,9 +1591,10 @@ func (h *Host) ObjectFromRef(permanodeRef blob.Ref) (*Object, error) {
 		return nil, fmt.Errorf("permanode %v had no DescribedPermanode in Describe response", permanodeRef)
 	}
 	return &Object{
-		h:    h,
-		pn:   permanodeRef,
-		attr: map[string][]string(db.Permanode.Attr),
+		h:       h,
+		pn:      permanodeRef,
+		attr:    map[string][]string(db.Permanode.Attr),
+		modtime: db.Permanode.ModTime,
 	}, nil
 }
 

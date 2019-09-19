@@ -1,19 +1,33 @@
+/*
+Copyright 2013 The Perkeep Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package search_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
-	"image/color"
 	"image/jpeg"
-	"image/png"
 	"io/ioutil"
 	"log"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -22,17 +36,18 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/geocode"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/index/indextest"
-	"camlistore.org/pkg/osutil"
-	. "camlistore.org/pkg/search"
-	"camlistore.org/pkg/test"
-	"camlistore.org/pkg/types/camtypes"
 	"go4.org/types"
-	"golang.org/x/net/context"
+	"perkeep.org/internal/geocode"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/index/indextest"
+	. "perkeep.org/pkg/search"
+	"perkeep.org/pkg/test"
+	"perkeep.org/pkg/types/camtypes"
 )
+
+var ctxbg = context.Background()
 
 // indexType is one of the three ways we test the query handler code.
 type indexType int
@@ -117,7 +132,7 @@ func testQueryType(t testing.TB, fn func(*queryTest), itype indexType) {
 	}
 	qt.id.Fataler = t
 	qt.newHandler = func() *Handler {
-		h := NewHandler(idx, qt.id.SignerBlobRef)
+		h := NewHandler(idx, owner)
 		if itype == indexCorpusScan {
 			if corpus, err = idx.KeepInMemory(); err != nil {
 				t.Fatal(err)
@@ -143,7 +158,7 @@ func (qt *queryTest) wantRes(req *SearchQuery, wanted ...blob.Ref) {
 			}
 		})
 	}
-	res, err := qt.Handler().Query(req)
+	res, err := qt.Handler().Query(ctxbg, req)
 	if err != nil {
 		qt.t.Fatal(err)
 	}
@@ -236,7 +251,7 @@ func TestQueryBlobRefPrefix(t *testing.T) {
 				BlobRefPrefix: "sha1-0",
 			},
 		}
-		sres, err := qt.Handler().Query(sq)
+		sres, err := qt.Handler().Query(ctxbg, sq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -580,9 +595,9 @@ func TestQueryPermanodeLocation(t *testing.T) {
 		id.SetAttribute(p5, "longitude", "2.0")
 
 		// Upload a basic image
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 		if err != nil {
-			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+			panic("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 		}
 		uploadFile := func(file string, modTime time.Time) blob.Ref {
 			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
@@ -616,9 +631,9 @@ func TestQueryFileLocation(t *testing.T) {
 		id := qt.id
 
 		// Upload a basic image
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 		if err != nil {
-			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+			panic("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 		}
 		uploadFile := func(file string, modTime time.Time) blob.Ref {
 			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
@@ -709,6 +724,306 @@ func TestQueryFileConstraint(t *testing.T) {
 	})
 }
 
+// find a directory with a name
+func TestQueryDirConstraint(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+		dirRef := id.UploadDir("somedir", []blob.Ref{}, time.Unix(789, 0))
+		qt.t.Logf("dirRef = %q", dirRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", fileRef3.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Dir: &DirConstraint{
+					FileName: &StringConstraint{
+						Contains: "somedir",
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, dirRef)
+	})
+}
+
+// find permanode with a dir that contains a certain file
+func TestQueryDirWithFileConstraint(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+		fileRef1, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef1 = %q", fileRef1)
+		fileRef2, _ := id.UploadFile("more-stuff.txt", "world", time.Unix(456, 0))
+		qt.t.Logf("fileRef2 = %q", fileRef2)
+		dirRef := id.UploadDir("somedir", []blob.Ref{fileRef1, fileRef2}, time.Unix(789, 0))
+		qt.t.Logf("dirRef = %q", dirRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", fileRef3.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Attr: "camliContent",
+					ValueInSet: &Constraint{
+						Dir: &DirConstraint{
+							Contains: &Constraint{File: &FileConstraint{
+								FileName: &StringConstraint{
+									Contains: "some-stuff.txt",
+								},
+							}},
+						},
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, p1)
+	})
+}
+
+// find a dir that doesn't contain any text files
+func TestQueryDirWithLogicalNotConstraint(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+		fileRef1, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef1 = %q", fileRef1)
+		fileRef2, _ := id.UploadFile("more-stuff.txt", "world", time.Unix(456, 0))
+		qt.t.Logf("fileRef2 = %q", fileRef2)
+		dirRef1 := id.UploadDir("somedir", []blob.Ref{fileRef1, fileRef2}, time.Unix(789, 0))
+		qt.t.Logf("dirRef1 = %q", dirRef1)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef1.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		dirRef2 := id.UploadDir("anotherdir", []blob.Ref{fileRef3}, time.Unix(181112, 0))
+		qt.t.Logf("dirRef2 = %q", dirRef2)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", dirRef2.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Dir: &DirConstraint{
+					Contains: &Constraint{
+						Logical: &LogicalConstraint{
+							A: &Constraint{
+								File: &FileConstraint{
+									FileName: &StringConstraint{
+										HasSuffix: ".txt",
+									},
+								},
+							},
+							Op: "not",
+						},
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, dirRef2)
+	})
+}
+
+// find permanode with a dir that contains a certain file or dir
+func TestQueryDirWithFileOrDirConstraint(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+		fileRef1, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef1 = %q", fileRef1)
+		childDirRef := id.UploadDir("childdir", []blob.Ref{}, time.Unix(457, 0))
+		qt.t.Logf("childDirRef = %q", childDirRef)
+		dirRef := id.UploadDir("somedir", []blob.Ref{fileRef1, childDirRef}, time.Unix(789, 0))
+		qt.t.Logf("dirRef = %q", dirRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", fileRef3.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Attr: "camliContent",
+					ValueInSet: &Constraint{
+						Dir: &DirConstraint{
+							Contains: &Constraint{Logical: &LogicalConstraint{
+								A: &Constraint{File: &FileConstraint{
+									FileName: &StringConstraint{
+										Equals: "foobar",
+									},
+								}},
+								B: &Constraint{Dir: &DirConstraint{
+									FileName: &StringConstraint{
+										Equals: "childdir",
+									},
+								}},
+								Op: "or",
+							}},
+						},
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, p1)
+	})
+}
+
+// find children of a directory, by name.
+// in practice, one can also get the children with the proper describe rules,
+// but doing so has some limitations that a direct search query has not.
+func TestQueryDirChildrenByNameConstraint(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		fileRef1, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef1 = %q", fileRef1)
+		fileRef2, _ := id.UploadFile("more-stuff.txt", "world", time.Unix(456, 0))
+		qt.t.Logf("fileRef2 = %q", fileRef2)
+		childDirRef := id.UploadDir("childdir", []blob.Ref{}, time.Unix(457, 0))
+		qt.t.Logf("childDirRef = %q", childDirRef)
+		dirRef := id.UploadDir("somedir", []blob.Ref{fileRef1, fileRef2, childDirRef}, time.Unix(789, 0))
+		qt.t.Logf("dirRef = %q", dirRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", fileRef3.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Logical: &LogicalConstraint{
+					A: &Constraint{File: &FileConstraint{
+						ParentDir: &DirConstraint{
+							FileName: &StringConstraint{
+								Equals: "somedir",
+							},
+						},
+					}},
+					B: &Constraint{Dir: &DirConstraint{
+						ParentDir: &DirConstraint{
+							FileName: &StringConstraint{
+								Equals: "somedir",
+							},
+						},
+					}},
+					Op: "or",
+				},
+			},
+		}
+		qt.wantRes(sq, fileRef1, fileRef2, childDirRef)
+	})
+}
+
+// find children of a directory, by blobref.
+func TestQueryDirChildrenByRefConstraint(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		fileRef1, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef1 = %q", fileRef1)
+		fileRef2, _ := id.UploadFile("more-stuff.txt", "world", time.Unix(456, 0))
+		qt.t.Logf("fileRef2 = %q", fileRef2)
+		childDirRef := id.UploadDir("childdir", []blob.Ref{}, time.Unix(457, 0))
+		qt.t.Logf("childDirRef = %q", childDirRef)
+		dirRef := id.UploadDir("somedir", []blob.Ref{fileRef1, fileRef2, childDirRef}, time.Unix(789, 0))
+		qt.t.Logf("dirRef = %q", dirRef)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", dirRef.String())
+
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(101112, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", fileRef3.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Logical: &LogicalConstraint{
+					A: &Constraint{File: &FileConstraint{
+						ParentDir: &DirConstraint{
+							BlobRefPrefix: dirRef.String(),
+						},
+					}},
+					B: &Constraint{Dir: &DirConstraint{
+						ParentDir: &DirConstraint{
+							BlobRefPrefix: dirRef.String(),
+						},
+					}},
+					Op: "or",
+				},
+			},
+		}
+		qt.wantRes(sq, fileRef1, fileRef2, childDirRef)
+	})
+}
+
+// find out if a file is amongst a dir's progeny (grand-children)
+func TestQueryDirProgeny(t *testing.T) {
+	testQuery(t, func(qt *queryTest) {
+		id := qt.id
+		grandchild1, _ := id.UploadFile("grandchild1.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("grandchild1 = %q", grandchild1)
+		grandchild2, _ := id.UploadFile("grandchild2.txt", "world", time.Unix(456, 0))
+		qt.t.Logf("grandchild2 = %q", grandchild2)
+		parentdir := id.UploadDir("parentdir", []blob.Ref{grandchild1, grandchild2}, time.Unix(789, 0))
+		qt.t.Logf("parentdir = %q", parentdir)
+		grandparentdir := id.UploadDir("grandparentdir", []blob.Ref{parentdir}, time.Unix(101112, 0))
+		qt.t.Logf("grandparentdir = %q", grandparentdir)
+		p1 := id.NewPlannedPermanode("1")
+		id.SetAttribute(p1, "camliContent", grandparentdir.String())
+
+		p3 := id.NewPlannedPermanode("3")
+		id.SetAttribute(p3, "camliContent", parentdir.String())
+
+		// adding an unrelated directory, to make sure we do _not_ find it as well
+		fileRef3, _ := id.UploadFile("other-file", "hellooooo", time.Unix(131415, 0))
+		qt.t.Logf("fileRef3 = %q", fileRef3)
+		otherdir := id.UploadDir("otherdir", []blob.Ref{fileRef3}, time.Unix(161718, 0))
+		qt.t.Logf("otherdir = %q", otherdir)
+		p2 := id.NewPlannedPermanode("2")
+		id.SetAttribute(p2, "camliContent", otherdir.String())
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Permanode: &PermanodeConstraint{
+					Attr: "camliContent",
+					ValueInSet: &Constraint{
+						Dir: &DirConstraint{
+							RecursiveContains: &Constraint{File: &FileConstraint{
+								FileName: &StringConstraint{
+									Contains: "grandchild1.txt",
+								},
+							}},
+						},
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, p1, p3)
+
+		// make sure that "Contains" only finds the direct parent, and not the grand-parent as well.
+		// also this time, skip the permanode layer.
+		sq = &SearchQuery{
+			Constraint: &Constraint{
+				Dir: &DirConstraint{
+					Contains: &Constraint{
+						BlobRefPrefix: grandchild1.String(),
+					},
+				},
+			},
+		}
+		qt.wantRes(sq, parentdir)
+	})
+}
+
 func TestQueryFileConstraint_WholeRef(t *testing.T) {
 	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
 		id := qt.id
@@ -728,7 +1043,7 @@ func TestQueryFileConstraint_WholeRef(t *testing.T) {
 					Attr: "camliContent",
 					ValueInSet: &Constraint{
 						File: &FileConstraint{
-							WholeRef: blob.SHA1FromString("hello"),
+							WholeRef: blob.RefFromString("hello"),
 						},
 					},
 				},
@@ -811,7 +1126,7 @@ func TestQueryFileCandidateSource(t *testing.T) {
 		sq := &SearchQuery{
 			Constraint: &Constraint{
 				File: &FileConstraint{
-					WholeRef: blob.SHA1FromString("hello"),
+					WholeRef: blob.RefFromString("hello"),
 				},
 			},
 		}
@@ -857,7 +1172,7 @@ func testQueryRecentPermanodes(t *testing.T, sortType SortType, source string) {
 			Describe: &DescribeRequest{},
 		}
 		handler := qt.Handler()
-		res, err := handler.Query(req)
+		res, err := handler.Query(ctxbg, req)
 		if err != nil {
 			qt.t.Fatal(err)
 		}
@@ -889,7 +1204,7 @@ func testQueryRecentPermanodes(t *testing.T, sortType SortType, source string) {
 				Sort:     sortType,
 				Continue: res.Continue,
 			}
-			res, err := handler.Query(req)
+			res, err := handler.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatal(err)
 			}
@@ -936,9 +1251,9 @@ func testQueryRecentPermanodes_Continue(t *testing.T, sortType SortType) {
 
 		contToken := ""
 		tests := [][]blob.Ref{
-			[]blob.Ref{blobs[3], blobs[2]},
-			[]blob.Ref{blobs[1], blobs[0]},
-			[]blob.Ref{},
+			{blobs[3], blobs[2]},
+			{blobs[1], blobs[0]},
+			{},
 		}
 
 		for i, wantBlobs := range tests {
@@ -950,7 +1265,7 @@ func testQueryRecentPermanodes_Continue(t *testing.T, sortType SortType) {
 				Sort:     sortType,
 				Continue: contToken,
 			}
-			res, err := handler.Query(req)
+			res, err := handler.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatalf("Error on query %d: %v", i+1, err)
 			}
@@ -1009,8 +1324,8 @@ func testQueryRecentPermanodes_ContinueEndMidPage(t *testing.T, sortType SortTyp
 
 		contToken := ""
 		tests := [][]blob.Ref{
-			[]blob.Ref{blobs[2], blobs[1]},
-			[]blob.Ref{blobs[0]},
+			{blobs[2], blobs[1]},
+			{blobs[0]},
 		}
 
 		for i, wantBlobs := range tests {
@@ -1022,7 +1337,7 @@ func testQueryRecentPermanodes_ContinueEndMidPage(t *testing.T, sortType SortTyp
 				Sort:     sortType,
 				Continue: contToken,
 			}
-			res, err := handler.Query(req)
+			res, err := handler.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatalf("Error on query %d: %v", i+1, err)
 			}
@@ -1483,7 +1798,7 @@ func testLimitDoesntDeadlock(t *testing.T, sortType SortType) {
 		h := qt.Handler()
 		gotRes := make(chan bool, 1)
 		go func() {
-			_, err := h.Query(req)
+			_, err := h.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Error(err)
 			}
@@ -1662,7 +1977,7 @@ func BenchmarkQueryRecentPermanodes(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			*req.Describe = DescribeRequest{}
-			_, err := h.Query(req)
+			_, err := h.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatal(err)
 			}
@@ -1704,7 +2019,7 @@ func benchmarkQueryPermanodes(b *testing.B, describe bool) {
 			if describe {
 				*req.Describe = DescribeRequest{}
 			}
-			_, err := h.Query(req)
+			_, err := h.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatal(err)
 			}
@@ -1718,9 +2033,9 @@ func BenchmarkQueryPermanodeLocation(b *testing.B) {
 		id := qt.id
 
 		// Upload a basic image
-		camliRootPath, err := osutil.GoPackagePath("camlistore.org")
+		camliRootPath, err := osutil.GoPackagePath("perkeep.org")
 		if err != nil {
-			panic("Package camlistore.org no found in $GOPATH or $GOPATH not defined")
+			panic("Package perkeep.org not found in $GOPATH or $GOPATH not defined")
 		}
 		uploadFile := func(file string, modTime time.Time) blob.Ref {
 			fileName := filepath.Join(camliRootPath, "pkg", "search", "testdata", file)
@@ -1770,11 +2085,68 @@ func BenchmarkQueryPermanodeLocation(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			_, err := h.Query(req)
+			_, err := h.Query(ctxbg, req)
 			if err != nil {
 				qt.t.Fatal(err)
 			}
 		}
+	})
+}
+
+// Issue 1118: be efficient when looking up a direct blobref with a "ref:" query.
+func TestRefQuerySource(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		fileRef, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef = %q", fileRef)
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				BlobRefPrefix: fileRef.String(), // exact match
+			},
+		}
+		qt.candidateSource = "one_blob"
+		qt.wantRes(sq, fileRef)
+	})
+}
+
+func TestRefQuerySource_Logical(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		fileRef, _ := id.UploadFile("some-stuff.txt", "hello", time.Unix(123, 0))
+		qt.t.Logf("fileRef = %q", fileRef)
+
+		sq := &SearchQuery{
+			Constraint: &Constraint{
+				Logical: &LogicalConstraint{
+					Op: "and",
+					A: &Constraint{
+						BlobRefPrefix: fileRef.String()[:10],
+					},
+					B: &Constraint{
+						BlobRefPrefix: fileRef.String(), // exact match
+					},
+				},
+			},
+		}
+		qt.candidateSource = "one_blob"
+		qt.wantRes(sq, fileRef)
+	})
+}
+
+// permanode camliNodeType candidate source
+func TestIsCheckinQuerySource(t *testing.T) {
+	testQueryTypes(t, memIndexTypes, func(qt *queryTest) {
+		id := qt.id
+		pn := id.NewPlannedPermanode("photo")
+		id.SetAttribute(pn, "camliNodeType", "foursquare.com:checkin")
+
+		sq := &SearchQuery{
+			Expression: "is:checkin",
+			Sort:       MapSort,
+		}
+		qt.candidateSource = "corpus_permanode_types"
+		qt.wantRes(sq, pn)
 	})
 }
 
@@ -1850,7 +2222,7 @@ func BenchmarkLocationPredicate(b *testing.B) {
 					Expression: "loc:" + loc,
 					Limit:      -1,
 				}
-				resp, err := h.Query(req)
+				resp, err := h.Query(ctxbg, req)
 				if err != nil {
 					qt.t.Fatal(err)
 				}
@@ -1886,6 +2258,7 @@ func init() {
 	cacheGeo("mexico", 32.7187629, -86.7105711, 14.5345486, -118.3649292)
 	cacheGeo("brazil", 5.2717863, -29.3448224, -33.7506241, -73.98281709999999)
 	cacheGeo("argentina", -21.7810459, -53.6374811, -55.05727899999999, -73.56036019999999)
+	cacheGeo("Uitdam", ExportUitdamLC.North, ExportUitdamLC.East, ExportUitdamLC.South, ExportUitdamLC.West)
 
 	geocode.AltLookupFn = func(ctx context.Context, addr string) ([]geocode.Rect, error) {
 		r, ok := altLocCache[addr]
@@ -2078,160 +2451,30 @@ type locationPoints struct {
 }
 
 func TestBestByLocation(t *testing.T) {
-	if testing.Short() {
-		t.Skip()
+	res := &SearchResult{
+		LocationArea: &camtypes.LocationBounds{
+			North: 90,
+			South: -90,
+			East:  180,
+			West:  -180,
+		},
 	}
-	data := make(map[string]locationPoints)
-	f, err := os.Open(filepath.Join("testdata", "locationPoints.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
-	if err := dec.Decode(&data); err != nil {
-		t.Fatal(err)
-	}
+	locm := map[blob.Ref]camtypes.Location{}
 
-	for _, v := range data {
-		testBestByLocation(t, v, false)
-	}
-}
-
-// call with generate=true to regenerate the png files int testdata/ from testdata/locationPoints.json
-func testBestByLocation(t *testing.T, data locationPoints, generate bool) {
-	var res SearchResult
-	var blobs []*SearchResultBlob
-	meta := make(map[string]*DescribedBlob)
-	var area camtypes.LocationBounds
-	locm := make(map[blob.Ref]camtypes.Location)
-	for _, v := range data.Points {
-		br := blob.RefFromString(fmt.Sprintf("%v,%v", v.Latitude, v.Longitude))
-		blobs = append(blobs, &SearchResultBlob{
-			Blob: br,
-		})
-		loc := camtypes.Location{
-			Latitude:  v.Latitude,
-			Longitude: v.Longitude,
-		}
-		meta[br.String()] = &DescribedBlob{
-			Location: &loc,
-		}
-		locm[br] = loc
-		area = area.Expand(loc)
-	}
-	res.Blobs = blobs
-	res.Describe = &DescribeResponse{
-		Meta: meta,
-	}
-	res.LocationArea = &area
-
-	var widthRatio, heightRatio float64
-	initImage := func() *image.RGBA {
-		maxRelLat := area.North - area.South
-		maxRelLong := area.East - area.West
-		if area.West >= area.East {
-			// area is spanning over the antimeridian
-			maxRelLong += 360
-		}
-		// draw it all on a 1000 px wide image
-		height := int(1000 * maxRelLat / maxRelLong)
-		img := image.NewRGBA(image.Rect(0, 0, 1000, height))
-		for i := 0; i < 1000; i++ {
-			for j := 0; j < 1000; j++ {
-				img.Set(i, j, image.White)
-			}
-		}
-		widthRatio = 1000. / maxRelLong
-		heightRatio = float64(height) / maxRelLat
-		return img
-	}
-
-	img := initImage()
-	for _, v := range data.Points {
-		// draw a little cross of 3x3, because 1px dot is not visible enough.
-		relLong := v.Longitude - area.West
-		if v.Longitude < area.West {
-			relLong += 360
-		}
-		crossX := int(relLong * widthRatio)
-		crossY := int((area.North - v.Latitude) * heightRatio)
-		for i := -1; i < 2; i++ {
-			img.Set(crossX+i, crossY, color.RGBA{127, 0, 0, 127})
-		}
-		for j := -1; j < 2; j++ {
-			img.Set(crossX, crossY+j, color.RGBA{127, 0, 0, 127})
+	const numResults = 5000
+	const limit = 117
+	const scale = 1000
+	for i := 0; i < numResults; i++ {
+		br := blob.RefFromString(fmt.Sprintf("foo %d", i))
+		res.Blobs = append(res.Blobs, &SearchResultBlob{Blob: br})
+		locm[br] = camtypes.Location{
+			Latitude:  float64(rand.Intn(360*scale) - 180*scale),
+			Longitude: float64(rand.Intn(180*scale) - 90*scale),
 		}
 	}
 
-	cmpImage := func(img *image.RGBA, wantImgFile string) {
-		f, err := os.Open(wantImgFile)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-		wantImg, err := png.Decode(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for j := 0; j < wantImg.Bounds().Max.Y; j++ {
-			for i := 0; i < wantImg.Bounds().Max.X; i++ {
-				r1, g1, b1, a1 := wantImg.At(i, j).RGBA()
-				r2, g2, b2, a2 := img.At(i, j).RGBA()
-				if r1 != r2 || g1 != g2 || b1 != b2 || a1 != a2 {
-					t.Fatalf("%v different from %v", wantImg.At(i, j), img.At(i, j))
-				}
-			}
-		}
-	}
-
-	genPng := func(img *image.RGBA, name string) {
-		f, err := os.Create(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-		if err := png.Encode(f, img); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if generate {
-		genPng(img, filepath.Join("testdata", fmt.Sprintf("%v-beforeMapSort.png", data.Name)))
-	} else {
-		cmpImage(img, filepath.Join("testdata", fmt.Sprintf("%v-beforeMapSort.png", data.Name)))
-	}
-
-	ExportBestByLocation(&res, locm, 100)
-
-	// check that all longitudes are in the [-180,180] range
-	for _, v := range res.Blobs {
-		longitude := meta[v.Blob.String()].Location.Longitude
-		if longitude < -180. || longitude > 180. {
-			t.Errorf("out of range location: %v", longitude)
-		}
-	}
-
-	img = initImage()
-	for _, v := range res.Blobs {
-		loc := meta[v.Blob.String()].Location
-		longitude := loc.Longitude
-		latitude := loc.Latitude
-		// draw a little cross of 3x3, because 1px dot is not visible enough.
-		relLong := longitude - area.West
-		if longitude < area.West {
-			relLong += 360
-		}
-		crossX := int(relLong * widthRatio)
-		crossY := int((area.North - latitude) * heightRatio)
-		for i := -1; i < 2; i++ {
-			img.Set(crossX+i, crossY, color.RGBA{127, 0, 0, 127})
-		}
-		for j := -1; j < 2; j++ {
-			img.Set(crossX, crossY+j, color.RGBA{127, 0, 0, 127})
-		}
-	}
-	if generate {
-		genPng(img, filepath.Join("testdata", fmt.Sprintf("%v-afterMapSort.png", data.Name)))
-	} else {
-		cmpImage(img, filepath.Join("testdata", fmt.Sprintf("%v-afterMapSort.png", data.Name)))
+	ExportBestByLocation(res, locm, limit)
+	if got := len(res.Blobs); got != limit {
+		t.Errorf("got %d blobs; want %d", got, limit)
 	}
 }

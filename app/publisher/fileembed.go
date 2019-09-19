@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,16 +15,16 @@ limitations under the License.
 */
 
 /*
-The publisher application serves and renders items published by Camlistore.
+The publisher application serves and renders items published by Perkeep.
 That is, items that are children, through a (direct or not) camliPath relation,
 of a camliRoot node (a permanode with a camliRoot attribute set).
 
 #fileembed pattern .+\.(js|css|html|png|svg|js.map)$
 */
-package main // import "camlistore.org/app/publisher"
+package main // import "perkeep.org/app/publisher"
 
 import (
-	"camlistore.org/pkg/fileembed"
+	"perkeep.org/pkg/fileembed"
 )
 
 // TODO(mpl): appengine case

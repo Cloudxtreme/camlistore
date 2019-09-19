@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore Authors.
+Copyright 2015 The Perkeep Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,20 +19,17 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
-	"camlistore.org/pkg/cmdmain"
+	"perkeep.org/pkg/cmdmain"
 )
 
 var hookPath = ".git/hooks/"
@@ -48,8 +45,17 @@ func (c *hookCmd) installHook() error {
 	if err != nil {
 		return err
 	}
+	hookDir := filepath.Join(root, hookPath)
+	if _, err := os.Stat(hookDir); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(hookDir, 0700); err != nil {
+			return err
+		}
+	}
 	for _, hookFile := range hookFiles {
-		filename := filepath.Join(root, hookPath+hookFile)
+		filename := hookDir + hookFile
 		hookContent := fmt.Sprintf(hookScript, hookFile)
 		// If hook file exists, assume it is okay.
 		_, err := os.Stat(filename)
@@ -85,7 +91,7 @@ type hookCmd struct {
 }
 
 func init() {
-	cmdmain.RegisterCommand("hook", func(flags *flag.FlagSet) cmdmain.CommandRunner {
+	cmdmain.RegisterMode("hook", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := &hookCmd{}
 		flags.BoolVar(&cmd.verbose, "verbose", false, "Be verbose.")
 		// TODO(mpl): "-w" flag to run gofmt -w and devcam fixv -w. for now just print instruction.
@@ -105,7 +111,7 @@ func (c *hookCmd) Examples() []string {
 }
 
 func (c *hookCmd) Describe() string {
-	return "Install git hooks for Camlistore, and if given, run the hook given as argument. Currently available hooks are: " + strings.TrimSuffix(strings.Join(hookFiles, ", "), ",") + "."
+	return "Install git hooks for Perkeep, and if given, run the hook given as argument. Currently available hooks are: " + strings.TrimSuffix(strings.Join(hookFiles, ", "), ",") + "."
 }
 
 func (c *hookCmd) RunCommand(args []string) error {
@@ -124,78 +130,6 @@ func (c *hookCmd) RunCommand(args []string) error {
 			cmdmain.ExitWithFailure = true
 			return err
 		}
-	case "commit-msg":
-		if err := c.hookCommitMsg(args[1:]); err != nil {
-			cmdmain.ExitWithFailure = true
-			return err
-		}
-	}
-	return nil
-}
-
-// stripComments strips lines that begin with "#" and removes the diff section
-// contained in verbose commits.
-func stripComments(in []byte) []byte {
-	if i := bytes.Index(in, ignoreBelow); i >= 0 {
-		in = in[:i+1]
-	}
-	return regexp.MustCompile(`(?m)^#.*\n`).ReplaceAll(in, nil)
-}
-
-// hookCommitMsg is installed as the git commit-msg hook.
-// It adds a Change-Id line to the bottom of the commit message
-// if there is not one already.
-// Code mostly copied from golang.org/x/review/git-codereview/hook.go
-func (c *hookCmd) hookCommitMsg(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: devcam hook commit-msg message.txt\n")
-	}
-
-	file := args[0]
-	oldData, err := ioutil.ReadFile(file)
-	if err != nil {
-		return err
-	}
-	data := append([]byte{}, oldData...)
-	data = stripComments(data)
-
-	// Empty message not allowed.
-	if len(bytes.TrimSpace(data)) == 0 {
-		return errors.New("empty commit message")
-	}
-
-	// Insert a blank line between first line and subsequent lines if not present.
-	eol := bytes.IndexByte(data, '\n')
-	if eol != -1 && len(data) > eol+1 && data[eol+1] != '\n' {
-		data = append(data, 0)
-		copy(data[eol+1:], data[eol:])
-		data[eol+1] = '\n'
-	}
-
-	// Complain if two Change-Ids are present.
-	// This can happen during an interactive rebase;
-	// it is easy to forget to remove one of them.
-	nChangeId := bytes.Count(data, []byte("\nChange-Id: "))
-	if nChangeId > 1 {
-		return errors.New("multiple Change-Id lines")
-	}
-
-	// Add Change-Id to commit message if not present.
-	if nChangeId == 0 {
-		n := len(data)
-		for n > 0 && data[n-1] == '\n' {
-			n--
-		}
-		var id [20]byte
-		if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
-			return fmt.Errorf("could not generate Change-Id: %v", err)
-		}
-		data = append(data[:n], fmt.Sprintf("\n\nChange-Id: I%x\n", id[:])...)
-	}
-
-	// Write back.
-	if !bytes.Equal(data, oldData) {
-		return ioutil.WriteFile(file, data, 0666)
 	}
 	return nil
 }
@@ -236,11 +170,12 @@ func (c *hookCmd) hookGofmt() error {
 }
 
 func (c *hookCmd) hookTrailingSpace() error {
-	out, _ := cmdOutputDirErr(".", "git", "diff-index", "--check", "--diff-filter=ACM", "--cached", "HEAD", "--")
+	// see 'pathspec' for the ':!' syntax to ignore a directory.
+	out, _ := cmdOutputDirErr(".", "git", "diff-index", "--check", "--diff-filter=ACM", "--cached", "HEAD", "--", ".", ":!/vendor/")
 	if out != "" {
 		printf("\n%s", out)
 		printf("Trailing whitespace detected, you need to clean it up manually.\n")
-		return errors.New("trailing whitespace.")
+		return errors.New("trailing whitespace")
 	}
 	return nil
 }
@@ -256,11 +191,11 @@ func (c *hookCmd) runGofmt() (files []string, err error) {
 		repo += string(filepath.Separator)
 	}
 
-	out, err := cmdOutputDirErr(".", "git", "diff-index", "--name-only", "--diff-filter=ACM", "--cached", "HEAD", "--")
+	out, err := cmdOutputDirErr(".", "git", "diff-index", "--name-only", "--diff-filter=ACM", "--cached", "HEAD", "--", ":(glob)**/*.go", ":!/vendor/")
 	if err != nil {
 		return nil, err
 	}
-	indexFiles := addRoot(repo, filter(gofmtRequired, nonBlankLines(out)))
+	indexFiles := addRoot(repo, nonBlankLines(out))
 	if len(indexFiles) == 0 {
 		return
 	}
@@ -328,19 +263,6 @@ func filter(f func(string) bool, list []string) []string {
 		}
 	}
 	return out
-}
-
-// gofmtRequired reports whether the specified file should be checked
-// for gofmt'dness by the pre-commit hook.
-// The file name is relative to the repo root.
-func gofmtRequired(file string) bool {
-	if !strings.HasSuffix(file, ".go") {
-		return false
-	}
-	if !strings.HasPrefix(file, "test/") {
-		return true
-	}
-	return strings.HasPrefix(file, "test/bench/") || file == "test/run.go"
 }
 
 func commandString(command string, args []string) string {

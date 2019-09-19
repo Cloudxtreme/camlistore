@@ -35,7 +35,7 @@
 
 		"/scancab/": {
 			"handler": "app",
-			"enabled": true,
+			"enabled": ["_env", "${CAMLI_SCANCAB_ENABLED}"],
 			"handlerArgs": {
 				"prefix": "/scancab/",
 				"serverListen": "localhost:3179",
@@ -230,7 +230,7 @@
 				"meta": "/encmeta/",
 				"blobs": "/encblob/",
 				"metaIndex": { "type": "memory" },
-				"key": "000102030405060708090a0b0c0d0e0f"
+				"passphrase": "password"
 			}
 		},
 
@@ -342,7 +342,10 @@
 			"handler": "search",
 			"handlerArgs": {
 				"index": ["_env", "${CAMLI_INDEXER_PATH}"],
-				"owner": ["_env", "${CAMLI_PUBKEY_BLOBREF}"],
+				"owner": {
+					"identity": ["_env", "${CAMLI_KEYID}"],
+					"secringFile": ["_env", "${CAMLI_SECRET_RING}"]
+				},
 				"slurpToMemory": true,
 				"devBlockStartupOn": "/sync-index/"
 			}
@@ -358,17 +361,20 @@
 				"flickr": {
 					"clientSecret": ["_env", "${CAMLI_FLICKR_API_KEY}", ""]
 				},
-				"foursquare": {
-					"clientSecret": ["_env", "${CAMLI_FOURSQUARE_API_KEY}", ""]
-				},
 				"picasa": {
 					"clientSecret": ["_env", "${CAMLI_PICASA_API_KEY}", ""]
 				},
 				"plaid": {
 					"clientSecret": ["_env", "${CAMLI_PLAID_API_KEY}", ""]
 				},
+				"swarm": {
+					"clientSecret": ["_env", "${CAMLI_SWARM_API_KEY}", ""]
+				},
 				"twitter": {
 					"clientSecret": ["_env", "${CAMLI_TWITTER_API_KEY}", ""]
+				},
+				"instapaper": {
+					"clientSecret": ["_env", "${CAMLI_INSTAPAPER_API_KEY}", ""]
 				}
 			}
 		},

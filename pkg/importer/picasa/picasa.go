@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 // Package picasa implements an importer for picasa.com accounts.
-package picasa // import "camlistore.org/pkg/importer/picasa"
+package picasa // import "perkeep.org/pkg/importer/picasa"
 
 // TODO: removing camliPath from gallery permanode when pic deleted from gallery
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,18 +32,17 @@ import (
 	"strings"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
-	"camlistore.org/pkg/search"
 	"github.com/tgulacsi/picago"
 	"go4.org/ctxutil"
 	"go4.org/syncutil"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
+	"perkeep.org/pkg/search"
 )
 
 const (
@@ -82,7 +82,14 @@ type imp struct {
 	importer.OAuth2
 }
 
-func (imp) SupportsIncremental() bool { return true }
+func (imp) Properties() importer.Properties {
+	return importer.Properties{
+		Title:               "Google Photos (via Picasa API)",
+		Description:         "import your photos from Google Photos. (limited to 10,000 photos per Google Photos API bug for now)",
+		SupportsIncremental: true,
+		NeedsAPIKey:         true,
+	}
+}
 
 type userInfo struct {
 	ID   string // numeric picasa user ID ("11583474931002155675")
@@ -423,13 +430,13 @@ func (r *run) updatePhotoInAlbum(ctx context.Context, albumNode *importer.Object
 		if err != nil {
 			return nil, err
 		}
-		fileRef, err := schema.WriteFileFromReader(r.Host.Target(), photo.Filename, io.TeeReader(rc, h))
+		fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), photo.Filename, io.TeeReader(rc, h))
 		if err != nil {
 			return nil, err
 		}
 		fileRefStr = fileRef.String()
 		wholeRef := blob.RefFromHash(h)
-		if pn, err := findExistingPermanode(r.Host.Searcher(), wholeRef); err == nil {
+		if pn, err := findExistingPermanode(r.Context(), r.Host.Searcher(), wholeRef); err == nil {
 			return r.Host.ObjectFromRef(pn)
 		}
 		return r.Host.NewObject()
@@ -450,7 +457,7 @@ func (r *run) updatePhotoInAlbum(ctx context.Context, albumNode *importer.Object
 			if err != nil {
 				return err
 			}
-			fileRef, err := schema.WriteFileFromReader(r.Host.Target(), photo.Filename, rc)
+			fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), photo.Filename, rc)
 			rc.Close()
 			if err != nil {
 				return err
@@ -508,7 +515,12 @@ func (r *run) updatePhotoInAlbum(ctx context.Context, albumNode *importer.Object
 	return nil
 }
 
+var testTopLevelNode *importer.Object
+
 func (r *run) getTopLevelNode(path string, title string) (*importer.Object, error) {
+	if testTopLevelNode != nil {
+		return testTopLevelNode, nil
+	}
 	childObject, err := r.RootNode().ChildPathObject(path)
 	if err != nil {
 		return nil, err
@@ -535,8 +547,8 @@ var sensitiveAttrs = []string{
 // camliContent pointing to a file with the provided wholeRef and
 // doesn't have any conflicting attributes that would prevent the
 // picasa importer from re-using that permanode for its own use.
-func findExistingPermanode(qs search.QueryDescriber, wholeRef blob.Ref) (pn blob.Ref, err error) {
-	res, err := qs.Query(&search.SearchQuery{
+func findExistingPermanode(ctx context.Context, qs search.QueryDescriber, wholeRef blob.Ref) (pn blob.Ref, err error) {
+	res, err := qs.Query(ctx, &search.SearchQuery{
 		Constraint: &search.Constraint{
 			Permanode: &search.PermanodeConstraint{
 				Attr: "camliContent",

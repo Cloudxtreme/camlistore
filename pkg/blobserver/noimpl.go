@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,12 @@ limitations under the License.
 package blobserver
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
 
-	"camlistore.org/pkg/blob"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
 )
 
 // NoImplStorage is an implementation of Storage that returns a not
@@ -31,23 +31,24 @@ type NoImplStorage struct{}
 
 var _ Storage = NoImplStorage{}
 
-func (NoImplStorage) Fetch(blob.Ref) (file io.ReadCloser, size uint32, err error) {
+func (NoImplStorage) Fetch(context.Context, blob.Ref) (file io.ReadCloser, size uint32, err error) {
 	return nil, 0, os.ErrNotExist
 }
 
-func (NoImplStorage) ReceiveBlob(blob.Ref, io.Reader) (sb blob.SizedRef, err error) {
+func (NoImplStorage) ReceiveBlob(context.Context, blob.Ref, io.Reader) (sb blob.SizedRef, err error) {
 	err = errors.New("ReceiveBlob not implemented")
 	return
 }
 
-func (NoImplStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
+func (NoImplStorage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
 	return errors.New("Stat not implemented")
 }
 
 func (NoImplStorage) EnumerateBlobs(ctx context.Context, dest chan<- blob.SizedRef, after string, limit int) error {
+	close(dest)
 	return errors.New("EnumerateBlobs not implemented")
 }
 
-func (NoImplStorage) RemoveBlobs(blobs []blob.Ref) error {
+func (NoImplStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	return errors.New("Remove not implemented")
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,13 +33,14 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/index"
-	"camlistore.org/pkg/types/camtypes"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/index"
+	"perkeep.org/pkg/types/camtypes"
+
+	"context"
 
 	"go4.org/strutil"
 	"go4.org/types"
-	"golang.org/x/net/context"
 )
 
 type SortType int
@@ -131,15 +132,7 @@ func (q *SearchQuery) URLSuffix() string { return "camli/search/query" }
 
 func (q *SearchQuery) FromHTTP(req *http.Request) error {
 	dec := json.NewDecoder(io.LimitReader(req.Body, 1<<20))
-	if err := dec.Decode(q); err != nil {
-		return err
-	}
-
-	if q.Constraint == nil && q.Expression == "" {
-		return errors.New("query must have at least a constraint or an expression")
-	}
-
-	return nil
+	return dec.Decode(q)
 }
 
 // exprQuery optionally specifies the *SearchQuery prototype that was generated
@@ -249,20 +242,21 @@ func (q *SearchQuery) checkValid(ctx context.Context) (sq *SearchQuery, err erro
 	if q.Sort == MapSort && (q.Continue != "" || q.Around.Valid()) {
 		return nil, errors.New("Continue or Around parameters are not available with MapSort")
 	}
-	if q.Constraint == nil {
-		if expr := q.Expression; expr != "" {
-			sq, err := parseExpression(ctx, expr)
-			if err != nil {
-				return nil, fmt.Errorf("Error parsing search expression %q: %v", expr, err)
-			}
-			if err := sq.Constraint.checkValid(); err != nil {
-				return nil, fmt.Errorf("Internal error: parseExpression(%q) returned invalid constraint: %v", expr, err)
-			}
-			return sq, nil
-		}
-		return nil, errors.New("no search constraint or expression")
+	if q.Constraint != nil && q.Expression != "" {
+		return nil, errors.New("Constraint and Expression are mutually exclusive in a search query")
 	}
-	return nil, q.Constraint.checkValid()
+	if q.Constraint != nil {
+		return sq, q.Constraint.checkValid()
+	}
+	expr := q.Expression
+	sq, err = parseExpression(ctx, expr)
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing search expression %q: %v", expr, err)
+	}
+	if err := sq.Constraint.checkValid(); err != nil {
+		return nil, fmt.Errorf("Internal error: parseExpression(%q) returned invalid constraint: %v", expr, err)
+	}
+	return sq, nil
 }
 
 // SearchResult is the result of the Search method for a given SearchQuery.
@@ -337,6 +331,57 @@ func (c *Constraint) checkValid() error {
 	return nil
 }
 
+// matchesPermanodeTypes returns a set of valid permanode types that a matching
+// permanode must have as its "camliNodeType" attribute.
+// It returns a zero-length slice if this constraint might include things other
+// things.
+func (c *Constraint) matchesPermanodeTypes() []string {
+	if c == nil {
+		return nil
+	}
+	if pc := c.Permanode; pc != nil && pc.Attr == "camliNodeType" && pc.Value != "" {
+		return []string{pc.Value}
+	}
+	if lc := c.Logical; lc != nil {
+		sa := lc.A.matchesPermanodeTypes()
+		sb := lc.B.matchesPermanodeTypes()
+		switch lc.Op {
+		case "and":
+			if len(sa) != 0 {
+				return sa
+			}
+			return sb
+		case "or":
+			return append(sa, sb...)
+		}
+	}
+	return nil
+
+}
+
+// matchesAtMostOneBlob reports whether this constraint matches at most a single blob.
+// If so, it returns that blob. Otherwise it returns a zero, invalid blob.Ref.
+func (c *Constraint) matchesAtMostOneBlob() blob.Ref {
+	if c == nil {
+		return blob.Ref{}
+	}
+	if c.BlobRefPrefix != "" {
+		br, ok := blob.Parse(c.BlobRefPrefix)
+		if ok {
+			return br
+		}
+	}
+	if c.Logical != nil && c.Logical.Op == "and" {
+		if br := c.Logical.A.matchesAtMostOneBlob(); br.Valid() {
+			return br
+		}
+		if br := c.Logical.B.matchesAtMostOneBlob(); br.Valid() {
+			return br
+		}
+	}
+	return blob.Ref{}
+}
+
 func (c *Constraint) onlyMatchesPermanode() bool {
 	if c.Permanode != nil || c.CamliType == "permanode" {
 		return true
@@ -381,6 +426,10 @@ type FileConstraint struct {
 	// every known hash algorithm.
 	WholeRef blob.Ref `json:"wholeRef,omitempty"`
 
+	// ParentDir, if non-nil, constrains the file match based on properties
+	// of its parent directory.
+	ParentDir *DirConstraint `json:"parentDir,omitempty"`
+
 	// For images:
 	IsImage  bool                `json:"isImage,omitempty"`
 	EXIF     *EXIFConstraint     `json:"exif,omitempty"` // TODO: implement
@@ -402,22 +451,35 @@ type MediaTagConstraint struct {
 	Int    *IntConstraint    `json:"int,omitempty"`
 }
 
+// DirConstraint matches static directories.
 type DirConstraint struct {
 	// (All non-zero fields must match)
 
-	// TODO: implement. mostly need more things in the index.
+	FileName      *StringConstraint `json:"fileName,omitempty"`
+	BlobRefPrefix string            `json:"blobRefPrefix,omitempty"`
 
-	FileName *StringConstraint `json:"fileName,omitempty"`
+	// ParentDir, if non-nil, constrains the directory match based on properties
+	// of its parent directory.
+	ParentDir *DirConstraint `json:"parentDir,omitempty"`
 
-	TopFileSize, // not recursive
-	TopFileCount, // not recursive
-	FileSize,
-	FileCount *IntConstraint
+	// TODO: implement.
+	// FileCount *IntConstraint
+	// FileSize *IntConstraint
 
-	// TODO: these would need thought on how to index efficiently:
-	// (Also: top-only variants?)
-	// ContainsFile *FileConstraint
-	// ContainsDir  *DirConstraint
+	// TopFileCount, if non-nil, constrains the directory match with the directory's
+	// number of children (non-recursively).
+	TopFileCount *IntConstraint `json:"topFileCount,omitempty"`
+
+	// RecursiveContains, if non-nil, is like Contains, but applied to all
+	// the descendants of the directory. It is mutually exclusive with Contains.
+	RecursiveContains *Constraint `json:"recursiveContains,omitempty"`
+
+	// Contains, if non-nil, constrains the directory match to just those
+	// directories containing a file matched by Contains. Contains should have a
+	// BlobPrefix, or a *FileConstraint, or a *DirConstraint, or a *LogicalConstraint
+	// combination of the aforementioned. It is only applied to the children of the
+	// directory, in a non-recursive manner. It is mutually exclusive with RecursiveContains.
+	Contains *Constraint `json:"contains,omitempty"`
 }
 
 // An IntConstraint specifies constraints on an integer.
@@ -525,10 +587,9 @@ func (c *LocationConstraint) matchesLatLong(lat, long float64) bool {
 	}
 	if c.West < c.East {
 		return c.West <= long && long <= c.East
-	} else {
-		// boundary spanning longitude ±180°
-		return c.West <= long || long <= c.East
 	}
+	// boundary spanning longitude ±180°
+	return c.West <= long || long <= c.East
 }
 
 // A StringConstraint specifies constraints on a string.
@@ -864,17 +925,43 @@ type search struct {
 func (s *search) blobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	if c := s.h.corpus; c != nil {
 		return c.GetBlobMeta(ctx, br)
-	} else {
-		return s.h.index.GetBlobMeta(ctx, br)
 	}
+	return s.h.index.GetBlobMeta(ctx, br)
 }
 
 func (s *search) fileInfo(ctx context.Context, br blob.Ref) (camtypes.FileInfo, error) {
 	if c := s.h.corpus; c != nil {
 		return c.GetFileInfo(ctx, br)
-	} else {
-		return s.h.index.GetFileInfo(ctx, br)
 	}
+	return s.h.index.GetFileInfo(ctx, br)
+}
+
+func (s *search) dirChildren(ctx context.Context, br blob.Ref) (map[blob.Ref]struct{}, error) {
+	if c := s.h.corpus; c != nil {
+		return c.GetDirChildren(ctx, br)
+	}
+
+	ch := make(chan blob.Ref)
+	errch := make(chan error)
+	go func() {
+		errch <- s.h.index.GetDirMembers(ctx, br, ch, s.q.Limit)
+	}()
+	children := make(map[blob.Ref]struct{})
+	for child := range ch {
+		children[child] = struct{}{}
+	}
+	if err := <-errch; err != nil {
+		return nil, err
+	}
+	return children, nil
+}
+
+func (s *search) parentDirs(ctx context.Context, br blob.Ref) (map[blob.Ref]struct{}, error) {
+	c := s.h.corpus
+	if c == nil {
+		return nil, errors.New("parent directory search not supported without a corpus")
+	}
+	return c.GetParentDirs(ctx, br)
 }
 
 // optimizePlan returns an optimized version of c which will hopefully
@@ -886,21 +973,20 @@ func optimizePlan(c *Constraint) *Constraint {
 
 var debugQuerySpeed, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG_QUERY_SPEED"))
 
-func (h *Handler) Query(rawq *SearchQuery) (ret_ *SearchResult, _ error) {
+func (h *Handler) Query(ctx context.Context, rawq *SearchQuery) (ret_ *SearchResult, _ error) {
 	if debugQuerySpeed {
 		t0 := time.Now()
 		jq, _ := json.Marshal(rawq)
-		log.Printf("Start %v, Doing search %s... ", t0.Format(time.RFC3339), jq)
+		log.Printf("[search=%p] Start %v, Doing search %s... ", rawq, t0.Format(time.RFC3339), jq)
 		defer func() {
 			d := time.Since(t0)
 			if ret_ != nil {
-				log.Printf("Start %v + %v = %v results", t0.Format(time.RFC3339), d, len(ret_.Blobs))
+				log.Printf("[search=%p] Start %v + %v = %v results", rawq, t0.Format(time.RFC3339), d, len(ret_.Blobs))
 			} else {
-				log.Printf("Start %v + %v = error")
+				log.Printf("[search=%p] Start %v + %v = error", rawq, t0.Format(time.RFC3339), d)
 			}
 		}()
 	}
-	ctx := context.TODO() // TODO: set from rawq
 	exprResult, err := rawq.checkValid(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid SearchQuery: %v", err)
@@ -926,9 +1012,13 @@ func (h *Handler) Query(rawq *SearchQuery) (ret_ *SearchResult, _ error) {
 	if candSourceHook != nil {
 		candSourceHook(cands.name)
 	}
+	if debugQuerySpeed {
+		log.Printf("[search=%p] using candidate source set %q", rawq, cands.name)
+	}
 
 	wantAround, foundAround := false, false
 	if q.Around.Valid() {
+		// TODO(mpl): fail somewhere if MapSorted and wantAround at the same time.
 		wantAround = true
 	}
 	blobMatches := q.Constraint.matcher()
@@ -1114,6 +1204,82 @@ func (h *Handler) Query(rawq *SearchQuery) (ret_ *SearchResult, _ error) {
 	return s.res, nil
 }
 
+// mapCell is which cell of an NxN cell grid of a map a point is in.
+// The numbering is arbitrary but dense, starting with 0.
+type mapCell int
+
+// mapGrids contains 1 or 2 mapGrids, depending on whether the search
+// area cross the dateline.
+type mapGrids []*mapGrid
+
+func (gs mapGrids) cellOf(loc camtypes.Location) mapCell {
+	for i, g := range gs {
+		cell, ok := g.cellOf(loc)
+		if ok {
+			return cell + mapCell(i*g.dim*g.dim)
+		}
+	}
+	return 0 // shouldn't happen, unless loc is malformed, in which case this is fine.
+}
+
+func newMapGrids(area camtypes.LocationBounds, dim int) mapGrids {
+	if !area.SpansDateLine() {
+		return mapGrids{newMapGrid(area, dim)}
+	}
+	return mapGrids{
+		newMapGrid(camtypes.LocationBounds{
+			North: area.North,
+			South: area.South,
+			West:  area.West,
+			East:  180,
+		}, dim),
+		newMapGrid(camtypes.LocationBounds{
+			North: area.North,
+			South: area.South,
+			West:  -180,
+			East:  area.East,
+		}, dim),
+	}
+}
+
+type mapGrid struct {
+	dim        int // grid is dim*dim cells
+	area       camtypes.LocationBounds
+	cellWidth  float64
+	cellHeight float64
+}
+
+// newMapGrid returns a grid matcher over an area. The area must not
+// span the date line. The mapGrid maps locations to a grid of (dim *
+// dim) cells.
+func newMapGrid(area camtypes.LocationBounds, dim int) *mapGrid {
+	if area.SpansDateLine() {
+		panic("invalid use of newMapGrid: must be called with bounds not overlapping date line")
+	}
+	return &mapGrid{
+		dim:        dim,
+		area:       area,
+		cellWidth:  area.Width() / float64(dim),
+		cellHeight: (area.North - area.South) / float64(dim),
+	}
+}
+
+func (g *mapGrid) cellOf(loc camtypes.Location) (c mapCell, ok bool) {
+	if loc.Latitude > g.area.North || loc.Latitude < g.area.South ||
+		loc.Longitude < g.area.West || loc.Longitude > g.area.East {
+		return
+	}
+	x := int((loc.Longitude - g.area.West) / g.cellWidth)
+	y := int((g.area.North - loc.Latitude) / g.cellHeight)
+	if x >= g.dim {
+		x = g.dim - 1
+	}
+	if y >= g.dim {
+		y = g.dim - 1
+	}
+	return mapCell(y*g.dim + x), true
+}
+
 // bestByLocation conditionally modifies res.Blobs if the number of blobs
 // is greater than limit. If so, it modifies res.Blobs so only `limit`
 // blobs remain, selecting those such that the results are evenly spread
@@ -1140,87 +1306,52 @@ func bestByLocation(res *SearchResult, locm map[blob.Ref]camtypes.Location, limi
 		// No even one result node with a location was found.
 		return
 	}
-	area := res.LocationArea
-	// divide location area in a grid of ~limit cells, such as each cell is of the
-	// same proportion as the location area, i.e. equal number of lines and columns.
-	grid := make(map[camtypes.LocationBounds][]blob.Ref)
-	areaHeight := area.North - area.South
-	areaWidth := area.East - area.West
-	if area.West >= area.East {
-		// area is spanning over the antimeridian
-		areaWidth += 360
-	}
-	nbLines := math.Sqrt(float64(limit))
-	cellLat := areaHeight / nbLines
-	cellLong := areaWidth / nbLines
-	latZero := area.North
-	longZero := area.West
 
-	for _, v := range res.Blobs {
-		br := v.Blob
+	// Divide location area in a grid of (dim * dim) map cells,
+	// such that (dim * dim) is approximately the given limit,
+	// then track which search results are in which cell.
+	cellOccupants := make(map[mapCell][]blob.Ref)
+	dim := int(math.Round(math.Sqrt(float64(limit))))
+	if dim < 3 {
+		dim = 3
+	} else if dim > 100 {
+		dim = 100
+	}
+	grids := newMapGrids(*res.LocationArea, dim)
+
+	resBlob := map[blob.Ref]*SearchResultBlob{}
+	for _, srb := range res.Blobs {
+		br := srb.Blob
 		loc, ok := locm[br]
 		if !ok {
 			continue
 		}
-
-		relLat := latZero - loc.Latitude
-		relLong := loc.Longitude - longZero
-		if loc.Longitude < longZero {
-			// area is spanning over the antimeridian
-			relLong += 360
+		cellKey := grids.cellOf(loc)
+		occupants := cellOccupants[cellKey]
+		if len(occupants) >= limit {
+			// no sense in filling a cell to more than our overall limit
+			continue
 		}
-		line := int(relLat / cellLat)
-		col := int(relLong / cellLong)
-		cellKey := camtypes.LocationBounds{
-			North: latZero - float64(line)*cellLat,
-			West:  camtypes.Longitude(longZero + float64(col)*cellLong).WrapTo180(),
-			South: latZero - float64(line+1)*cellLat,
-			East:  camtypes.Longitude(longZero + float64(col+1)*cellLong).WrapTo180(),
-		}
-
-		var brs []blob.Ref
-		cell, ok := grid[cellKey]
-		if !ok {
-			// cell does not exist yet.
-			brs = []blob.Ref{br}
-		} else {
-			if len(cell) >= limit {
-				// no sense in filling a cell to more than our overall limit
-				continue
-			}
-			brs = append(cell, br)
-		}
-		grid[cellKey] = brs
+		cellOccupants[cellKey] = append(occupants, br)
+		resBlob[br] = srb
 	}
 
-	maxNodesPerCell := limit / len(grid)
-	if len(grid) > limit {
-		maxNodesPerCell = 1
-	}
 	var nodesKept []*SearchResultBlob
-	for _, v := range grid {
-		var brs []blob.Ref
-		if len(v) <= maxNodesPerCell {
-			brs = v
-		} else {
-			// TODO(mpl): remove the nodes that are the most clustered within a cell. For
-			// now simply do first found first picked, for each cell.
-			brs = v[:maxNodesPerCell]
+	for {
+		for cellKey, occupants := range cellOccupants {
+			nodesKept = append(nodesKept, resBlob[occupants[0]])
+			if len(nodesKept) == limit {
+				res.Blobs = nodesKept
+				return
+			}
+			if len(occupants) == 1 {
+				delete(cellOccupants, cellKey)
+			} else {
+				cellOccupants[cellKey] = occupants[1:]
+			}
 		}
-		for _, br := range brs {
-			// TODO(mpl): if grid was instead a
-			// map[camtypes.LocationBounds][]*SearchResultBlob from the start, then here we
-			// could instead do nodesKept = append(nodesKept, brs...), but I'm not sure that's a win?
-			nodesKept = append(nodesKept, &SearchResultBlob{
-				Blob: br,
-			})
-		}
+
 	}
-	res.Blobs = nodesKept
-	// TODO(mpl): we do not trim the described blobs, because some of the described
-	// are children of the kept blobs, and we wouldn't know whether to remove them or
-	// not. If we do care about the size of res.Describe, I suppose we should reissue a
-	// describe query on nodesKept.
 }
 
 // setResultContinue sets res.Continue if q is suitable for having a continue token.
@@ -1302,7 +1433,23 @@ func (q *SearchQuery) pickCandidateSource(s *search) (src candidateSource) {
 				return
 			default:
 				src.sorted = false
+				if typs := c.matchesPermanodeTypes(); len(typs) != 0 {
+					src.name = "corpus_permanode_types"
+					src.send = func(ctx context.Context, s *search, fn func(camtypes.BlobMeta) bool) error {
+						corpus.EnumeratePermanodesByNodeTypes(fn, typs)
+						return nil
+					}
+					return
+				}
 			}
+		}
+		if br := c.matchesAtMostOneBlob(); br.Valid() {
+			src.name = "one_blob"
+			src.send = func(ctx context.Context, s *search, fn func(camtypes.BlobMeta) bool) error {
+				corpus.EnumerateSingleBlob(fn, br)
+				return nil
+			}
+			return
 		}
 		// fastpath for files
 		if c.matchesFileByWholeRef() {
@@ -1396,7 +1543,7 @@ func (c *Constraint) genMatcher() matchFn {
 	}
 	if pfx := c.BlobRefPrefix; pfx != "" {
 		addCond(func(ctx context.Context, s *search, br blob.Ref, meta camtypes.BlobMeta) (bool, error) {
-			return strings.HasPrefix(br.String(), pfx), nil
+			return br.HasPrefix(pfx), nil
 		})
 	}
 	switch ncond {
@@ -1559,7 +1706,7 @@ func (c *PermanodeConstraint) blobMatches(ctx context.Context, s *search, br blo
 			vals = dp.Attr[c.Attr]
 		} else {
 			s.ss = corpus.AppendPermanodeAttrValues(
-				s.ss[:0], br, c.Attr, c.At, s.h.owner)
+				s.ss[:0], br, c.Attr, c.At, s.h.owner.KeyID())
 			vals = s.ss
 		}
 		ok, err := c.permanodeMatchesAttrVals(ctx, s, vals)
@@ -1569,11 +1716,11 @@ func (c *PermanodeConstraint) blobMatches(ctx context.Context, s *search, br blo
 	}
 
 	if c.SkipHidden && corpus != nil {
-		defVis := corpus.PermanodeAttrValue(br, "camliDefVis", c.At, s.h.owner)
+		defVis := corpus.PermanodeAttrValue(br, "camliDefVis", c.At, s.h.owner.KeyID())
 		if defVis == "hide" {
 			return false, nil
 		}
-		nodeType := corpus.PermanodeAttrValue(br, "camliNodeType", c.At, s.h.owner)
+		nodeType := corpus.PermanodeAttrValue(br, "camliNodeType", c.At, s.h.owner.KeyID())
 		if nodeType == "foursquare.com:venue" {
 			// TODO: temporary. remove this, or change
 			// when/where (time) we show these.  But these
@@ -1612,18 +1759,22 @@ func (c *PermanodeConstraint) blobMatches(ctx context.Context, s *search, br blo
 		}
 	}
 
-	if c.Location != nil {
+	if c.Location != nil || s.q.Sort == MapSort {
 		l, err := s.h.lh.PermanodeLocation(ctx, br, c.At, s.h.owner)
-		if err != nil {
-			if err != os.ErrNotExist {
-				log.Printf("PermanodeLocation(ref %s): %v", br, err)
+		if c.Location != nil {
+			if err != nil {
+				if err != os.ErrNotExist {
+					log.Printf("PermanodeLocation(ref %s): %v", br, err)
+				}
+				return false, nil
 			}
-			return false, nil
+			if !c.Location.matchesLatLong(l.Latitude, l.Longitude) {
+				return false, nil
+			}
 		}
-		if !c.Location.matchesLatLong(l.Latitude, l.Longitude) {
-			return false, nil
+		if err == nil {
+			s.loc[br] = l
 		}
-		s.loc[br] = l
 	}
 
 	if cc := c.Continue; cc != nil {
@@ -1764,6 +1915,36 @@ func (c *FileConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref
 			return false, nil
 		}
 	}
+	if pc := c.ParentDir; pc != nil {
+		parents, err := s.parentDirs(ctx, br)
+		if err == os.ErrNotExist {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		matches := false
+		for parent, _ := range parents {
+			meta, err := s.blobMeta(ctx, parent)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return false, err
+			}
+			ok, err := pc.blobMatches(ctx, s, parent, meta)
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			return false, nil
+		}
+	}
 	corpus := s.h.corpus
 	if c.WholeRef.Valid() {
 		if corpus == nil {
@@ -1813,6 +1994,13 @@ func (c *FileConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref
 		s.loc[br] = camtypes.Location{
 			Latitude:  lat,
 			Longitude: long,
+		}
+	} else if s.q.Sort == MapSort {
+		if lat, long, found := corpus.FileLatLong(br); found {
+			s.loc[br] = camtypes.Location{
+				Latitude:  lat,
+				Longitude: long,
+			}
 		}
 	}
 	// this makes sure, in conjunction with TestQueryFileLocation, that we only
@@ -1864,16 +2052,179 @@ func (c *TimeConstraint) timeMatches(t time.Time) bool {
 }
 
 func (c *DirConstraint) checkValid() error {
+	if c == nil {
+		return nil
+	}
+	if c.Contains != nil && c.RecursiveContains != nil {
+		return errors.New("Contains and RecursiveContains in a DirConstraint are mutually exclusive")
+	}
 	return nil
+}
+
+func (c *Constraint) isFileOrDirConstraint() bool {
+	if l := c.Logical; l != nil {
+		if l.Op == "not" {
+			return l.A.isFileOrDirConstraint() // l.B is nil
+		}
+		return l.A.isFileOrDirConstraint() && l.B.isFileOrDirConstraint()
+	}
+	return c.File != nil || c.Dir != nil
+}
+
+func (c *Constraint) fileOrDirOrLogicalMatches(ctx context.Context, s *search, br blob.Ref, bm camtypes.BlobMeta) (bool, error) {
+	if cf := c.File; cf != nil {
+		return cf.blobMatches(ctx, s, br, bm)
+	}
+	if cd := c.Dir; cd != nil {
+		return cd.blobMatches(ctx, s, br, bm)
+	}
+	if l := c.Logical; l != nil {
+		return l.matcher()(ctx, s, br, bm)
+	}
+	return false, nil
 }
 
 func (c *DirConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref, bm camtypes.BlobMeta) (bool, error) {
 	if bm.CamliType != "directory" {
 		return false, nil
 	}
+	// TODO(mpl): I've added c.BlobRefPrefix, so that c.ParentDir can be directly
+	// matched against a blobRef (instead of e.g. a filename), but I could instead make
+	// ParentDir be a *Constraint, and logically enforce that it has to "be equivalent"
+	// to a ParentDir matching or a BlobRefPrefix matching. I think this here below is
+	// simpler, but not sure it's best in the long run.
+	if pfx := c.BlobRefPrefix; pfx != "" {
+		if !br.HasPrefix(pfx) {
+			return false, nil
+		}
+	}
+	fi, err := s.fileInfo(ctx, br)
+	if err == os.ErrNotExist {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if sc := c.FileName; sc != nil && !sc.stringMatches(fi.FileName) {
+		return false, nil
+	}
+	if pc := c.ParentDir; pc != nil {
+		parents, err := s.parentDirs(ctx, br)
+		if err == os.ErrNotExist {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		isMatch, err := pc.hasMatchingParent(ctx, s, parents)
+		if err != nil {
+			return false, err
+		}
+		if !isMatch {
+			return false, nil
+		}
+	}
 
-	// TODO: implement
-	panic("TODO: implement DirConstraint.blobMatches")
+	// All constraints not pertaining to children must happen above
+	// this point.
+	children, err := s.dirChildren(ctx, br)
+	if err != nil && err != os.ErrNotExist {
+		return false, err
+	}
+	if fc := c.TopFileCount; fc != nil && !fc.intMatches(int64(len(children))) {
+		return false, nil
+	}
+	cc := c.Contains
+	recursive := false
+	if cc == nil {
+		if crc := c.RecursiveContains; crc != nil {
+			recursive = true
+			// RecursiveContains implies Contains
+			cc = crc
+		}
+	}
+	// First test on the direct children
+	containsMatch := false
+	if cc != nil {
+		// Allow directly specifying the fileRef
+		if cc.BlobRefPrefix != "" {
+			containsMatch, err = c.hasMatchingChild(ctx, s, children, func(ctx context.Context, s *search, child blob.Ref, bm camtypes.BlobMeta) (bool, error) {
+				return child.HasPrefix(cc.BlobRefPrefix), nil
+			})
+		} else {
+			if !cc.isFileOrDirConstraint() {
+				return false, errors.New("[Recursive]Contains constraint should have a *FileConstraint, or a *DirConstraint, or a *LogicalConstraint combination of the aforementioned.")
+			}
+			containsMatch, err = c.hasMatchingChild(ctx, s, children, cc.fileOrDirOrLogicalMatches)
+		}
+		if err != nil {
+			return false, err
+		}
+		if !containsMatch && !recursive {
+			return false, nil
+		}
+	}
+	// Then if needed recurse on the next generation descendants.
+	if !containsMatch && recursive {
+		match, err := c.hasMatchingChild(ctx, s, children, c.blobMatches)
+		if err != nil {
+			return false, err
+		}
+		if !match {
+			return false, nil
+		}
+	}
+
+	// TODO: implement FileCount and FileSize.
+
+	return true, nil
+}
+
+// hasMatchingParent checks all parents against c and returns true as soon as one of
+// them matches, or returns false if none of them is a match.
+func (c *DirConstraint) hasMatchingParent(ctx context.Context, s *search, parents map[blob.Ref]struct{}) (bool, error) {
+	for parent := range parents {
+		meta, err := s.blobMeta(ctx, parent)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, err
+		}
+		ok, err := c.blobMatches(ctx, s, parent, meta)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// hasMatchingChild runs matcher against each child and returns true as soon as
+// there is a match, of false if none of them is a match.
+func (c *DirConstraint) hasMatchingChild(ctx context.Context, s *search, children map[blob.Ref]struct{},
+	matcher func(context.Context, *search, blob.Ref, camtypes.BlobMeta) (bool, error)) (bool, error) {
+	// TODO(mpl): See if we're guaranteed to be CPU-bound (i.e. all resources are in
+	// corpus), and if not, add some concurrency to spread costly index lookups.
+	for child, _ := range children {
+		meta, err := s.blobMeta(ctx, child)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, err
+		}
+		ok, err := matcher(ctx, s, child, meta)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type sortSearchResultBlobs struct {

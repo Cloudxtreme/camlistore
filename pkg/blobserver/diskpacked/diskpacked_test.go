@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,23 +18,28 @@ package diskpacked
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"expvar"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/storagetest"
-	"camlistore.org/pkg/env"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/test"
 	"go4.org/jsonconfig"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/storagetest"
+	"perkeep.org/pkg/env"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/test"
 )
+
+var ctxbg = context.Background()
 
 func newTempDiskpacked(t *testing.T) (sto blobserver.Storage, cleanup func()) {
 	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{})
@@ -93,7 +98,7 @@ func TestDoubleReceive(t *testing.T) {
 	b := &test.Blob{Contents: strings.Repeat("a", blobSize)}
 	br := b.BlobRef()
 
-	_, err := blobserver.Receive(sto, br, b.Reader())
+	_, err := blobserver.Receive(ctxbg, sto, br, b.Reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +107,7 @@ func TestDoubleReceive(t *testing.T) {
 	}
 	sto.(*storage).nextPack()
 
-	_, err = blobserver.Receive(sto, br, b.Reader())
+	_, err = blobserver.Receive(ctxbg, sto, br, b.Reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,19 +115,10 @@ func TestDoubleReceive(t *testing.T) {
 	if sizePostDup >= blobSize {
 		t.Fatalf("size(pack1) = %d; appeared to double-write.", sizePostDup)
 	}
-
-	os.Remove(sto.(*storage).filename(0))
-	_, err = blobserver.Receive(sto, br, b.Reader())
-	if err != nil {
-		t.Fatal(err)
-	}
-	sizePostDelete := size(1)
-	if sizePostDelete < blobSize {
-		t.Fatalf("after packfile delete + reupload, not big enough. want size of a blob")
-	}
 }
 
 func TestDelete(t *testing.T) {
+	ctx := context.Background()
 	sto, cleanup := newTempDiskpacked(t)
 	defer cleanup()
 
@@ -136,7 +132,7 @@ func TestDelete(t *testing.T) {
 
 	stepAdd := func(tb *test.Blob) step { // add the blob
 		return func() error {
-			sb, err := sto.ReceiveBlob(tb.BlobRef(), tb.Reader())
+			sb, err := sto.ReceiveBlob(ctxbg, tb.BlobRef(), tb.Reader())
 			if err != nil {
 				return fmt.Errorf("ReceiveBlob of %s: %v", sb, err)
 			}
@@ -162,7 +158,7 @@ func TestDelete(t *testing.T) {
 
 	stepDelete := func(tb *test.Blob) step {
 		return func() error {
-			if err := sto.RemoveBlobs([]blob.Ref{tb.BlobRef()}); err != nil {
+			if err := sto.RemoveBlobs(ctx, []blob.Ref{tb.BlobRef()}); err != nil {
 				return fmt.Errorf("RemoveBlob(%s): %v", tb.BlobRef(), err)
 			}
 			return nil
@@ -170,7 +166,7 @@ func TestDelete(t *testing.T) {
 	}
 
 	var deleteTests = [][]step{
-		[]step{
+		{
 			stepAdd(A),
 			stepDelete(A),
 			stepCheck(),
@@ -186,7 +182,7 @@ func TestDelete(t *testing.T) {
 			stepDelete(C),
 			stepCheck(),
 		},
-		[]step{
+		{
 			stepAdd(A),
 			stepAdd(B),
 			stepAdd(C),
@@ -204,7 +200,7 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-var dummyErr = errors.New("dummy fail")
+var errDummy = errors.New("dummy fail")
 
 func TestDoubleReceiveFailingIndex(t *testing.T) {
 	sto, cleanup := newTempDiskpacked(t)
@@ -225,9 +221,9 @@ func TestDoubleReceiveFailingIndex(t *testing.T) {
 	b := &test.Blob{Contents: strings.Repeat("a", blobSize)}
 	br := b.BlobRef()
 
-	_, err := blobserver.Receive(sto, br, b.Reader())
+	_, err := blobserver.Receive(ctxbg, sto, br, b.Reader())
 	if err != nil {
-		if err != dummyErr {
+		if err != errDummy {
 			t.Fatal(err)
 		}
 		t.Logf("dummy fail")
@@ -236,7 +232,7 @@ func TestDoubleReceiveFailingIndex(t *testing.T) {
 		t.Fatalf("size = %d; want zero (at most %d)", size(0), blobSize-1)
 	}
 
-	_, err = blobserver.Receive(sto, br, b.Reader())
+	_, err = blobserver.Receive(ctxbg, sto, br, b.Reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +249,7 @@ type failingIndex struct {
 func (idx *failingIndex) Set(key string, value string) error {
 	idx.setCount++
 	if idx.setCount == 1 { // fail the first time
-		return dummyErr
+		return errDummy
 	}
 	return idx.KeyValue.Set(key, value)
 }
@@ -322,7 +318,7 @@ func TestClose(t *testing.T) {
 	br := b.BlobRef()
 
 	fd2 := fds()
-	_, err := blobserver.Receive(sto, br, b.Reader())
+	_, err := blobserver.Receive(ctxbg, sto, br, b.Reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,10 +328,41 @@ func TestClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	fd4 := fds()
-	got := fmt.Sprintf("%v %v %v %v %v", fd0, fd1, fd2, fd3, fd4)
-	want := "0 2 2 2 0"
+	got := [...]int{fd1 - fd0, fd2 - fd1, fd3 - fd2, fd4 - fd3}
+	want := [...]int{+2, 0, 0, -2}
 	if got != want {
-		t.Errorf("fd count over time = %q; want %q", got, want)
+		t.Errorf("fd count over time = %v; want %v", got, want)
 	}
 
+}
+
+func TestBadDir(t *testing.T) {
+	s, err := newStorage("hopefully this is a not existing directory", 1<<20, jsonconfig.Obj{"type": "memory"})
+	if err == nil {
+		s.Close()
+		t.Errorf("expected error for non-existing directory")
+	}
+}
+
+func TestWriteError(t *testing.T) {
+	dir, err := ioutil.TempDir("", "diskpacked-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !env.IsDebug() {
+		defer os.RemoveAll(dir)
+	}
+	t.Logf("diskpacked test dir is %q", dir)
+	fn := filepath.Join(dir, "pack-00000.blobs")
+	if err := os.Symlink("/non existing file", fn); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping symlink test on Windows")
+		}
+		t.Fatal(err)
+	}
+	s, err := newStorage(dir, 1, jsonconfig.Obj{"type": "memory"})
+	if err == nil {
+		s.Close()
+		t.Fatal("expected error for non-existing directory")
+	}
 }

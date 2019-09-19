@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,21 +18,29 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/osutil"
-	. "camlistore.org/pkg/test/asserts"
+	"perkeep.org/internal/osutil"
+	"perkeep.org/internal/testhooks"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/test"
+	. "perkeep.org/pkg/test/asserts"
 )
 
-const kExpectedHeader = `{"camliVersion"`
+const expectedHeader = `{"camliVersion"`
+
+func init() {
+	testhooks.SetUseSHA1(true)
+}
 
 func TestJSON(t *testing.T) {
 	fileName := "schema_test.go"
@@ -45,7 +53,7 @@ func TestJSON(t *testing.T) {
 	t.Logf("Got json: [%s]\n", json)
 	// TODO: test it parses back
 
-	if !strings.HasPrefix(json, kExpectedHeader) {
+	if !strings.HasPrefix(json, expectedHeader) {
 		t.Errorf("JSON does't start with expected header.")
 	}
 
@@ -72,6 +80,9 @@ func TestSymlink(t *testing.T) {
 
 	symFile := filepath.Join(td, "test-symlink")
 	if err := os.Symlink("test-target", symFile); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping symlink test on Windows")
+		}
 		t.Fatal(err)
 	}
 
@@ -489,7 +500,7 @@ func TestShareExpiration(t *testing.T) {
 	}
 }
 
-// camlistore.org/issue/305
+// perkeep.org/issue/305
 func TestIssue305(t *testing.T) {
 	var in = `{"camliVersion": 1,
   "camliType": "file",
@@ -505,7 +516,7 @@ func TestIssue305(t *testing.T) {
 	if err := json.NewDecoder(strings.NewReader(in)).Decode(&ss); err != nil {
 		t.Fatal(err)
 	}
-	inref := blob.SHA1FromString(in)
+	inref := blob.RefFromString(in)
 	blob, err := BlobFromReader(inref, strings.NewReader(in))
 	if err != nil {
 		t.Fatal(err)
@@ -569,9 +580,15 @@ func TestStaticFileAndStaticSymlink(t *testing.T) {
 	target := "bar"
 	src := filepath.Join(dir, "foo")
 	err = os.Symlink(target, src)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping symlink test on Windows")
+		}
+		t.Fatal(err)
+	}
 	fi, err = os.Lstat(src)
 	if err != nil {
-		t.Fatalf("os.Lstat():  %v", err)
+		t.Fatalf("os.Lstat(): %v", err)
 	}
 
 	bb = NewCommonFileMap(src, fi)
@@ -700,6 +717,97 @@ func TestTimezoneEXIFCorrection(t *testing.T) {
 		}
 		if got := tm.UTC().String(); got != tt.wantUTC {
 			t.Errorf("%s: utc time = %q; want %q", tt.file, got, tt.wantUTC)
+		}
+	}
+}
+
+func TestLargeDirs(t *testing.T) {
+	oldMaxStaticSetMembers := maxStaticSetMembers
+	maxStaticSetMembers = 10
+	defer func() {
+		maxStaticSetMembers = oldMaxStaticSetMembers
+	}()
+
+	// small directory, no splitting needed.
+	testLargeDir(t, []blob.Ref{
+		(&test.Blob{"AAAAAaaaaa"}).BlobRef(),
+		(&test.Blob{"BBBBBbbbbb"}).BlobRef(),
+		(&test.Blob{"CCCCCccccc"}).BlobRef(),
+	})
+
+	// large (over maxStaticSetMembers) directory. splitting, but no recursion needed.
+	var members []blob.Ref
+	for i := 0; i < maxStaticSetMembers+3; i++ {
+		members = append(members, (&test.Blob{fmt.Sprintf("%2d", i)}).BlobRef())
+	}
+	testLargeDir(t, members)
+
+	// very large (over maxStaticSetMembers^2) directory. splitting with recursion.
+	members = nil
+	for i := 0; i < maxStaticSetMembers*maxStaticSetMembers+3; i++ {
+		members = append(members, (&test.Blob{fmt.Sprintf("%3d", i)}).BlobRef())
+	}
+	testLargeDir(t, members)
+}
+
+func testLargeDir(t *testing.T, members []blob.Ref) {
+	ssb := NewStaticSet()
+	subsets := ssb.SetStaticSetMembers(members)
+
+	refToBlob := make(map[string]*Blob, len(subsets))
+	for _, v := range subsets {
+		refToBlob[v.BlobRef().String()] = v
+	}
+
+	var findMember func(blob.Ref, []blob.Ref) bool
+	findMember = func(member blob.Ref, entries []blob.Ref) bool {
+		for _, v := range entries {
+			if member == v {
+				return true
+			}
+			subsetBlob, ok := refToBlob[v.String()]
+			if !ok {
+				continue
+			}
+			children := subsetBlob.StaticSetMembers()
+			if len(children) == 0 {
+				children = subsetBlob.StaticSetMergeSets()
+			}
+			if findMember(member, children) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var membersOrSubsets []string
+	if ssb.m["members"] != nil && len(ssb.m["members"].([]string)) > 0 {
+		membersOrSubsets = ssb.m["members"].([]string)
+	} else {
+		membersOrSubsets = ssb.m["mergeSets"].([]string)
+	}
+	for _, mb := range members {
+		var found bool
+		for _, v := range membersOrSubsets {
+			if mb.String() == v {
+				found = true
+				break
+			}
+			subsetBlob, ok := refToBlob[v]
+			if !ok {
+				continue
+			}
+			children := subsetBlob.StaticSetMembers()
+			if len(children) == 0 {
+				children = subsetBlob.StaticSetMergeSets()
+			}
+			if findMember(mb, children) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("member %q not found while following the subset schemas", mb)
 		}
 	}
 }

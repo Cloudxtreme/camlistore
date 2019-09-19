@@ -1,12 +1,12 @@
 # Configuring the server
 
-The server's config file at $HOME/.config/camlistore/server-config.json is
+The server's config file at $HOME/.config/perkeep/server-config.json is
 JSON. It can either be in [simple mode](#simplemode) (for basic configurations), or in
 [low-level mode](#lowlevel) (for any sort of crazy configuration).
 
 # Configuration Keys & Values {#simplemode}
 
-**Note,** if you can't find what you're looking for here, check the API docs: [/pkg/types/serverconfig](https://camlistore.org/pkg/types/serverconfig/).
+**Note,** if you can't find what you're looking for here, check the API docs: [/pkg/types/serverconfig](https://perkeep.org/pkg/types/serverconfig/).
 
 * `auth`: the authentication mechanism to use. Example values include:
 
@@ -23,7 +23,7 @@ JSON. It can either be in [simple mode](#simplemode) (for basic configurations),
     operations (upload new things, but not access anything).
 
 * `baseURL`: Optional. If non-empty, this is the root of your URL prefix for
-  your Camlistore server. Useful for when running behind a reverse proxy.
+  your Perkeep server. Useful for when running behind a reverse proxy.
   Should not end in a slash. e.g. `https://yourserver.example.com`
 
 * `https`: if "true", HTTPS is used.
@@ -36,12 +36,12 @@ JSON. It can either be in [simple mode](#simplemode) (for basic configurations),
     [Let's Encrypt](https://letsencrypt.org) is requested automatically if the
     following conditions apply:
      * A fully qualified domain name is specified in either `baseURL` or `listen`.
-     * Camlistore listens on port `443` in order to answer the TLS-SNI challenge
+     * Perkeep listens on port `443` in order to answer the TLS-SNI challenge
        from Let's Encrypt.
   * As a fallback, if no FQDN is found, a self-signed certificate is generated.
 
 * `camliNetIP`: the optional internet-facing IP address for this
-  Camlistore instance. If set, a name in the camlistore.net domain for
+  Perkeep instance. If set, a name in the camlistore.net domain for
   that IP address will be requested on startup. The obtained domain name
   will then be used as the host name in the base URL.
   For now, the protocol to get the name requires receiving a challenge
@@ -80,8 +80,8 @@ JSON. It can either be in [simple mode](#simplemode) (for basic configurations),
   may be unsupported in the future. Keeping this set to "true" is recommended.
 
 * `sourceRoot`: Optional. If non-empty, it specifies the path to an alternative
-  Camlistore source tree, in order to override the embedded UI and/or Closure
-  resources. The UI files will be expected in `<sourceRoot>/server/camlistored/ui`
+  Perkeep source tree, in order to override the embedded UI and/or Closure
+  resources. The UI files will be expected in `<sourceRoot>/server/perkeepd/ui`
   and the Closure library in `<sourceRoot>/third_party/closure/lib`.
 
 
@@ -92,22 +92,29 @@ At least one of these must be set:
 * `memoryStorage`: if true, blobs will be stored in memory only. This is
   generally only useful for debugging & development.
 * `blobPath`: local disk path to store blobs. (valid for diskpacked too).
-* `s3`: "`key:secret:bucket[/optional/dir]`" or "`key:secret:bucket[/optional/dir]:hostname`" (with colons,
-  but no quotes).
+* `s3`: "`key:secret:bucket[/optional/dir]`" or
+  "`key:secret:bucket[/optional/dir]:hostname`" (with colons, but no quotes).
 * `b2`: "`account_id:application_key:bucket[/optional/dir]`".
 * `googlecloudstorage`: "`clientId:clientSecret:refreshToken:bucketName[/optional/dir]`"
+
+The `s3` storage option's `hostname` value may be set to use an S3-compatible
+endpoint instead of AWS S3, such as `my-minio-server.example.com`. A specific
+region may be specified by using [Low-level Configuration](#lowlevel), though
+the bucket's region will generally be detected automatically.
 
 Additionally, there are two mutually exclusive options which only apply if `blobPath` is set:
 
 * `packRelated`: if true, blobs are automatically repacked for fast read access.
-* `packBlobs`: if true, diskpacked is used instead of the default filestorage.
+* `packBlobs`: if true, diskpacked is used instead of the default
+  filestorage. This gives better write throughput, at the cost of slower
+  read access.
 
 For now, if more than one storage option is set, one of them is the primary
 storage and the other ones are set up as mirrors. The precedence order is the
 same as the order they are listed above.
 
 Others aren't yet supported by the simple config mode. Patches to
-[pkg/serverinit](https://camlistore.org/pkg/serverinit/genconfig.go) welcome.
+[pkg/serverinit](https://perkeep.org/pkg/serverinit/genconfig.go) welcome.
 
 Examples for [configuring storage backends](/doc/storage-examples.md)
 
@@ -123,36 +130,68 @@ Unless `runIndex` is set to `false`, exactly one of these must be set:
 * `postgres`: user@host:password
 * `memoryIndex`: if true, a memory-only indexer is used.
 
-Additionally, mongo, mysql, and postgres require the `dbname` value set.
-Initialize your database with [camtool dbinit](/cmd/camtool/).
+## Database-related options {#database}
 
-There's also an in-memory index type, but only in the low-level config, as used
-by `devcam server`.
+* `dbname`: optional name of the index database if MySQL, PostgreSQL, or MongoDB,
+  is used. If empty, dbUnique is used as part of the database name.
+* `dbUnique`: optionally provides a unique value to differentiate databases on a
+  DBMS shared by multiple Perkeep instances. It should not contain spaces or
+  punctuation. If empty, identity is used instead. If the latter is absent, the
+  current username (provided by the operating system) is used instead. For the
+  index database, dbname takes priority.
 
+When using [MariaDB](https://downloads.mariadb.org/)
+or [MySQL](https://dev.mysql.com/downloads/), the user will need to be able to
+create a schema in addition to the default schema. You will need `grant create,
+insert, update, delete, alter, show databases on *.*` permissions for your
+database user.
+
+You can use the [pk dbinit](/cmd/pk/) command to initialize your
+database, and see [dbinit.go](/cmd/pk/dbinit.go) and
+[dbschema.go](/pkg/sorted/mysql/dbschema.go) if you're curious about the
+details.
 
 ## Publishing options {#publishing}
 
-Camlistore uses Go html templates to publish pages, and publishing can be
+Perkeep uses Go html templates to publish pages, and publishing can be
 configured through the `publish` key. There is already support for an image
 gallery view, which can be enabled similarly to the example below (obviously,
-the rootPermanode will be different).
+the camliRoot will be different).
 
     "publish": {
       "/pics/": {
         "camliRoot": "mypics",
-        "backendURL": "http://localhost:3178/",
-        "cacheRoot": "/home/joe/var/camlistore/blobs/cache",
+        "cacheRoot": "/home/joe/var/perkeep/blobs/cache",
         "goTemplate": "gallery.html"
       }
     }
 
 See the
-[serverconfig.Publish](https://camlistore.org/pkg/types/serverconfig/#Publish)
+[serverconfig.Publish](https://perkeep.org/pkg/types/serverconfig/#Publish)
 type for all the configuration parameters.
 
-One can create any permanode with camput or the UI, and set its camliRoot
+One can create any permanode with **pk-put** or the web UI, and set its camliRoot
 attribute to the value set in the config, to use it as the root permanode for
 publishing.
+
+One common use-case is for Perkeep (and the publisher app) to run behind a
+reverse-proxy (such as Nginx), which takes care of the TLS termination, and
+where therefore it might be acceptable for both perkeepd and publisher to listen
+for non-TLS HTTP connections. In that case, the app handler configuration
+parameters should be specified, such as in the example below. In addition,
+please note that the reverse-proxy should not modify the Host header of the
+incoming requests.
+
+    "publish": {
+        "/pics/": {
+            "camliRoot": "mypics",
+            "cacheRoot": "/home/joe/var/perkeep/blobs/cache",
+            "goTemplate": "gallery.html",
+            "apiHost": "http://localhost:3179/",
+            "listen": ":44352",
+            "backendURL": "http://localhost:44352/"
+        }
+    },
 
 Please see the [publishing README](/doc/publishing/README) for further details
 on how to set up permanodes for publishing, or if you want to
@@ -161,7 +200,7 @@ make/contribute more publishing views.
 
 ## Importers
 
-Camlistore has several built-in importers, including:
+Perkeep has several built-in importers, including:
 
  * Feeds (RSS, Atom, and RDF)
  * Flickr
@@ -169,6 +208,7 @@ Camlistore has several built-in importers, including:
  * Picasa
  * Pinboard
  * Twitter
+ * Instapaper
 
 These can be setup by visiting the "`/importer/`" URL prefix path, e.g. `http://localhost:3179/importer/`
 
@@ -184,63 +224,35 @@ The following steps should get you started with MySQL:
   or [MySQL](http://dev.mysql.com/downloads/windows/installer/) (the latter
   requires .NET).
 * Edit your server configuration file (if it does not exit yet, running
-  **camlistored** will automatically create it):
+  **perkeepd** will automatically create it):
   * Remove the <b>sqlite</b> option.
   * Add a <b>dbname</b> option. (ex: "dbname": "camliprod")
   * Add a <b>mysql</b> option. (ex: "mysql": "foo@localhost:bar")
 * Create a dedicated user/password for your mysql server.
-* Initialize the database with **camtool**: `camtool dbinit --user=foo
+* Initialize the database with **pk**: `pk dbinit --user=foo
   --password=bar --host=localhost --dbname=camliprod --wipe`
 
 Setting up MongoDB is even simpler, but the MongoDB indexer is not as well
 tested as the MySQL one.
 
 
-## App Engine {#appengine}
-
-Most configuration doesn't apply on App Engine as it's pre-configured
-to use the App Engine Blobstore and Datastore, as well as App Engine's
-user auth mechanisms. But as of 2013-06-12 we don't yet recommend running
-on App Engine; there are still some sharp corners.
-
-The UI requires some static resources that are not included by default in the
-App Engine application directory (`server/appengine/`). You can define that
-directory in the server configuration file (`server/appengine/config.json`),
-with the `sourceRoot` parameter, like so:
-
-      "/ui/": {
-        "handler": "ui",
-        "handlerArgs": {
-          "sourceRoot": "dir_name",
-          "jsonSignRoot": "/sighelper/"
-        }
-      },
-
-You will then have to populate that directory with all the necessary resources
-(UI static files and closure library files).
-
-Alternatively, you can run `devcam appengine` once, which will create and
-populate the default directory (`server/appengine/source_root`). Please see the
-[CONTRIBUTING](https://camlistore.googlesource.com/camlistore/+/master/CONTRIBUTING.md)
-doc to build devcam.
-
 # Low-level configuration {#lowlevel}
 
-You can specify a low-level configuration file to camlistored with the same
+You can specify a low-level configuration file to perkeepd with the same
 `-configfile` option that is used to specify the simple mode configuration file.
-Camlistore tests for the presence of the `"handlerConfig": true` key/value
+Perkeep tests for the presence of the `"handlerConfig": true` key/value
 pair to determine whether the configuration should be considered low-level.
 
 As the low-level configuration needs to be much more detailed and precise, it is
 not advised to write one from scratch. Therefore, the easiest way to get started
-is to first run Camlistore with a simple configuration (or none, as one will be
+is to first run Perkeep with a simple configuration (or none, as one will be
 automatically generated), and to download the equivalent low-level configuration
-that can be found at /debug/config on your Camlistore instance.
+that can be found at /debug/config on your Perkeep instance.
 
 In the following are examples of features that can only be achieved through
 low-level configuration, for now.
 
-## Replication to another Camlistore instance {#replication}
+## Replication to another Perkeep instance {#replication}
 
 If `"/bs"` is the storage for your primary instance, such as for example:
 
@@ -249,7 +261,7 @@ If `"/bs"` is the storage for your primary instance, such as for example:
             "handlerArgs": {
                 "largeBlobs": "/bs-packed/",
                 "metaIndex": {
-                    "file": "/home/you/var/camlistore/blobs/packed/packindex.leveldb",
+                    "file": "/home/you/var/perkeep/blobs/packed/packindex.leveldb",
                     "type": "leveldb"
                 },
                 "smallBlobs": "/bs-loose/"
@@ -269,7 +281,7 @@ prefix `"/bsrepl/"`, which can be defined as:
             }
         },
 
-where `"/r1/"` is the blobserver for your other Camlistore instance, such as:
+where `"/r1/"` is the blobserver for your other Perkeep instance, such as:
 
 		"/r1/": {
 			"handler": "storage-remote",

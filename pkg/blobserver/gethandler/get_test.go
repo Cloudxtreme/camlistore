@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package gethandler
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"io/ioutil"
@@ -27,7 +28,7 @@ import (
 	"strings"
 	"testing"
 
-	"camlistore.org/pkg/blob"
+	"perkeep.org/pkg/blob"
 )
 
 func TestBlobFromURLPath(t *testing.T) {
@@ -121,7 +122,7 @@ type fetcher struct {
 	size int64
 }
 
-func (f fetcher) Fetch(br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
+func (f fetcher) Fetch(ctx context.Context, br blob.Ref) (rc io.ReadCloser, size uint32, err error) {
 	if f.r == nil {
 		if f.size < 0 {
 			return nil, 0, errors.New("some other error type")

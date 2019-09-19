@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package flickr implements an importer for flickr.com accounts.
-package flickr // import "camlistore.org/pkg/importer/flickr"
+package flickr // import "perkeep.org/pkg/importer/flickr"
 
 import (
 	"bytes"
@@ -28,10 +28,10 @@ import (
 	"strconv"
 	"time"
 
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/importer"
-	"camlistore.org/pkg/schema"
-	"camlistore.org/pkg/schema/nodeattr"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/importer"
+	"perkeep.org/pkg/schema"
+	"perkeep.org/pkg/schema/nodeattr"
 
 	"github.com/garyburd/go-oauth/oauth"
 
@@ -67,9 +67,14 @@ type imp struct {
 	importer.OAuth1 // for CallbackRequestAccount and CallbackURLParameters
 }
 
-func (imp) NeedsAPIKey() bool { return true }
-
-func (imp) SupportsIncremental() bool { return false }
+func (imp) Properties() importer.Properties {
+	return importer.Properties{
+		Title:               "Flickr",
+		Description:         "import your photos from Flickr.com",
+		SupportsIncremental: false,
+		NeedsAPIKey:         true,
+	}
+}
 
 func (imp) IsAccountReady(acctNode *importer.Object) (ok bool, err error) {
 	return acctNode.Attr(importer.AcctAttrUserName) != "" && acctNode.Attr(importer.AcctAttrAccessToken) != "", nil
@@ -124,7 +129,7 @@ func (imp) Run(ctx *importer.RunContext) error {
 	}
 	userID := ctx.AccountNode().Attr(importer.AcctAttrUserID)
 	if userID == "" {
-		return errors.New("UserID hasn't been set by account setup.")
+		return errors.New("userID hasn't been set by account setup")
 	}
 	r := &run{
 		userID:     userID,
@@ -258,9 +263,8 @@ func (r *run) importPhotoset(parent *importer.Object, photoset *photosetInfo, pa
 
 	if resp.Photoset.Page < resp.Photoset.Pages {
 		return page + 1, nil
-	} else {
-		return 0, nil
 	}
+	return 0, nil
 }
 
 type photosSearch struct {
@@ -356,9 +360,8 @@ func (r *run) importPhotosPage(page int) (int, error) {
 
 	if resp.Photos.Pages > resp.Photos.Page {
 		return page + 1, nil
-	} else {
-		return 0, nil
 	}
+	return 0, nil
 }
 
 // TODO(aa):
@@ -429,7 +432,7 @@ func (r *run) importPhoto(parent *importer.Object, photo *photosSearchItem) erro
 	}
 	defer res.Body.Close()
 
-	fileRef, err := schema.WriteFileFromReader(r.Host.Target(), filename, res.Body)
+	fileRef, err := schema.WriteFileFromReader(r.Context(), r.Host.Target(), filename, res.Body)
 	if err != nil {
 		return err
 	}
@@ -496,7 +499,7 @@ func (r *run) flickrAPIRequest(result interface{}, method string, keyval ...stri
 	return importer.OAuthContext{
 		r.Context(),
 		r.oauthClient,
-		r.accessCreds}.PopulateJSONFromURL(result, apiURL, keyval...)
+		r.accessCreds}.PopulateJSONFromURL(result, http.MethodGet, apiURL, keyval...)
 }
 
 func (r *run) fetch(url string, form url.Values) (*http.Response, error) {

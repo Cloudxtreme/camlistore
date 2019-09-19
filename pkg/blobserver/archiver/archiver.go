@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Camlistore Authors
+Copyright 2014 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,17 +18,17 @@ limitations under the License.
 // and stores them somewhere. While generic, it was designed to
 // incrementally create Amazon Glacier archives from many little
 // blobs, rather than creating millions of Glacier archives.
-package archiver // import "camlistore.org/pkg/blobserver/archiver"
+package archiver // import "perkeep.org/pkg/blobserver/archiver"
 
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 )
 
 // DefaultMinZipSize is the default value of Archiver.MinZipSize.
@@ -77,7 +77,7 @@ var errStopEnumerate = errors.New("sentinel return value")
 
 // RunOnce scans a.Source and conditionally creates a new zip.
 // It returns ErrSourceTooSmall if there aren't enough blobs on Source.
-func (a *Archiver) RunOnce() error {
+func (a *Archiver) RunOnce(ctx context.Context) error {
 	if a.Source == nil {
 		return errors.New("archiver: nil Source")
 	}
@@ -85,8 +85,8 @@ func (a *Archiver) RunOnce() error {
 		return errors.New("archiver: nil Store func")
 	}
 	pz := &potentialZip{a: a}
-	err := blobserver.EnumerateAll(context.TODO(), a.Source, func(sb blob.SizedRef) error {
-		if err := pz.addBlob(sb); err != nil {
+	err := blobserver.EnumerateAll(ctx, a.Source, func(sb blob.SizedRef) error {
+		if err := pz.addBlob(ctx, sb); err != nil {
 			return err
 		}
 		if pz.bigEnough() {
@@ -114,7 +114,7 @@ func (a *Archiver) RunOnce() error {
 		for _, sb := range pz.blobs {
 			blobs = append(blobs, sb.Ref)
 		}
-		if err := a.Source.RemoveBlobs(blobs); err != nil {
+		if err := a.Source.RemoveBlobs(ctx, blobs); err != nil {
 			return err
 		}
 	}
@@ -142,7 +142,7 @@ func (z *potentialZip) condClose() error {
 	return z.zw.Close()
 }
 
-func (z *potentialZip) addBlob(sb blob.SizedRef) error {
+func (z *potentialZip) addBlob(ctx context.Context, sb blob.SizedRef) error {
 	if z.bigEnough() {
 		return nil
 	}
@@ -150,19 +150,19 @@ func (z *potentialZip) addBlob(sb blob.SizedRef) error {
 	if z.zw == nil && z.sumSize > z.a.zipSize() {
 		z.zw = zip.NewWriter(&z.buf)
 		for _, sb := range z.blobs {
-			if err := z.writeZipBlob(sb); err != nil {
+			if err := z.writeZipBlob(ctx, sb); err != nil {
 				return err
 			}
 		}
 	}
 	z.blobs = append(z.blobs, sb)
 	if z.zw != nil {
-		return z.writeZipBlob(sb)
+		return z.writeZipBlob(ctx, sb)
 	}
 	return nil
 }
 
-func (z *potentialZip) writeZipBlob(sb blob.SizedRef) error {
+func (z *potentialZip) writeZipBlob(ctx context.Context, sb blob.SizedRef) error {
 	w, err := z.zw.CreateHeader(&zip.FileHeader{
 		Name:   sb.Ref.String(),
 		Method: zip.Deflate,
@@ -170,7 +170,7 @@ func (z *potentialZip) writeZipBlob(sb blob.SizedRef) error {
 	if err != nil {
 		return err
 	}
-	blobSrc, _, err := z.a.Source.Fetch(sb.Ref)
+	blobSrc, _, err := z.a.Source.Fetch(ctx, sb.Ref)
 	if err != nil {
 		return err
 	}

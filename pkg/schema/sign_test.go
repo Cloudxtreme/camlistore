@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/jsonsign"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/jsonsign"
 )
 
 func TestSigner(t *testing.T) {
@@ -38,12 +38,12 @@ func TestSigner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubRef := blob.SHA1FromString(armorPub)
+	pubRef := blob.RefFromString(armorPub)
 	sig, err := NewSigner(pubRef, strings.NewReader(armorPub), ent)
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
 	}
-	pn, err := NewUnsignedPermanode().Sign(sig)
+	pn, err := NewUnsignedPermanode().Sign(ctxbg, sig)
 	if err != nil {
 		t.Fatalf("NewPermanode: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestClaimDate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubRef := blob.SHA1FromString(armorPub)
+	pubRef := blob.RefFromString(armorPub)
 	sig, err := NewSigner(pubRef, strings.NewReader(armorPub), ent)
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
@@ -75,7 +75,7 @@ func TestClaimDate(t *testing.T) {
 		t.Fatal(err)
 	}
 	share := NewShareRef(ShareHaveRef, true).SetShareTarget(pubRef)
-	signed, err := share.SignAt(sig, sigTime)
+	signed, err := share.SignAt(ctxbg, sig, sigTime)
 	if err != nil {
 		t.Fatal(err)
 	}

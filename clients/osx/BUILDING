@@ -1,0 +1,8 @@
+1. Install Go.
+2. Install xcode.
+3. From top-level directory:
+   $ go run make.go
+   (this will create perkeepd, pk-mount, and pk-put)
+4. From this directory:
+   $ xcodebuild -target Perkeep.dmg
+   (this will create build/Release/Perkeep.app and Perkeep.dmg)

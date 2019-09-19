@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,16 +29,17 @@ Example low-level config:
      },
 
 */
-package shard // import "camlistore.org/pkg/blobserver/shard"
+package shard // import "perkeep.org/pkg/blobserver/shard"
 
 import (
+	"context"
 	"errors"
 	"io"
+	"sync"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
 	"go4.org/jsonconfig"
-	"golang.org/x/net/context"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 )
 
 type shardStorage struct {
@@ -75,15 +76,15 @@ func (sto *shardStorage) shardNum(b blob.Ref) uint32 {
 	return b.Sum32() % uint32(len(sto.shards))
 }
 
-func (sto *shardStorage) Fetch(b blob.Ref) (file io.ReadCloser, size uint32, err error) {
-	return sto.shard(b).Fetch(b)
+func (sto *shardStorage) Fetch(ctx context.Context, b blob.Ref) (file io.ReadCloser, size uint32, err error) {
+	return sto.shard(b).Fetch(ctx, b)
 }
 
-func (sto *shardStorage) ReceiveBlob(b blob.Ref, source io.Reader) (sb blob.SizedRef, err error) {
-	return sto.shard(b).ReceiveBlob(b, source)
+func (sto *shardStorage) ReceiveBlob(ctx context.Context, b blob.Ref, source io.Reader) (sb blob.SizedRef, err error) {
+	return sto.shard(b).ReceiveBlob(ctx, b, source)
 }
 
-func (sto *shardStorage) batchedShards(blobs []blob.Ref, fn func(blobserver.Storage, []blob.Ref) error) error {
+func (sto *shardStorage) batchedShards(ctx context.Context, blobs []blob.Ref, fn func(blobserver.Storage, []blob.Ref) error) error {
 	m := make(map[uint32][]blob.Ref)
 	for _, b := range blobs {
 		sn := sto.shardNum(b)
@@ -106,15 +107,40 @@ func (sto *shardStorage) batchedShards(blobs []blob.Ref, fn func(blobserver.Stor
 	return reterr
 }
 
-func (sto *shardStorage) RemoveBlobs(blobs []blob.Ref) error {
-	return sto.batchedShards(blobs, func(s blobserver.Storage, blobs []blob.Ref) error {
-		return s.RemoveBlobs(blobs)
+func (sto *shardStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
+	return sto.batchedShards(context.TODO(), blobs, func(s blobserver.Storage, blobs []blob.Ref) error {
+		return s.RemoveBlobs(ctx, blobs)
 	})
 }
 
-func (sto *shardStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) error {
-	return sto.batchedShards(blobs, func(s blobserver.Storage, blobs []blob.Ref) error {
-		return s.StatBlobs(dest, blobs)
+func (sto *shardStorage) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	var (
+		fnMu   sync.Mutex // serializes calls to fn, guards failed
+		failed bool
+	)
+	// TODO: do a context.WithCancel and abort all shards' context
+	// once one fails, but don't do that until we can guarantee
+	// that the first failure we report is the real one, not
+	// another goroutine getting its context canceled before our
+	// real first failure returns from its goroutine. That is, we
+	// should use golang.org/x/sync/errgroup, but we need to
+	// integrate it with batchedShards and audit callers. Or not
+	// use batchedShards here, or only use batchedShards to
+	// collect work to do and then use errgroup directly ourselves
+	// here.
+	return sto.batchedShards(ctx, blobs, func(s blobserver.Storage, blobs []blob.Ref) error {
+		return s.StatBlobs(ctx, blobs, func(sb blob.SizedRef) error {
+			fnMu.Lock()
+			defer fnMu.Unlock()
+			if failed {
+				return nil
+			}
+			if err := fn(sb); err != nil {
+				failed = true
+				return err
+			}
+			return nil
+		})
 	})
 }
 

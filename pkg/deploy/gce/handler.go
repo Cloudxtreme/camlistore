@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Camlistore Authors
+Copyright 2015 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package gce
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -37,17 +38,16 @@ import (
 	"sync"
 	"time"
 
-	"camlistore.org/pkg/auth"
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/blobserver"
-	"camlistore.org/pkg/blobserver/localdisk"
-	"camlistore.org/pkg/httputil"
-	"camlistore.org/pkg/sorted"
-	"camlistore.org/pkg/sorted/leveldb"
+	"perkeep.org/internal/httputil"
+	"perkeep.org/pkg/auth"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"perkeep.org/pkg/blobserver/localdisk"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/leveldb"
 
 	"cloud.google.com/go/compute/metadata"
-	"code.google.com/p/xsrftoken"
-	"golang.org/x/net/context"
+	"golang.org/x/net/xsrftoken"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
@@ -60,18 +60,19 @@ var (
 	helpZones        = "https://cloud.google.com/compute/docs/zones#available"
 
 	machineValues = []string{
+		"f1-micro",
 		"g1-small",
 		"n1-highcpu-2",
 	}
 
 	backupZones = map[string][]string{
-		"us-central1":  []string{"-a", "-b", "-f"},
-		"europe-west1": []string{"-b", "-c", "-d"},
-		"asia-east1":   []string{"-a", "-b", "-c"},
+		"us-central1":  {"-a", "-b", "-f"},
+		"europe-west1": {"-b", "-c", "-d"},
+		"asia-east1":   {"-a", "-b", "-c"},
 	}
 )
 
-// DeployHandler serves a wizard that helps with the deployment of Camlistore on Google
+// DeployHandler serves a wizard that helps with the deployment of Perkeep on Google
 // Compute Engine. It must be initialized with NewDeployHandler.
 type DeployHandler struct {
 	scheme   string                   // URL scheme for the URLs served by this handler. Defaults to "https".
@@ -211,7 +212,7 @@ func NewDeployHandler(host, prefix string) (*DeployHandler, error) {
 	var refreshCamliVersionFn func()
 	refreshCamliVersionFn = func() {
 		if err := h.refreshCamliVersion(); err != nil {
-			h.logger.Printf("error while refreshing Camlistore version: %v", err)
+			h.logger.Printf("error while refreshing Perkeep version: %v", err)
 		}
 		time.AfterFunc(time.Hour, refreshCamliVersionFn)
 	}
@@ -238,6 +239,8 @@ func (h *DeployHandler) SetScheme(scheme string) { h.scheme = scheme }
 // If we're not running on GCE (e.g. dev mode on localhost) and have
 // no other way to get the info, the error value is is errNoRefresh.
 func (h *DeployHandler) authenticatedClient() (project string, hc *http.Client, err error) {
+	var ctx = context.Background()
+
 	project = os.Getenv("CAMLI_GCE_PROJECT")
 	accountFile := os.Getenv("CAMLI_GCE_SERVICE_ACCOUNT")
 	if project != "" && accountFile != "" {
@@ -251,7 +254,7 @@ func (h *DeployHandler) authenticatedClient() (project string, hc *http.Client, 
 		if err != nil {
 			return
 		}
-		hc = jwtConf.Client(context.Background())
+		hc = jwtConf.Client(ctx)
 		return
 	}
 	if !metadata.OnGCE() {
@@ -259,7 +262,7 @@ func (h *DeployHandler) authenticatedClient() (project string, hc *http.Client, 
 		return
 	}
 	project, _ = metadata.ProjectID()
-	hc, err = google.DefaultClient(oauth2.NoContext)
+	hc, err = google.DefaultClient(ctx)
 	return project, hc, err
 }
 
@@ -291,14 +294,14 @@ func (h *DeployHandler) camliRev() string {
 	return h.camliVersion
 }
 
-var errNoRefresh error = errors.New("not on GCE, and at least one of CAMLI_GCE_PROJECT or CAMLI_GCE_SERVICE_ACCOUNT not defined.")
+var errNoRefresh error = errors.New("not on GCE, and at least one of CAMLI_GCE_PROJECT or CAMLI_GCE_SERVICE_ACCOUNT not defined")
 
 func (h *DeployHandler) refreshZones() error {
 	h.zonesMu.Lock()
 	defer h.zonesMu.Unlock()
 	defer func() {
 		h.regions = make([]string, 0, len(h.zones))
-		for r, _ := range h.zones {
+		for r := range h.zones {
 			h.regions = append(h.regions, r)
 		}
 	}()
@@ -306,7 +309,7 @@ func (h *DeployHandler) refreshZones() error {
 	if err != nil {
 		if err == errNoRefresh {
 			h.zones = backupZones
-			h.logger.Printf("Cannot refresh zones because %v. Using hard-coded ones instead.")
+			h.logger.Printf("Cannot refresh zones. Using hard-coded ones instead.")
 			return nil
 		}
 		return err
@@ -380,18 +383,19 @@ func (h *DeployHandler) serveSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	ck, err := r.Cookie("user")
 	if err != nil {
-		h.serveFormError(w, errors.New("Cookie expired, or CSRF attempt. Please reload and retry."))
+		h.serveFormError(w, errors.New("cookie expired, or CSRF attempt. Please reload and retry"))
 		h.logger.Printf("Cookie expired, or CSRF attempt on form.")
 		return
 	}
 
+	ctx := r.Context()
 	instConf, err := h.confFromForm(r)
 	if err != nil {
 		h.serveFormError(w, err)
 		return
 	}
 
-	br, err := h.storeInstanceConf(instConf)
+	br, err := h.storeInstanceConf(ctx, instConf)
 	if err != nil {
 		h.serveError(w, r, fmt.Errorf("could not store instance configuration: %v", err))
 		return
@@ -405,6 +409,8 @@ func (h *DeployHandler) serveSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	ck, err := r.Cookie("user")
 	if err != nil {
 		http.Error(w,
@@ -431,21 +437,21 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	oAuthConf := h.oAuthConfig()
-	tok, err := oAuthConf.Exchange(oauth2.NoContext, code)
+	tok, err := oAuthConf.Exchange(ctx, code)
 	if err != nil {
 		h.serveError(w, r, fmt.Errorf("could not obtain a token: %v", err))
 		return
 	}
 	h.logger.Printf("successful authorization with token: %v", tok)
 
-	instConf, err := h.instanceConf(br)
+	instConf, err := h.instanceConf(ctx, br)
 	if err != nil {
 		h.serveError(w, r, err)
 		return
 	}
 
 	depl := &Deployer{
-		Client: oAuthConf.Client(oauth2.NoContext, tok),
+		Client: oAuthConf.Client(ctx, tok),
 		Conf:   instConf,
 		Logger: h.logger,
 	}
@@ -453,7 +459,7 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 	// They've requested that we create a project for them.
 	if instConf.CreateProject {
 		// So we try to do so.
-		projectID, err := depl.CreateProject(context.TODO())
+		projectID, err := depl.CreateProject(ctx)
 		if err != nil {
 			h.logger.Printf("error creating project: %v", err)
 			// TODO(mpl): we log the errors, but none of them are
@@ -480,7 +486,7 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		inst, err := depl.Create(context.TODO())
+		inst, err := depl.Create(context.Background())
 		state := &creationState{
 			InstConf: br,
 		}
@@ -516,7 +522,7 @@ func (h *DeployHandler) serveCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		// We also try to get the "camlistore-hostname" from the
 		// instance, so we can tell the user what their hostname is. It can
-		// take a while as camlistored itself sets it after it has
+		// take a while as perkeepd itself sets it after it has
 		// registered with the camlistore.net DNS.
 		giveupTime := time.Now().Add(time.Hour)
 		pause := time.Second
@@ -580,9 +586,7 @@ func (h *DeployHandler) serveOldInstance(w http.ResponseWriter, br blob.Ref, dep
 
 func (h *DeployHandler) serveFormError(w http.ResponseWriter, err error, hints ...string) {
 	var topHints []string
-	for _, v := range hints {
-		topHints = append(topHints, v)
-	}
+	topHints = append(topHints, hints...)
 	h.logger.Print(err)
 	h.tplMu.RLock()
 	defer h.tplMu.RUnlock()
@@ -599,13 +603,14 @@ func (h *DeployHandler) serveFormError(w http.ResponseWriter, err error, hints .
 }
 
 func fileIssue(br string) string {
-	return fmt.Sprintf("Please file an issue with your instance key (%v) at https://camlistore.org/issue", br)
+	return fmt.Sprintf("Please file an issue with your instance key (%v) at https://perkeep.org/issue", br)
 }
 
 // serveInstanceState serves the state of the requested Google Cloud Engine VM creation
 // process. If the operation was successful, it serves a success page. If it failed, it
 // serves an error page. If it isn't finished yet, it replies with "running".
 func (h *DeployHandler) serveInstanceState(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != "GET" {
 		h.serveError(w, r, fmt.Errorf("Wrong method: %v", r.Method))
 		return
@@ -623,14 +628,14 @@ func (h *DeployHandler) serveInstanceState(w http.ResponseWriter, r *http.Reques
 	}
 	if state.Err != "" {
 		// No need to log that error here since we're already doing it in serveCallback
-		h.serveErrorPage(w, fmt.Errorf("An error occurred while creating your instance: %v.", state.Err))
+		h.serveErrorPage(w, fmt.Errorf("an error occurred while creating your instance: %v", state.Err))
 		return
 	}
 	if state.Success || state.Exists {
-		conf, err := h.instanceConf(state.InstConf)
+		conf, err := h.instanceConf(ctx, state.InstConf)
 		if err != nil {
 			h.logger.Printf("Could not get parameters for success message: %v", err)
-			h.serveErrorPage(w, fmt.Errorf("Your instance was created and should soon be up at https://%s but there might have been a problem in the creation process. %v", state.Err, fileIssue(br)))
+			h.serveErrorPage(w, fmt.Errorf("your instance was created and should soon be up at https://%s but there might have been a problem in the creation process. %v", state.Err, fileIssue(br)))
 			return
 		}
 		h.serveSuccess(w, &TemplateData{
@@ -672,9 +677,7 @@ func (h *DeployHandler) serveProgress(w http.ResponseWriter, instanceKey blob.Re
 
 func (h *DeployHandler) serveErrorPage(w http.ResponseWriter, err error, hints ...string) {
 	var topHints []string
-	for _, v := range hints {
-		topHints = append(topHints, v)
-	}
+	topHints = append(topHints, hints...)
 	h.logger.Print(err)
 	h.tplMu.RLock()
 	defer h.tplMu.RUnlock()
@@ -736,11 +739,24 @@ func (h *DeployHandler) confFromForm(r *http.Request) (*InstanceConf, error) {
 	} else {
 		return nil, errors.New("invalid zone or region")
 	}
+	isFreeTier, err := strconv.ParseBool(formValueOrDefault(r, "freetier", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("could not convert \"freetier\" value to bool: %v", err)
+	}
+	machine := formValueOrDefault(r, "machine", DefaultMachineType)
+	if isFreeTier {
+		if !strings.HasPrefix(zone, "us-") {
+			return nil, fmt.Errorf("The %v zone was selected, but the Google Cloud Free Tier is only available for US zones", zone)
+		}
+		if machine != "f1-micro" {
+			return nil, fmt.Errorf("The %v machine type was selected, but the Google Cloud Free Tier is only available for f1-micro", machine)
+		}
+	}
 	return &InstanceConf{
 		CreateProject: newProject,
 		Name:          formValueOrDefault(r, "name", DefaultInstanceName),
 		Project:       projectID,
-		Machine:       formValueOrDefault(r, "machine", DefaultMachineType),
+		Machine:       machine,
 		Zone:          zone,
 		Hostname:      formValueOrDefault(r, "hostname", ""),
 		Ctime:         time.Now(),
@@ -796,7 +812,7 @@ func fromState(r *http.Request) (br blob.Ref, xsrfToken string, err error) {
 	return br, string(token), nil
 }
 
-func (h *DeployHandler) storeInstanceConf(conf *InstanceConf) (blob.Ref, error) {
+func (h *DeployHandler) storeInstanceConf(ctx context.Context, conf *InstanceConf) (blob.Ref, error) {
 	contents, err := json.Marshal(conf)
 	if err != nil {
 		return blob.Ref{}, fmt.Errorf("could not json encode instance config: %v", err)
@@ -807,14 +823,14 @@ func (h *DeployHandler) storeInstanceConf(conf *InstanceConf) (blob.Ref, error) 
 		return blob.Ref{}, fmt.Errorf("could not hash blob contents: %v", err)
 	}
 	br := blob.RefFromHash(hash)
-	if _, err := blobserver.Receive(h.instConf, br, bytes.NewReader(contents)); err != nil {
+	if _, err := blobserver.Receive(ctx, h.instConf, br, bytes.NewReader(contents)); err != nil {
 		return blob.Ref{}, fmt.Errorf("could not store instance config blob: %v", err)
 	}
 	return br, nil
 }
 
-func (h *DeployHandler) instanceConf(br blob.Ref) (*InstanceConf, error) {
-	rc, _, err := h.instConf.Fetch(br)
+func (h *DeployHandler) instanceConf(ctx context.Context, br blob.Ref) (*InstanceConf, error) {
+	rc, _, err := h.instConf.Fetch(ctx, br)
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch conf at %v: %v", br, err)
 	}
@@ -896,7 +912,10 @@ func dataStores() (blobserver.Storage, sorted.KeyValue, error) {
 // input and hence can contain just any field, that is not a known field of
 // TemplateData. Which will make the execution of the template fail. We should
 // probably just somehow hardcode website/tmpl/page.html as the template.
-// See issue #815
+// Or better, probably hardcode our own version of website/tmpl/page.html,
+// because we don't want to be bound to whatever new template fields the
+// website may need that we don't (such as .Domain).
+// See issue #815, and issue #985.
 
 // AddTemplateTheme allows to enhance the aesthetics of the default template. To that
 // effect, text can provide the template definitions for "header", "banner", "toplinks", and
@@ -929,6 +948,11 @@ type TemplateData struct {
 	ZoneValues        []string
 	MachineValues     []string
 	CamliVersion      string // git revision found in https://storage.googleapis.com/camlistore-release/docker/VERSION
+
+	// Unused stuff, but needed by page.html. See TODO above,
+	// before AddTemplateTheme.
+	GoImportDomain   string
+	GoImportUpstream string
 }
 
 const toHyperlink = `<a href="$1$3">$1$3</a>`
@@ -940,7 +964,7 @@ var googURLPattern = regexp.MustCompile(`(https://([a-zA-Z0-9\-\.]+)?\.google.co
 var noTheme = `
 {{define "header"}}
 	<head>
-		<title>Camlistore on Google Cloud</title>
+		<title>Perkeep on Google Cloud</title>
 	</head>
 {{end}}
 {{define "banner"}}
@@ -1024,7 +1048,7 @@ func tplHTML() string {
 				window.document.open();
 				window.document.write(xmlhttp.responseText);
 				window.document.close();
-				history.pushState(null, 'Camlistore on Google Cloud', progressURL);
+				history.pushState(null, 'Perkeep on Google Cloud', progressURL);
 			}
 		}
 	</script>
@@ -1033,20 +1057,20 @@ func tplHTML() string {
 
 	{{define "messages"}}
 		<div class='content'>
-	<h1><a href="{{.Prefix}}">Camlistore on Google Cloud</a></h1>
+	<h1><a href="{{.Prefix}}">Perkeep on Google Cloud</a></h1>
 
 	{{if .InstanceIP}}
 		{{if .InstanceHostname}}
-			<p>Success. Your Camlistore instance is running at <a href="https://{{.InstanceHostname}}">{{.InstanceHostname}}</a>.</p>
+			<p>Success. Your Perkeep instance is running at <a href="https://{{.InstanceHostname}}">{{.InstanceHostname}}</a>.</p>
 		{{else}}
 			<!-- TODO(mpl): refresh automatically with some js when InstanceHostname is ready? -->
-			<p>Success. Your Camlistore instance is deployed at {{.InstanceIP}}. Refresh this page in a couple of minutes to know your hostname. Or go to <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a>, and look for <b>camlistore-hostname</b> (which might take a while to appear too) in the custom metadata section.</p>
+			<p>Success. Your Perkeep instance is deployed at {{.InstanceIP}}. Refresh this page in a couple of minutes to know your hostname. Or go to <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a>, and look for <b>camlistore-hostname</b> (which might take a while to appear too) in the custom metadata section.</p>
 		{{end}}
 		<p>Please save the information on this page.</p>
 
 		<h4>First connection</h4>
 		<p>
-		The password to access the web interface of your Camlistore instance was automatically generated. Go to the <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a> page to view it, and possibly change it. It is <b>camlistore-password</b> in the custom metadata section. Similarly, the username is camlistore-username. Then restart Camlistore from the /status page if you changed anything.
+		The password to access the web interface of your Perkeep instance was automatically generated. Go to the <a href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server instance</a> page to view it, and possibly change it. It is <b>camlistore-password</b> in the custom metadata section. Similarly, the username is camlistore-username. Then restart Perkeep from the /status page if you changed anything.
 		</p>
 
 		<h4>Further configuration</h4>
@@ -1055,10 +1079,10 @@ func tplHTML() string {
 		</p>
 
 		<p>
-		If you want to use your own HTTPS certificate and key, go to <a href="https://console.developers.google.com/project/{{.Conf.Project}}/storage/browser/{{.Conf.Project}}-camlistore/config/">the storage browser</a>. Delete "<b>` + certFilename() + `</b>", "<b>` + keyFilename() + `</b>", and replace them by uploading your own files (with the same names). Then restart Camlistore.
+		If you want to use your own HTTPS certificate and key, go to <a href="https://console.developers.google.com/project/{{.Conf.Project}}/storage/browser/{{.Conf.Project}}-camlistore/config/">the storage browser</a>. Delete "<b>` + certFilename() + `</b>", "<b>` + keyFilename() + `</b>", and replace them by uploading your own files (with the same names). Then restart Perkeep.
 		</p>
 
-		<p> Camlistore should not require system
+		<p> Perkeep should not require system
 administration but to manage/add SSH keys, go to the <a
 href="{{.ProjectConsoleURL}}/instancesDetail/zones/{{.Conf.Zone}}/instances/camlistore-server">camlistore-server
 instance</a> page. Scroll down to the SSH Keys section. Note that the
@@ -1095,16 +1119,59 @@ or corrupted.</p>
 				}
 			};
 			setBillingURL();
+			var allRegions = [];
+			var usRegions = [];
+			$('#regions').children().each(function(idx, value) {
+				var region = $(this).val();
+				if (region.startsWith("us-")) {
+					usRegions.push(region);
+				};
+				allRegions.push(region);
+			});
+			var setRegions = function(usOnly) {
+				var regions = $('#regions');
+				regions.empty();
+				var currentRegions = allRegions;
+				if (usOnly == "true") {
+					currentRegions = usRegions;
+				}
+				currentRegions.forEach(function(region) {
+					var opt = document.createElement("option");
+					opt.value = region;
+					opt.text = region;
+					regions.append(opt);
+				});
+				if (usOnly == "true") {
+					if (!$('#zone').val().startsWith("us-")) {
+						$('#zone').val("us-central1");
+					}
+				}
+			};
 			var toggleFormAction = function(newProject) {
 				if (newProject == "true") {
 					$('#zone').prop("disabled", true);
 					$('#machine').prop("disabled", true);
+					$('#free_tier').prop("disabled", true);
 					$('#submit_btn').val("Create project");
 					return
 				}
 				$('#zone').prop("disabled", false);
-				$('#machine').prop("disabled", false);
+				if ($('#free_tier').prop("checked")) {
+					$('#machine').prop("disabled", true);
+				} else {
+					$('#machine').prop("disabled", false);
+				}
+				$('#free_tier').prop("disabled", false);
 				$('#submit_btn').val("Create instance");
+			};
+			var toggleFreeTier = function() {
+				if ($('#free_tier').prop("checked")) {
+					$('#machine').val("f1-micro");
+					setRegions("true");
+					return
+				}
+				$('#zone').prop("disabled", false);
+				setRegions("false");
 			};
 			$("#new_project_id").focus(function(){
 				$('#newproject_yes').prop("checked", true);
@@ -1123,6 +1190,9 @@ or corrupted.</p>
 			$("#newproject_no").change(function(e){
 				toggleFormAction("false");
 			});
+			$("#free_tier").change(function(e){
+				toggleFreeTier();
+			});
 		})
 	</script>
 	{{if .InstanceKey}}
@@ -1135,23 +1205,23 @@ or corrupted.</p>
 	<form method="post" enctype="multipart/form-data">
 		<input type='hidden' name="mode" value="setupproject">
 
-		<h3>Deploy Camlistore</h3>
+		<h3>Deploy Perkeep</h3>
 
 		<p> This tool creates your own private
-Camlistore instance running on <a
+Perkeep instance running on <a
 href="https://cloud.google.com/">Google Cloud Platform</a>. Be sure to
 understand <a
 href="https://cloud.google.com/compute/pricing#machinetype">Compute Engine pricing</a>
 and
 <a href="https://cloud.google.com/storage/pricing">Cloud Storage pricing</a>
-before proceeding. Note that Camlistore metadata adds overhead on top of the size
+before proceeding. Note that Perkeep metadata adds overhead on top of the size
 of any raw data added to your instance. To delete your
 instance and stop paying Google for the virtual machine, visit the <a
 href="https://console.developers.google.com/">Google Cloud console</a>
 and visit both the "Compute Engine" and "Storage" sections for your project.
 </p>
 	{{if .CamliVersion}}
-		<p> Camlistore version deployed by this tool: <a href="https://camlistore.googlesource.com/camlistore/+/{{.CamliVersion}}">{{.CamliVersion}}</a></p>
+		<p> Perkeep version deployed by this tool: <a href="https://camlistore.googlesource.com/camlistore/+/{{.CamliVersion}}">{{.CamliVersion}}</a></p>
 	{{end}}
 
 		<table border=0 cellpadding=3 style='margin-top: 2em'>
@@ -1190,6 +1260,13 @@ and visit both the "Compute Engine" and "Storage" sections for your project.
 				{{end}}
 				</datalist></td></tr>
 		<tr valign=top><td></td><td colspan="2"><span style="font-size:75%">As of 2015-12-27, a g1-small is $13.88 (USD) per month, before storage usage charges. See <a href="https://cloud.google.com/compute/pricing#machinetype">current pricing</a>.</span>
+			</td></tr>
+			{{if .ProjectID}}
+				<tr valign=top><td></td><td align=left colspan="2"><input id='free_tier' type="checkbox" name="freetier" value="true"> Use <a href="https://cloud.google.com/free/">Google Cloud Free Tier</a></td></tr>
+			{{else}}
+				<tr valign=top><td></td><td align=left colspan="2"><input id='free_tier' type="checkbox" name="freetier" value="true" disabled='disabled'> Use <a href="https://cloud.google.com/free/">Google Cloud Free Tier</a></td></tr>
+			{{end}}
+		<tr valign=top><td></td><td colspan="2"><span style="font-size:75%">The Free Tier implies using an f1-micro instance, which might not be powerful enough in the long run. Also, the free storage is limited to 5GB, and must be in a US region.</span>
 			</td></tr>
 			<tr><td></td><td>
 			{{if .ProjectID}}

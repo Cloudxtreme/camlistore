@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,15 @@ limitations under the License.
 package drive
 
 import (
-	"camlistore.org/pkg/blob"
+	"context"
+
+	"perkeep.org/pkg/blob"
 )
 
-func (sto *driveStorage) RemoveBlobs(blobs []blob.Ref) error {
+func (sto *driveStorage) RemoveBlobs(ctx context.Context, blobs []blob.Ref) error {
 	var reterr error
 	for _, blob := range blobs {
-		if err := sto.service.Trash(blob.String()); err != nil {
+		if err := sto.service.Trash(ctx, blob.String()); err != nil {
 			reterr = err
 		}
 	}

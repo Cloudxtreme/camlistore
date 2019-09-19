@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"log"
 
-	"camlistore.org/pkg/osutil"
+	"perkeep.org/internal/osutil"
 )
 
 // TODO(mpl): move pkg/camerrors stuff in here
@@ -31,7 +31,7 @@ var (
 	ErrClientNoServer = addCamError("client-no-server", funcStr(func() string {
 		return fmt.Sprintf("No valid server defined. It can be set with the CAMLI_SERVER environment variable, or the --server flag, or in the \"servers\" section of %q (see https://camlistore.org/doc/client-config).", osutil.UserClientConfigPath())
 	}))
-	ErrClientNoPublicKey = addCamError("client-no-public-key", str("No public key configured: see 'camput init'."))
+	ErrClientNoPublicKey = addCamError("client-no-public-key", str("No public key configured: see 'pk-put init'."))
 )
 
 type str string

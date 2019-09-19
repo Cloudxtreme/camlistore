@@ -1,5 +1,5 @@
 /*
-Copyright 2013 Google Inc.
+Copyright 2013 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,24 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package blob defines types to refer to and retrieve low-level Camlistore blobs.
-package blob // import "camlistore.org/pkg/blob"
+// Package blob defines types to refer to and retrieve low-level Perkeep blobs.
+package blob // import "perkeep.org/pkg/blob"
 
 import (
 	"bytes"
 	"crypto/sha1"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"reflect"
 	"strings"
+
+	"perkeep.org/internal/testhooks"
 )
 
 // Pattern is the regular expression which matches a blobref.
 // It does not contain ^ or $.
 const Pattern = `\b([a-z][a-z0-9]*)-([a-f0-9]+)\b`
 
-// Ref is a reference to a Camlistore blob.
+// Ref is a reference to a Perkeep blob.
 // It is used as a value type and supports equality (with ==) and the ability
 // to use it as a map key.
 type Ref struct {
@@ -65,13 +69,14 @@ type digestType interface {
 	bytes() []byte
 	digestName() string
 	newHash() hash.Hash
+	equalString(string) bool
+	hasPrefix(string) bool
 }
 
 func (r Ref) String() string {
 	if r.digest == nil {
 		return "<invalid-blob.Ref>"
 	}
-	// TODO: maybe memoize this.
 	dname := r.digest.digestName()
 	bs := r.digest.bytes()
 	buf := getBuf(len(dname) + 1 + len(bs)*2)[:0]
@@ -84,7 +89,6 @@ func (r Ref) StringMinusOne() string {
 	if r.digest == nil {
 		return "<invalid-blob.Ref>"
 	}
-	// TODO: maybe memoize this.
 	dname := r.digest.digestName()
 	bs := r.digest.bytes()
 	buf := getBuf(len(dname) + 1 + len(bs)*2)[:0]
@@ -93,6 +97,16 @@ func (r Ref) StringMinusOne() string {
 	buf[len(buf)-1]-- // no need to deal with carrying underflow (no 0 bytes ever)
 	return string(buf)
 }
+
+// EqualString reports whether r.String() is equal to s.
+// It does not allocate.
+func (r Ref) EqualString(s string) bool { return r.digest.equalString(s) }
+
+// HasPrefix reports whether s is a prefix of r.String(). It returns false if s
+// does not contain at least the digest name prefix (e.g. "sha224-") and one byte of
+// digest.
+// It does not allocate.
+func (r Ref) HasPrefix(s string) bool { return r.digest.hasPrefix(s) }
 
 func (r Ref) appendString(buf []byte) []byte {
 	dname := r.digest.digestName()
@@ -118,7 +132,7 @@ func (r Ref) HashName() string {
 }
 
 // Digest returns the lower hex digest of the blobref, without
-// the e.g. "sha1-" prefix. It panics if r is zero.
+// the e.g. "sha224-" prefix. It panics if r is zero.
 func (r Ref) Digest() string {
 	if r.digest == nil {
 		panic("Digest called on invalid Ref")
@@ -209,7 +223,7 @@ func parse(s string, allowAll bool) (ref Ref, ok bool) {
 	if i < 0 {
 		return
 	}
-	name := s[:i] // e.g. "sha1"
+	name := s[:i] // e.g. "sha1", "sha224"
 	hex := s[i+1:]
 	meta, ok := metaFromString[name]
 	if !ok {
@@ -241,7 +255,7 @@ func ParseBytes(s []byte) (ref Ref, ok bool) {
 	if i < 0 {
 		return
 	}
-	name := s[:i] // e.g. "sha1"
+	name := s[:i] // e.g. "sha1", "sha224"
 	hex := s[i+1:]
 	meta, ok := metaFromBytes(name)
 	if !ok {
@@ -258,8 +272,8 @@ func ParseBytes(s []byte) (ref Ref, ok bool) {
 	return Ref{dt}, true
 }
 
-// Parse parse s as a blobref. If s is invalid, a zero Ref is returned
-// which can be tested with the Valid method.
+// ParseOrZero parses as a blobref. If s is invalid, a zero Ref is
+// returned which can be tested with the Valid method.
 func ParseOrZero(s string) Ref {
 	ref, ok := Parse(s)
 	if !ok {
@@ -371,10 +385,44 @@ func sha1FromHexBytes(hex []byte) (digestType, bool) {
 	return d, true
 }
 
+func sha224FromBinary(b []byte) digestType {
+	var d sha224Digest
+	if len(d) != len(b) {
+		panic("bogus sha-224 length")
+	}
+	copy(d[:], b)
+	return d
+}
+
+func sha224FromHexString(hex string) (digestType, bool) {
+	var d sha224Digest
+	var bad bool
+	for i := 0; i < len(hex); i += 2 {
+		d[i/2] = hexVal(hex[i], &bad)<<4 | hexVal(hex[i+1], &bad)
+	}
+	if bad {
+		return nil, false
+	}
+	return d, true
+}
+
+// yawn. exact copy of sha224FromHexString.
+func sha224FromHexBytes(hex []byte) (digestType, bool) {
+	var d sha224Digest
+	var bad bool
+	for i := 0; i < len(hex); i += 2 {
+		d[i/2] = hexVal(hex[i], &bad)<<4 | hexVal(hex[i+1], &bad)
+	}
+	if bad {
+		return nil, false
+	}
+	return d, true
+}
+
 // RefFromHash returns a blobref representing the given hash.
 // It panics if the hash isn't of a known type.
 func RefFromHash(h hash.Hash) Ref {
-	meta, ok := metaFromType[reflect.TypeOf(h)]
+	meta, ok := metaFromType[hashSig{reflect.TypeOf(h), h.Size()}]
 	if !ok {
 		panic(fmt.Sprintf("Currently-unsupported hash type %T", h))
 	}
@@ -382,30 +430,132 @@ func RefFromHash(h hash.Hash) Ref {
 }
 
 // RefFromString returns a blobref from the given string, for the currently
-// recommended hash function
+// recommended hash function.
 func RefFromString(s string) Ref {
-	return SHA1FromString(s)
+	h := NewHash()
+	io.WriteString(h, s)
+	return RefFromHash(h)
 }
 
-// SHA1FromString returns a SHA-1 blobref of the provided string.
-func SHA1FromString(s string) Ref {
-	s1 := sha1.New()
-	s1.Write([]byte(s))
-	return RefFromHash(s1)
-}
-
-// SHA1FromBytes returns a SHA-1 blobref of the provided bytes.
-func SHA1FromBytes(b []byte) Ref {
-	s1 := sha1.New()
-	s1.Write(b)
-	return RefFromHash(s1)
+// RefFromBytes returns a blobref from the given string, for the currently
+// recommended hash function.
+func RefFromBytes(b []byte) Ref {
+	h := NewHash()
+	h.Write(b)
+	return RefFromHash(h)
 }
 
 type sha1Digest [20]byte
 
-func (s sha1Digest) digestName() string { return "sha1" }
-func (s sha1Digest) bytes() []byte      { return s[:] }
-func (s sha1Digest) newHash() hash.Hash { return sha1.New() }
+func (d sha1Digest) digestName() string { return "sha1" }
+func (d sha1Digest) bytes() []byte      { return d[:] }
+func (d sha1Digest) newHash() hash.Hash { return sha1.New() }
+func (d sha1Digest) equalString(s string) bool {
+	if len(s) != 45 {
+		return false
+	}
+	if !strings.HasPrefix(s, "sha1-") {
+		return false
+	}
+	s = s[len("sha1-"):]
+	for i, b := range d[:] {
+		if s[i*2] != hexDigit[b>>4] || s[i*2+1] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
+}
+
+func (d sha1Digest) hasPrefix(s string) bool {
+	if len(s) > 45 {
+		return false
+	}
+	if len(s) == 45 {
+		return d.equalString(s)
+	}
+	if !strings.HasPrefix(s, "sha1-") {
+		return false
+	}
+	s = s[len("sha1-"):]
+	if len(s) == 0 {
+		// we want at least one digest char to match on
+		return false
+	}
+	for i, b := range d[:] {
+		even := i * 2
+		if even == len(s) {
+			break
+		}
+		if s[even] != hexDigit[b>>4] {
+			return false
+		}
+		odd := i*2 + 1
+		if odd == len(s) {
+			break
+		}
+		if s[odd] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
+}
+
+type sha224Digest [28]byte
+
+const sha224StrLen = 63 // len("sha224-d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f")
+
+func (d sha224Digest) digestName() string { return "sha224" }
+func (d sha224Digest) bytes() []byte      { return d[:] }
+func (d sha224Digest) newHash() hash.Hash { return sha256.New224() }
+func (d sha224Digest) equalString(s string) bool {
+	if len(s) != sha224StrLen {
+		return false
+	}
+	if !strings.HasPrefix(s, "sha224-") {
+		return false
+	}
+	s = s[len("sha224-"):]
+	for i, b := range d[:] {
+		if s[i*2] != hexDigit[b>>4] || s[i*2+1] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
+}
+
+func (d sha224Digest) hasPrefix(s string) bool {
+	if len(s) > sha224StrLen {
+		return false
+	}
+	if len(s) == sha224StrLen {
+		return d.equalString(s)
+	}
+	if !strings.HasPrefix(s, "sha224-") {
+		return false
+	}
+	s = s[len("sha224-"):]
+	if len(s) == 0 {
+		// we want at least one digest char to match on
+		return false
+	}
+	for i, b := range d[:] {
+		even := i * 2
+		if even == len(s) {
+			break
+		}
+		if s[even] != hexDigit[b>>4] {
+			return false
+		}
+		odd := i*2 + 1
+		if odd == len(s) {
+			break
+		}
+		if s[odd] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
+}
 
 const maxOtherDigestLen = 128
 
@@ -419,16 +569,85 @@ type otherDigest struct {
 func (d otherDigest) digestName() string { return d.name }
 func (d otherDigest) bytes() []byte      { return d.sum[:d.sumLen] }
 func (d otherDigest) newHash() hash.Hash { return nil }
-
-var sha1Meta = &digestMeta{
-	ctor:  sha1FromBinary,
-	ctors: sha1FromHexString,
-	ctorb: sha1FromHexBytes,
-	size:  sha1.Size,
+func (d otherDigest) equalString(s string) bool {
+	wantLen := len(d.name) + len("-") + 2*d.sumLen
+	if d.odd {
+		wantLen--
+	}
+	if len(s) != wantLen || !strings.HasPrefix(s, d.name) || s[len(d.name)] != '-' {
+		return false
+	}
+	s = s[len(d.name)+1:]
+	for i, b := range d.sum[:d.sumLen] {
+		if s[i*2] != hexDigit[b>>4] {
+			return false
+		}
+		if i == d.sumLen-1 && d.odd {
+			break
+		}
+		if s[i*2+1] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
 }
 
+func (d otherDigest) hasPrefix(s string) bool {
+	maxLen := len(d.name) + len("-") + 2*d.sumLen
+	if d.odd {
+		maxLen--
+	}
+	if len(s) > maxLen || !strings.HasPrefix(s, d.name) || s[len(d.name)] != '-' {
+		return false
+	}
+	if len(s) == maxLen {
+		return d.equalString(s)
+	}
+	s = s[len(d.name)+1:]
+	if len(s) == 0 {
+		// we want at least one digest char to match on
+		return false
+	}
+	for i, b := range d.sum[:d.sumLen] {
+		even := i * 2
+		if even == len(s) {
+			break
+		}
+		if s[even] != hexDigit[b>>4] {
+			return false
+		}
+		odd := i*2 + 1
+		if odd == len(s) {
+			break
+		}
+		if i == d.sumLen-1 && d.odd {
+			break
+		}
+		if s[odd] != hexDigit[b&0xf] {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	sha1Meta = &digestMeta{
+		ctor:  sha1FromBinary,
+		ctors: sha1FromHexString,
+		ctorb: sha1FromHexBytes,
+		size:  sha1.Size,
+	}
+	sha224Meta = &digestMeta{
+		ctor:  sha224FromBinary,
+		ctors: sha224FromHexString,
+		ctorb: sha224FromHexBytes,
+		size:  sha256.Size224,
+	}
+)
+
 var metaFromString = map[string]*digestMeta{
-	"sha1": sha1Meta,
+	"sha1":   sha1Meta,
+	"sha224": sha224Meta,
 }
 
 type blobTypeAndMeta struct {
@@ -465,10 +684,22 @@ func HashFuncs() []string {
 	return hashes
 }
 
-var sha1Type = reflect.TypeOf(sha1.New())
+var (
+	sha1Type   = reflect.TypeOf(sha1.New())
+	sha224Type = reflect.TypeOf(sha256.New224())
+)
 
-var metaFromType = map[reflect.Type]*digestMeta{
-	sha1Type: sha1Meta,
+// hashSig is the tuple (reflect.Type, hash size), for use as a map key.
+// The size disambiguates SHA-256 vs SHA-224, both of which have the same
+// reflect.Type (crypto/sha256.digest, but one has is224 bool set true).
+type hashSig struct {
+	rt   reflect.Type
+	size int
+}
+
+var metaFromType = map[hashSig]*digestMeta{
+	{sha1Type, sha1.Size}:        sha1Meta,
+	{sha224Type, sha256.Size224}: sha224Meta,
 }
 
 type digestMeta struct {
@@ -501,10 +732,12 @@ func putBuf(b []byte) {
 }
 
 // NewHash returns a new hash.Hash of the currently recommended hash type.
-// Currently this is just SHA-1, but will likely change within the next
-// year or so.
+// Currently this is SHA-224, but is subject to change over time.
 func NewHash() hash.Hash {
-	return sha1.New()
+	if testhooks.UseSHA1() {
+		return sha1.New()
+	}
+	return sha256.New224()
 }
 
 func ValidRefString(s string) bool {
@@ -619,6 +852,8 @@ func (s SizedByRef) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func TypeAlphabet(typ string) string {
 	switch typ {
 	case "sha1":
+		return hexDigit
+	case "sha224":
 		return hexDigit
 	}
 	return ""

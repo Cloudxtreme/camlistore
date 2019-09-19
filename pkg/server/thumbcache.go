@@ -1,5 +1,5 @@
 /*
-Copyright 2011 Google Inc.
+Copyright 2011 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"errors"
 	"fmt"
 
-	"camlistore.org/pkg/blob"
-	"camlistore.org/pkg/lru"
-	"camlistore.org/pkg/sorted"
+	"perkeep.org/internal/lru"
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/sorted"
 )
 
 const memLRUSize = 1024 // arbitrary
